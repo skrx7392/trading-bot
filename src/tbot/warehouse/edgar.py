@@ -5,10 +5,11 @@ Two SEC feeds land here:
 ``companyfacts``
     Every XBRL fact a company has ever reported, as
     ``facts[taxonomy][tag]["units"][unit] -> [entry, ...]``. Flattened to one row
-    per entry under ``<data_root>/edgar/facts/``. The entry's ``start`` is not
-    carried — the schema is fixed by its downstream consumers — so two duration
-    facts sharing an ``end`` (a 10-Q's three-month and year-to-date figures) are
-    stored as two rows distinguishable only by ``val``; see :data:`_PIT_SORT`.
+    per entry under ``<data_root>/edgar/facts/``. A duration fact (income
+    statement, cash flow) carries ``start``; an instant fact (balance sheet) has
+    none and stores null. ``start`` is what separates the two rows a 10-Q emits
+    for the same ``end`` — the three-month figure and the year-to-date one — so a
+    consumer diffing quarters must filter on it; see :data:`_PIT_SORT`.
 ``submissions``
     The company's filing index (``filings.recent``), flattened to one row per
     filing under ``<data_root>/edgar/filings/``.
@@ -54,6 +55,7 @@ FACTS_SCHEMA = pl.Schema(
         "taxonomy": pl.Utf8,  # us-gaap | dei | ifrs-full | srt ...
         "tag": pl.Utf8,
         "unit": pl.Utf8,  # USD | shares | USD/shares ...
+        "start": pl.Date,  # null for instant facts; nullable, never a skip reason
         "end": pl.Date,
         "val": pl.Float64,
         "accn": pl.Utf8,
@@ -83,13 +85,13 @@ _FILINGS_SORT = ("cik", "filed", "accn")
 #: recent period ``end``, ties broken by the latest ``filed`` (a restatement
 #: supersedes the original), then ``accn``.
 #:
-#: These four can still tie. One filing reports the same ``end`` at two
+#: These four can still tie: one filing reports the same ``end`` at two
 #: durations — a Q3 10-Q carries both the three-month and the nine-month
-#: ``NetIncomeLoss`` — and the only field telling them apart is ``start``, which
-#: this schema does not carry. The sort is therefore stable and the *last* such
-#: row in document order wins, which is the longer (year-to-date) duration in
-#: EDGAR's ordering. Deterministic, and a caller needing a specific duration must
-#: read ``fp``/``form`` rather than trust the tie-break.
+#: ``NetIncomeLoss`` — and they differ only in ``start``, which is deliberately
+#: *not* a sort key here. Picking a duration is the consumer's job (it depends on
+#: whether the caller wants a quarter or a year), so this sort stays stable and
+#: the last such row in document order wins — deterministic, and the losing row
+#: is still there in :func:`read_facts` for a consumer that filters on ``start``.
 _PIT_SORT = ("cik", "end", "filed", "accn")
 
 #: A filing is identified by its accession number.
@@ -227,7 +229,8 @@ def ingest_companyfacts(json_bytes: bytes | str) -> int:
     Every ``facts[taxonomy][tag]["units"][unit]`` entry becomes a row. Entries
     without a parseable ``filed``, ``end`` or ``val`` are skipped — a fact with no
     filing date can never be served point-in-time, and one with no value is not a
-    fact — and the skip count is recorded in the ledger.
+    fact — and the skip count is recorded in the ledger. ``start`` is optional
+    by design: instant facts have none, and its absence never drops a row.
 
     A companyfacts document is the company's *complete* current snapshot, so a
     re-ingest replaces the previous one wholesale: a re-run of the backfill is a
@@ -268,6 +271,7 @@ def ingest_companyfacts(json_bytes: bytes | str) -> int:
                             "taxonomy": _text(taxonomy),
                             "tag": _text(tag),
                             "unit": _text(unit),
+                            "start": _opt_date(entry.get("start")),
                             "end": end,
                             "val": val,
                             "accn": _text(entry.get("accn")),

@@ -64,8 +64,8 @@ def test_facts_schema_is_exactly_the_documented_columns(tmp_path, monkeypatch):
     assert dict(df.schema) == dict(edgar.FACTS_SCHEMA)
     assert dict(edgar.FACTS_SCHEMA) == {
         "cik": pl.Int64, "taxonomy": pl.Utf8, "tag": pl.Utf8, "unit": pl.Utf8,
-        "end": pl.Date, "val": pl.Float64, "accn": pl.Utf8, "fy": pl.Int64,
-        "fp": pl.Utf8, "form": pl.Utf8, "filed": pl.Date,
+        "start": pl.Date, "end": pl.Date, "val": pl.Float64, "accn": pl.Utf8,
+        "fy": pl.Int64, "fp": pl.Utf8, "form": pl.Utf8, "filed": pl.Date,
     }
 
 
@@ -111,6 +111,9 @@ def test_all_null_optional_fields_keep_their_dtypes(tmp_path, monkeypatch):
     assert dict(df.schema) == dict(edgar.FACTS_SCHEMA)
     assert df["fy"][0] == 0 and df["fp"][0] == "" and df["form"][0] == ""
     assert df["accn"][0] == ""
+    # `start` is absent from every entry in this batch: inference would make the
+    # column Null, the explicit schema keeps it Date.
+    assert df["start"][0] is None and df.schema["start"] == pl.Date
 
 
 def test_all_null_optional_fields_keep_their_dtypes_in_filings(tmp_path, monkeypatch):
@@ -168,7 +171,7 @@ def test_ingest_maps_every_field(tmp_path, monkeypatch):
     r = edgar.read_facts().row(0, named=True)
     assert r == {
         "cik": 320193, "taxonomy": "us-gaap", "tag": "NetIncomeLoss", "unit": "USD",
-        "end": dt.date(2019, 12, 28), "val": 22236000000.0,
+        "start": None, "end": dt.date(2019, 12, 28), "val": 22236000000.0,
         "accn": "0000320193-20-000010", "fy": 2020, "fp": "Q1",
         "form": "10-Q", "filed": dt.date(2020, 1, 29),
     }
@@ -528,12 +531,12 @@ def test_pit_facts_prefers_the_newest_period_over_the_newest_filing(tmp_path, mo
     assert pit["val"].to_list() == [2.0] and pit["accn"].to_list() == ["q2"]
 
 
-def test_pit_facts_is_deterministic_when_an_entry_pair_cannot_be_told_apart(
+def test_pit_facts_is_deterministic_across_a_same_end_duration_pair(
     tmp_path, monkeypatch
 ):
     """One 10-Q reports the same `end` at two durations (three-month and
-    year-to-date); `start` would separate them but is not part of the schema, so
-    the tie must at least resolve the same way on every call."""
+    year-to-date). `start` separates them for a consumer, but it is not a
+    pit_facts sort key, so the tie must resolve the same way on every call."""
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     edgar.ingest_companyfacts(_facts(1, [
         {"start": "2020-07-01", "end": "2020-09-30", "val": 3.0, "accn": "a",
@@ -592,6 +595,55 @@ def test_pit_facts_rejects_bad_input(tmp_path, monkeypatch):
         edgar.pit_facts("Assets", 20200101)
     with pytest.raises(ValueError):
         edgar.pit_facts("Assets", "01/01/2020")
+
+
+# --- start / duration disambiguation ------------------------------------------------
+
+def test_duration_fact_retains_its_start(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_companyfacts(_facts(1, [
+        {"start": "2020-07-01", "end": "2020-09-30", "val": 3.0, "accn": "a",
+         "fy": 2020, "fp": "Q3", "form": "10-Q", "filed": "2020-10-30"}]))
+    df = edgar.read_facts()
+    assert df["start"][0] == dt.date(2020, 7, 1) and df["end"][0] == dt.date(2020, 9, 30)
+
+
+def test_instant_fact_has_a_null_start(tmp_path, monkeypatch):
+    """Balance-sheet tags are instants: no start, and that must not drop the row."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    n = edgar.ingest_companyfacts(_facts(1, [
+        {"end": "2020-09-30", "val": 100.0, "accn": "a", "fy": 2020, "fp": "Q3",
+         "form": "10-Q", "filed": "2020-10-30"}], tag="Assets"))
+    assert n == 1
+    df = edgar.read_facts()
+    assert df["start"][0] is None and df["val"][0] == 100.0
+
+
+def test_an_unparseable_start_is_nulled_not_skipped(tmp_path, monkeypatch):
+    """Only filed/end/val are mandatory; a junk start costs the field, not the fact."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    assert edgar.ingest_companyfacts(_facts(1, [
+        _entry("2020-09-30", "2020-10-30", 3.0, start="not-a-date")])) == 1
+    assert edgar.read_facts()["start"][0] is None
+
+
+def test_three_month_and_ytd_facts_are_distinguishable_by_start(tmp_path, monkeypatch):
+    """The finding this column exists for: Task 12 diffs quarters on
+    NetIncomeLoss and must not mix the 3-month row with the year-to-date one."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_companyfacts(_facts(1, [
+        {"start": "2020-07-01", "end": "2020-09-30", "val": 3.0, "accn": "a",
+         "fy": 2020, "fp": "Q3", "form": "10-Q", "filed": "2020-10-30"},
+        {"start": "2020-01-01", "end": "2020-09-30", "val": 9.0, "accn": "a",
+         "fy": 2020, "fp": "Q3", "form": "10-Q", "filed": "2020-10-30"}]))
+    df = edgar.read_facts(["NetIncomeLoss"])
+    assert df.height == 2
+    assert sorted(zip(df["start"].to_list(), df["val"].to_list())) == [
+        (dt.date(2020, 1, 1), 9.0), (dt.date(2020, 7, 1), 3.0)]
+    # a consumer can now select exactly the three-month duration
+    quarterly = df.filter(
+        (pl.col("end") - pl.col("start")).dt.total_days().is_between(80, 100))
+    assert quarterly["val"].to_list() == [3.0]
 
 
 # --- downstream call shapes ---------------------------------------------------------
