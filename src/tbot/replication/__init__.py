@@ -10,7 +10,7 @@ can be trusted at all. A signal that fails to reproduce a known effect is a bug
 in the plumbing, and finding it here is far cheaper than finding it in
 production.
 
-Every module exports the same one function::
+Every *signal* module exports the same one function::
 
     signal(asof: dt.date) -> pl.DataFrame  # columns: symbol, score
 
@@ -29,8 +29,13 @@ period ended; it is known on the day it was filed, and those can be nine months
 apart. Nothing here writes, so a signal is a pure read over the warehouse and
 re-evaluating a past date always gives the same answer.
 
+:mod:`~tbot.replication.calibrate` is the fifth module and the only one that is
+not a signal: it is the harness that scores a reproduced series against the
+published one and writes the ``replication.calibration`` verdict to the ledger.
+It also carries the runbook for obtaining the published files.
+
 The shared frame contract, coercions and finiteness guards live in this module's
-namespace; the four signal modules are imported explicitly
+namespace; the submodules are imported explicitly
 (``from tbot.replication import momentum``) to match :mod:`tbot.warehouse` and
 :mod:`tbot.backtest`.
 """
@@ -39,7 +44,7 @@ import datetime as dt
 
 import polars as pl
 
-__all__ = ["accruals", "issuance", "momentum", "pead"]
+__all__ = ["accruals", "calibrate", "issuance", "momentum", "pead"]
 
 #: The signal frame. Two columns, no more: every consumer reads exactly this,
 #: and a signal that can score nothing returns it empty rather than untyped.
