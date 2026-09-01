@@ -101,6 +101,14 @@ def test_predictor_can_be_asked_to_think(monkeypatch):
     assert client.requests[0]["json"]["think"] is True
 
 
+def test_predictor_pins_the_temperature_to_zero(monkeypatch):
+    """A bake-off is a measurement; default sampling would make it unrepeatable."""
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    client = FakeClient(lambda u, b: _chat_response(5.0))
+    bakeoff.ollama_predictor("m", host=HOST, client=client)("doc", "revenue")
+    assert client.requests[0]["json"]["options"] == {"temperature": 0}
+
+
 def test_predictor_returns_the_parsed_value(monkeypatch):
     monkeypatch.delenv("OLLAMA_HOST", raising=False)
     numeric = bakeoff.ollama_predictor(
@@ -239,6 +247,14 @@ def test_run_disables_thinking_by_default_and_can_be_told_not_to(tmp_path, monke
     on = FakeClient(_echo_revenue)
     bakeoff.run(["m"], client=on, think=True)
     assert all(r["json"]["think"] is True for r in on.requests)
+
+
+def test_run_pins_the_temperature_on_every_call(tmp_path, monkeypatch):
+    _seed(monkeypatch, tmp_path)
+    client = FakeClient(_echo_revenue)
+    bakeoff.run(["a", "b"], client=client)
+    assert client.requests  # the models were actually called
+    assert all(r["json"]["options"] == {"temperature": 0} for r in client.requests)
 
 
 def test_run_defaults_to_the_dev_split(tmp_path, monkeypatch):

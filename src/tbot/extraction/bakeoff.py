@@ -38,6 +38,11 @@ bake-off axis — it costs a large multiple in tokens/sec and may buy accuracy o
 the hard tail — but the default is off, because a bake-off that cannot parse a
 reply is not measuring the model.
 
+Sampling is pinned to ``temperature: 0`` (:data:`OPTIONS`) for the same reason:
+a candidate's score has to mean the same thing on Tuesday as it did on Monday,
+or a "model swap" decision is reading noise. That is a large reduction in
+variance rather than a guarantee of bit-identical replies — see :data:`OPTIONS`.
+
 The request is deliberately single-document — one filing, one field, one call.
 Fin-RATE (2026) measures 14-19% accuracy degradation once an LLM is asked to
 reason across entities or across time, so everything cross-company and
@@ -74,7 +79,7 @@ import polars as pl
 from tbot import ledger
 from tbot.extraction import _check_split, _non_blank, goldenset
 
-__all__ = ["RESULT_SCHEMA", "SYSTEM_PROMPT", "FORMAT", "ollama_predictor", "run"]
+__all__ = ["RESULT_SCHEMA", "SYSTEM_PROMPT", "FORMAT", "OPTIONS", "ollama_predictor", "run"]
 
 #: One row per candidate. Held to exactly these columns so two bake-offs run
 #: months apart are directly comparable.
@@ -93,6 +98,16 @@ FORMAT = {
     "properties": {"value": {"type": ["string", "number"]}},
     "required": ["value"],
 }
+
+#: Sampling is pinned off. A bake-off is a measurement, and a measurement that
+#: cannot be repeated is an anecdote: at the model's default temperature two runs
+#: of the same candidate over the same cases can disagree, and there is no way to
+#: tell that disagreement apart from a real accuracy difference. This does not
+#: buy bit-perfect reproducibility — batching, quantisation, GPU kernel choice
+#: and the Ollama version all still move the logits, so a re-run months later on
+#: a different build may differ — but it removes the one source of variance that
+#: is both dominant and entirely under our control.
+OPTIONS = {"temperature": 0}
 
 HOST_ENV = "OLLAMA_HOST"
 DEFAULT_HOST = "http://localhost:11434"
@@ -184,6 +199,7 @@ def ollama_predictor(
                 "stream": False,
                 "think": think,
                 "format": FORMAT,
+                "options": OPTIONS,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
