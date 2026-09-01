@@ -5,4 +5,4 @@ than re-exported here: the ingestion modules import ``store`` themselves, and an
 eager import in this package's ``__init__`` would make that a cycle.
 """
 
-__all__ = ["store"]
+__all__ = ["stooq", "store"]
