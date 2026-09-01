@@ -7,10 +7,13 @@ and turns the answer into a report the phase-0 gate can be scored on::
 
     {"anomaly", "rho", "n_months", "mean_ours", "mean_osap", "pass"}
 
-``rho`` is Pearson's correlation over the months the two series share, ``pass``
-is ``rho > 0.9``, and every run is written to the decision ledger as
-``replication.calibration`` so that a later "our momentum reproduces Mom12m"
-claim can be traced to the run that established it. The gate is not decoration:
+``rho`` is Pearson's correlation over the months the two series share and
+``pass`` is ``rho > 0.9``. Every run is written to the decision ledger as
+``replication.calibration``, carrying those six keys plus the three that make
+the verdict re-derivable — ``start``, ``end`` and ``osap_csv`` — so that a later
+"our momentum reproduces Mom12m" claim can be traced to the window and the file
+that established it, and two runs of one anomaly over different windows are
+never confused for each other. The gate is not decoration:
 a pipeline that cannot reproduce a thirty-year-old published effect has a bug
 somewhere between the vendor CSV and the decile, and every backtest run on top
 of it is measuring that bug.
@@ -160,7 +163,9 @@ PERCENT_MEAN_THRESHOLD = 0.5
 #: pass.
 RHO_GATE = 0.9
 
-#: Ledger event kind written by every :func:`run`.
+#: Ledger event kind written by every :func:`run`. Its payload is the returned
+#: report plus the provenance the report itself has no room for: ``start``,
+#: ``end`` (ISO dates) and ``osap_csv`` (the path as passed).
 EVENT_KIND = "replication.calibration"
 
 
@@ -367,6 +372,10 @@ def run(
         and both means are taken over exactly the months behind that count.
         ``pass`` is ``rho >``:data:`RHO_GATE`.
 
+        The ledger event carries the same six keys **plus** the provenance three
+        (``start``, ``end``, ``osap_csv``); see :data:`EVENT_KIND`. Callers get
+        the verdict, the ledger gets the verdict *and* what produced it.
+
     Raises:
         TypeError: If `anomaly` is not a string, `series_fn` is not callable,
             the dates are not date-ish, or `series_fn`'s frame is malformed.
@@ -384,9 +393,12 @@ def run(
     end = _as_date(end, "end")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
+    # Resolved before `series_fn` runs: a bad path should not cost a full
+    # series build, and the ledger records one canonical spelling of it.
+    osap_path = _as_path(osap_csv, "osap_csv")
 
     ours = _our_series(series_fn(start, end))
-    osap = load_osap(osap_csv, anomaly)
+    osap = load_osap(osap_path, anomaly)
     rho, n_months = metrics.pearson(ours, osap)
 
     # The same inner join and finiteness filter `pearson` applies internally, so
@@ -407,5 +419,16 @@ def run(
         "mean_osap": _mean(matched["ret"]),
         "pass": bool(rho > RHO_GATE),
     }
-    ledger.log_event(EVENT_KIND, report)
+    # The report is the caller's contract and does not grow. The ledger event
+    # does: a verdict with no window and no source cannot be re-derived, and two
+    # runs of one anomaly over different windows would be indistinguishable in
+    # the record the phase-0 gate is argued from.
+    ledger.log_event(
+        EVENT_KIND,
+        report | {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "osap_csv": str(osap_path),
+        },
+    )
     return report

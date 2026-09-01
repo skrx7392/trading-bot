@@ -287,7 +287,61 @@ def test_run_logs_the_report_to_the_ledger(tmp_path, monkeypatch):
     events = ledger.read_events("replication.calibration")
     assert events.height == 1
     payload = json.loads(events["payload"][0], parse_constant=_reject_constant)
-    assert payload == rep
+    # The event is the report plus the provenance needed to re-derive it.
+    assert payload == rep | {"start": "2020-01-01", "end": "2020-03-31",
+                             "osap_csv": str(p)}
+    # ...and the caller's contract stays the six pinned keys.
+    assert set(rep) == {"anomaly", "rho", "n_months", "mean_ours", "mean_osap", "pass"}
+
+
+def test_ledger_distinguishes_two_windows_of_one_anomaly(tmp_path, monkeypatch):
+    # Without the window in the payload these two events are byte-identical:
+    # same anomaly, same file, and a series_fn that answers the same either way.
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    p = _csv(tmp_path, "date,ret\n2020-01,0.01\n2020-02,-0.02\n2020-03,0.03\n")
+    ours = _series((1, 2, 3), [0.011, -0.019, 0.031])
+    first = calibrate.run("Mom12m", lambda s, e: ours, p,
+                          dt.date(2020, 1, 1), dt.date(2020, 3, 31))
+    second = calibrate.run("Mom12m", lambda s, e: ours, p,
+                           dt.date(2015, 1, 1), dt.date(2019, 12, 31))
+    assert first == second  # the verdicts are identical...
+    payloads = [json.loads(x, parse_constant=_reject_constant)
+                for x in ledger.read_events("replication.calibration")["payload"]]
+    assert len(payloads) == 2
+    assert {(x["start"], x["end"]) for x in payloads} == {
+        ("2020-01-01", "2020-03-31"), ("2015-01-01", "2019-12-31")}
+
+
+def test_ledger_records_the_source_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    ours = _series((1, 2, 3), [0.011, -0.019, 0.031])
+    body = "date,ret\n2020-01,0.01\n2020-02,-0.02\n2020-03,0.03\n"
+    for name in ("Mom12m.csv", "Mom12m-v2.csv"):
+        calibrate.run("Mom12m", lambda s, e: ours, _csv(tmp_path, body, name=name),
+                      dt.date(2020, 1, 1), dt.date(2020, 3, 31))
+    sources = [json.loads(x)["osap_csv"]
+               for x in ledger.read_events("replication.calibration")["payload"]]
+    assert sorted(sources) == [str(tmp_path / "Mom12m-v2.csv"),
+                               str(tmp_path / "Mom12m.csv")]
+
+
+def test_string_csv_path_is_recorded_as_passed(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    p = _csv(tmp_path, "date,ret\n2020-01,0.01\n2020-02,-0.02\n2020-03,0.03\n")
+    calibrate.run("Mom12m", lambda s, e: _series((1, 2, 3), [0.011, -0.019, 0.031]),
+                  str(p), dt.date(2020, 1, 1), dt.date(2020, 3, 31))
+    payload = json.loads(ledger.read_events("replication.calibration")["payload"][0])
+    assert payload["osap_csv"] == str(p)
+
+
+def test_bad_csv_path_is_rejected_before_the_series_is_built(tmp_path, monkeypatch):
+    # A full series build is expensive; the cheap argument check comes first.
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    called = []
+    with pytest.raises(TypeError, match="osap_csv"):
+        calibrate.run("Mom12m", lambda s, e: called.append(1) or _series((1,), [0.01]),
+                      42, dt.date(2020, 1, 1), dt.date(2020, 3, 31))
+    assert called == []
 
 
 def test_ledger_payload_is_valid_json_even_when_nothing_overlaps(tmp_path, monkeypatch):
@@ -302,7 +356,8 @@ def test_ledger_payload_is_valid_json_even_when_nothing_overlaps(tmp_path, monke
     payload = json.loads(
         ledger.read_events("replication.calibration")["payload"][0],
         parse_constant=_reject_constant)
-    assert payload == rep
+    assert payload == rep | {"start": "2020-01-01", "end": "2020-03-31",
+                             "osap_csv": str(p)}
 
 
 def test_gate_fails_on_a_correlation_below_the_threshold(tmp_path, monkeypatch):
