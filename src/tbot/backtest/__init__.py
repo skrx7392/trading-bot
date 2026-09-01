@@ -10,14 +10,19 @@ them live here and are consumed by every strategy the engine runs:
   is after-tax SPY, so realised gains have to be split short- from long-term
   before any strategy gets to claim it beat anything.
 
+Both are charged by :mod:`tbot.backtest.engine`, the daily-bar simulator that
+turns a :mod:`tbot.backtest.strategy` specification into an equity curve, a
+cost bill and a tax bill — always stamped with the cost-model version that
+produced them.
+
 Submodules are imported explicitly (``from tbot.backtest import costs``) to
 match :mod:`tbot.warehouse`; this package's namespace holds only the shared
-argument validation both modules use.
+argument validation the modules use.
 """
 
 import math
 
-__all__ = ["costs", "tax"]
+__all__ = ["costs", "engine", "strategy", "tax"]
 
 
 def _number(name: str, value: object) -> float:
