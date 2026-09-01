@@ -47,6 +47,19 @@ observable cost is one unwanted round trip plus the tax on it; if quarantine
 rates in the real backfill turn out to be non-trivial, the fix belongs in the
 warehouse (an explicit `delisted` flag) rather than here.
 
+**A forced liquidation is *dated* at that last close too, not at the day the
+engine noticed.** Discovery is always the next trading day, so the two dates
+differ by one trading day — which is enough to move a realised gain across a
+year boundary (last close 31 Dec, discovery 2 Jan) or a 365-day holding across
+the short/long-term line. The last close wins for three reasons: it is the price
+the sale is booked at, so pairing it with a later date would compute a gain at
+one date and tax it in another; it is the last day the position contributed to
+the equity curve, so the tax year matches the year the equity gain appears in;
+and it is the conservative side of both boundaries, since it books the gain in
+the *earlier* tax year (no free year of deferral) and *shortens* the holding
+period (short-term rate on the fence). The discovery day still stamps the
+ledger event's ``ts``; ``last_ts``/``tax_ts`` carry the sale date.
+
 **Costs are charged on every fill, including forced ones.** Getting out of a
 delisting name is not free in reality either.
 
@@ -499,8 +512,9 @@ def run(
             if qty <= QTY_EPS:
                 continue
             cost = cm.estimate(price, qty, adv, sigma)
-            st, lt = lots.sell(symbol, day, qty, price)
-            _record(realised, day.year, st, lt)
+            # Dated at the last close, not at discovery: see the module docstring.
+            st, lt = lots.sell(symbol, seen_on, qty, price)
+            _record(realised, seen_on.year, st, lt)
             cash += qty * price - cost
             costs_paid += cost
             trades += 1
@@ -511,6 +525,7 @@ def run(
                     "symbol": symbol,
                     "ts": day.isoformat(),
                     "last_ts": seen_on.isoformat(),
+                    "tax_ts": seen_on.isoformat(),  # drives the year and ST/LT
                     "qty": qty,
                     "price": price,
                     "proceeds": qty * price,

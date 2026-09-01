@@ -327,7 +327,9 @@ def test_delisted_holding_is_liquidated_at_its_last_close(tmp_path, monkeypatch)
     payload = pl.Series([events["payload"][0]]).str.json_decode().to_list()[0]
     assert payload["symbol"] == "A"
     assert payload["price"] == pytest.approx(a[a_days[-1]], rel=1e-12)
-    assert payload["ts"] == days[60].isoformat()
+    assert payload["ts"] == days[60].isoformat()          # discovered here
+    assert payload["last_ts"] == a_days[-1].isoformat()   # sold (and taxed) here
+    assert payload["tax_ts"] == a_days[-1].isoformat()
     assert payload["qty"] > 0
 
     # Proceeds are booked at A's last close, so equity is flat from then on —
@@ -376,6 +378,66 @@ def test_quarantine_gap_forces_a_liquidation(tmp_path, monkeypatch):
     assert res.trades == 3
     annual = res.ret_net_after_tax_annual
     assert annual.height == 1 and annual["st"][0] > 0.0
+
+
+def test_forced_liquidation_is_taxed_in_the_year_of_the_last_close(tmp_path, monkeypatch):
+    """A gain whose last close is 31 December is a December tax bill.
+
+    Discovery is always the next trading day, so a symbol whose last close falls
+    on the last trading day of the year is discovered missing in January. The
+    engine dates the sale at the last close (module docstring), which keeps the
+    tax year equal to the year the gain actually appears in the equity curve —
+    and refuses the free year of deferral the discovery date would have granted.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2021, 6, 30))
+    a_days = [d for d in days if d.year == 2020]          # A's last close: 2020-12-31
+    a = {d: 100.0 * (1.001 ** i) for i, d in enumerate(a_days)}
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 20.0 for d in days}})
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    discovered = days[days.index(a_days[-1]) + 1]
+    assert (a_days[-1].year, discovered.year) == (2020, 2021)   # the boundary is real
+
+    events = ledger.read_events("engine.forced_liquidation")
+    payload = pl.Series([events["payload"][0]]).str.json_decode().to_list()[0]
+    assert payload["ts"] == discovered.isoformat()
+    assert payload["tax_ts"] == a_days[-1].isoformat()
+
+    gain = 100_000.0 * (a[a_days[-1]] / a[days[1]] - 1.0)
+    annual = res.ret_net_after_tax_annual
+    assert annual["year"].to_list() == [2020]        # not 2021: the last close rules
+    row = annual.row(0, named=True)
+    assert row["st"] == pytest.approx(gain, rel=1e-9)
+    assert row["tax_paid"] == pytest.approx(gain * config.TAX_RATE_ST, rel=1e-9)
+
+
+def test_forced_liquidation_holding_period_ends_at_the_last_close(tmp_path, monkeypatch):
+    """Exactly 365 days at the last close is short-term, whatever discovery says.
+
+    The position is bought on 2020-01-02 and A's last close is 2021-01-01 — 365
+    days, the last short-term day. It is discovered missing on 2021-01-04, which
+    is 367 days and would have been long-term. Twenty points of tax rate ride on
+    which date the engine uses.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2021, 6, 30))
+    a_days = [d for d in days if d <= dt.date(2021, 1, 1)]
+    a = {d: 100.0 * (1.001 ** i) for i, d in enumerate(a_days)}
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 20.0 for d in days}})
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    entry, last_close = days[1], a_days[-1]
+    discovered = days[days.index(last_close) + 1]
+    assert (last_close - entry).days == 365          # the last short-term day
+    assert (discovered - entry).days > 365           # discovery would have been long-term
+
+    gain = 100_000.0 * (a[last_close] / a[entry] - 1.0)
+    row = res.ret_net_after_tax_annual.row(0, named=True)
+    assert row["year"] == 2021
+    assert row["st"] == pytest.approx(gain, rel=1e-9)
+    assert row["lt"] == pytest.approx(0.0, abs=1e-9)
+    assert row["tax_paid"] == pytest.approx(gain * config.TAX_RATE_ST, rel=1e-9)
 
 
 # --- tax year attribution -----------------------------------------------------------
