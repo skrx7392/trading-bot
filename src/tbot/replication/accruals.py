@@ -6,7 +6,7 @@ go on to underperform the firms whose profits arrive as cash — Sloan (1996), a
 Chen-Zimmermann's ``Accruals``. The balance-sheet form of the measure needs no
 cash-flow statement, only four numbers at two consecutive fiscal year ends::
 
-    accruals = (dAssetsCurrent - dCash - dLiabilitiesCurrent) / avg(AssetsTotal)
+    accruals = (dAssetsCurrent - dCash - dLiabilitiesCurrent) / avg(Assets)
     score    = -accruals
 
 Cash is subtracted because cash is the *good* half of the growth, and current
@@ -38,15 +38,14 @@ from tbot.warehouse.universe import _ticker_map
 
 #: The four balance-sheet lines, keyed by their role in the formula.
 #:
-#: .. note:: ``AssetsTotal`` is the tag named by the replication spec. The tag
-#:    SEC filers actually use for total assets in us-gaap is ``Assets``; this
-#:    mapping is the single place to change if the backfill shows the spec's
-#:    name is not what lands in the facts store.
+#: ``Assets`` is the us-gaap concept for *total* assets, and is deliberately the
+#: sibling of ``AssetsCurrent`` here: the numerator is a change in working
+#: capital, the denominator the whole balance sheet it is scaled against.
 TAGS = {
     "ca": "AssetsCurrent",
     "cash": "CashAndCashEquivalentsAtCarryingValue",
     "cl": "LiabilitiesCurrent",
-    "ta": "AssetsTotal",
+    "ta": "Assets",
 }
 
 #: Annual reports only. Accruals is a year-over-year measure, and a 10-Q balance

@@ -6,13 +6,19 @@ Bernard-Thomas 1989, and Chen-Zimmermann's ``EarningsSurprise``). The signal
 buys the names that just surprised upward, scaled so that a big surprise at a
 volatile filer counts for less than the same surprise at a steady one::
 
-    SUE = (E_q - E_{q-4}) / std(last up to 8 seasonal differences)
+    SUE = (E_q - E_{q-4}) / std(up to 8 *prior* seasonal differences)
 
 ``E_q - E_{q-4}`` is the *seasonal* difference — this quarter against the same
 quarter a year ago — because quarterly earnings are strongly seasonal and a
-sequential difference would mostly measure the calendar. A filer needs at least
-:data:`MIN_HISTORY` seasonal differences (so eight quarters) before it can be
-scored at all.
+sequential difference would mostly measure the calendar.
+
+The denominator is the standard deviation of the differences *before* the
+current one — the Bernard-Thomas convention, and the one behind the published
+series this package is calibrated against. Including the current difference
+would let a large surprise inflate its own denominator and shrink exactly the
+observations the anomaly is made of. A filer therefore needs at least
+:data:`MIN_HISTORY` *prior* seasonal differences (so nine quarterly
+observations) before it can be scored at all.
 
 **Only three-month rows may enter the series.** A 10-Q files ``NetIncomeLoss``
 twice for the same period ``end`` — once for the three months, once
@@ -61,7 +67,10 @@ SEASONAL_LAG = 4
 #: would otherwise have Q1 differenced against a quarter fifteen months back.
 SEASONAL_GAP_DAYS = (330, 400)
 
-#: The SUE denominator: at most this many differences, at least :data:`MIN_HISTORY`.
+#: The SUE denominator window, over the *prior* seasonal differences only: at
+#: most :data:`HISTORY_QUARTERS` of them, and the filer is skipped unless at
+#: least :data:`MIN_HISTORY` exist. The current difference is the numerator and
+#: never enters the scale it is divided by.
 HISTORY_QUARTERS = 8
 MIN_HISTORY = 4
 
@@ -76,11 +85,12 @@ def signal(asof: dt.date, window_days: int = DEFAULT_WINDOW_DAYS) -> pl.DataFram
     frame when no filer qualifies. A filer is scored when all of the following
     hold at `asof`:
 
-    * it has at least :data:`MIN_HISTORY` seasonal differences built from
-      three-month ``NetIncomeLoss`` rows filed by `asof`;
-    * those differences have a non-zero, finite standard deviation (a filer
-      whose surprises never vary has no scale to standardise by, and dividing by
-      zero would hand it an infinite SUE);
+    * on top of the current seasonal difference it has at least
+      :data:`MIN_HISTORY` *prior* ones — so nine three-month ``NetIncomeLoss``
+      rows filed by `asof`;
+    * those prior differences have a non-zero, finite standard deviation (a
+      filer whose surprises never vary has no scale to standardise by, and
+      dividing by zero would hand it an infinite SUE);
     * its most recent such quarter was *filed* no more than `window_days` before
       `asof`, inclusive — the drift window.
 
@@ -130,12 +140,19 @@ def signal(asof: dt.date, window_days: int = DEFAULT_WINDOW_DAYS) -> pl.DataFram
         .agg(diffs=pl.col("diff").sort_by("end"),
              announced=pl.col("filed").sort_by("end").last())
         .filter(
-            (pl.col("diffs").list.len() >= MIN_HISTORY)
+            # `>`, not `>=`: MIN_HISTORY counts the *prior* differences, and
+            # the newest element of the list is the surprise being scored.
+            (pl.col("diffs").list.len() > MIN_HISTORY)
             & (pl.col("announced") >= asof - dt.timedelta(days=window_days))
         )
         .with_columns(
             surprise=pl.col("diffs").list.last(),
-            scale=pl.col("diffs").list.tail(HISTORY_QUARTERS).list.std(),
+            # `head(len - 1)` drops the current difference before `tail` takes
+            # the window it is standardised against: prior differences only.
+            scale=pl.col("diffs")
+            .list.head(pl.col("diffs").list.len() - 1)
+            .list.tail(HISTORY_QUARTERS)
+            .list.std(),
         )
         .filter(pl.col("scale").is_not_null() & pl.col("scale").is_finite()
                 & (pl.col("scale") > 0))

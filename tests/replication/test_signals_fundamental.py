@@ -22,6 +22,7 @@ import polars as pl
 import pytest
 
 from tbot.replication import accruals, pead
+from tbot.replication.pead import HISTORY_QUARTERS
 from tbot.warehouse import edgar
 
 SIGNAL_COLUMNS = {"symbol": pl.Utf8, "score": pl.Float64}
@@ -115,7 +116,7 @@ def _year_to_date(values, quarters=None):
 
 
 ACCRUAL_TAGS = ("AssetsCurrent", "CashAndCashEquivalentsAtCarryingValue",
-                "LiabilitiesCurrent", "AssetsTotal")
+                "LiabilitiesCurrent", "Assets")
 
 
 def _annual(snapshots, form="10-K", filed_offset=45):
@@ -137,17 +138,21 @@ def _annual(snapshots, form="10-K", filed_offset=45):
 BLOAT_BS = {"AssetsCurrent": [100.0, 200.0],  # receivables balloon
             "CashAndCashEquivalentsAtCarryingValue": [50.0, 50.0],
             "LiabilitiesCurrent": [40.0, 40.0],
-            "AssetsTotal": [500.0, 600.0]}
+            "Assets": [500.0, 600.0]}
 CLEAN_BS = {"AssetsCurrent": [100.0, 110.0],  # the growth is cash
             "CashAndCashEquivalentsAtCarryingValue": [50.0, 60.0],
             "LiabilitiesCurrent": [40.0, 40.0],
-            "AssetsTotal": [500.0, 600.0]}
+            "Assets": [500.0, 600.0]}
 
 
 def _sue(earnings: list[float]) -> float:
-    """The SUE the implementation should produce for a nine-quarter series."""
+    """The SUE the implementation should produce for a quarterly earnings series.
+
+    The denominator is the *prior* seasonal differences — up to eight of them,
+    the current one excluded — which is why ``[-9:-1]`` and not ``[-8:]``.
+    """
     diffs = [earnings[i] - earnings[i - 4] for i in range(4, len(earnings))]
-    return diffs[-1] / pl.Series(diffs[-8:]).std()
+    return diffs[-1] / pl.Series(diffs[-9:-1]).std()
 
 
 # --- PEAD: the contract from the brief ----------------------------------------------
@@ -277,43 +282,67 @@ def test_pead_rejects_a_non_positive_window(tmp_path, monkeypatch):
 # --- PEAD: point-in-time and the history requirement --------------------------------
 
 def test_pead_ignores_facts_filed_after_asof(tmp_path, monkeypatch):
-    """The surprise is announced on 2020-05-22; the day before, nobody had it."""
+    """The surprise is announced on 2020-05-22; the day before, nobody had it.
+
+    Ten quarters, so the day before the announcement still leaves nine — enough
+    to score. The two dates must therefore give two *different* scores, not one
+    score and one empty frame.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _write_ticker_map(tmp_path, [(1, "BEAT")])
     announced = ASOF - dt.timedelta(days=10)
-    _ingest(1, {"NetIncomeLoss": _quarterly(BEAT_EARNINGS, last_filed=announced)})
-    assert pead.signal(announced)["score"][0] == pytest.approx(_sue(BEAT_EARNINGS))
-    # One day earlier the ninth quarter is unfiled: eight quarters leave four
-    # seasonal differences, and the newest of them is a year old.
+    values = [100.0, *BASE, 165.0]  # ten quarters, the last a +50% surprise
+    _ingest(1, {"NetIncomeLoss": _quarterly(
+        values, quarters=QUARTERS[1:], last_filed=announced)})
+    assert pead.signal(announced)["score"][0] == pytest.approx(_sue(values))
     assert pead.signal(announced - dt.timedelta(days=1), window_days=1000)[
-        "score"][0] == pytest.approx(_sue(BEAT_EARNINGS[:8]))
+        "score"][0] == pytest.approx(_sue(values[:9]))
+    assert _sue(values) != pytest.approx(_sue(values[:9]))
 
 
-def test_pead_needs_eight_quarters(tmp_path, monkeypatch):
-    """Four seasonal differences is the floor, and four needs eight quarters."""
+def test_pead_needs_nine_quarters(tmp_path, monkeypatch):
+    """Four *prior* differences is the floor, and four priors need nine quarters.
+
+    Eight quarters yield four differences, but one of them is the surprise
+    itself, leaving only three to standardise by.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _write_ticker_map(tmp_path, [(1, "SHORT"), (2, "LONG")])
     announced = ASOF - dt.timedelta(days=10)
     _ingest(1, {"NetIncomeLoss": _quarterly(
-        BEAT_EARNINGS[2:], quarters=QUARTERS[4:], last_filed=announced)})  # 7 quarters
-    _ingest(2, {"NetIncomeLoss": _quarterly(
         BEAT_EARNINGS[1:], quarters=QUARTERS[3:], last_filed=announced)})  # 8 quarters
+    _ingest(2, {"NetIncomeLoss": _quarterly(
+        BEAT_EARNINGS, last_filed=announced)})  # 9 quarters
     assert pead.signal(ASOF)["symbol"].to_list() == ["LONG"]
 
 
-def test_pead_denominator_is_the_last_eight_seasonal_differences(tmp_path, monkeypatch):
-    """A long history is truncated to eight differences, not averaged over all."""
+def test_pead_denominator_is_the_last_eight_prior_seasonal_differences(
+        tmp_path, monkeypatch):
+    """Prior differences only, capped at eight — the Bernard-Thomas convention.
+
+    The three readings are pulled apart deliberately, so this fails under the
+    two the ruling rejected: including the current difference in the scale, and
+    taking every prior difference rather than the last eight.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _write_ticker_map(tmp_path, [(1, "LONGHIST")])
     quarters = _consecutive_quarters(17, first=(2016, 1))  # 2016Q1 .. 2020Q1
-    values = [float(10 * i) for i in range(len(quarters) - 1)] + [1_000.0]
+    # The `% 3` term makes the seasonal differences alternate 47/26, so the
+    # eight-difference window and the full history have different spreads.
+    values = [float(10 * i + 7 * (i % 3)) for i in range(len(quarters) - 1)]
+    values += [1_000.0]
     _ingest(1, {"NetIncomeLoss": _quarterly(
         values, quarters=quarters, last_filed=ASOF - dt.timedelta(days=10))})
+
     diffs = [values[i] - values[i - 4] for i in range(4, len(values))]
-    assert len(diffs) > 8, "the fixture must have more history than the cap"
-    expected = diffs[-1] / pl.Series(diffs[-8:]).std()
-    assert pead.signal(ASOF)["score"][0] == pytest.approx(expected)
-    assert expected != pytest.approx(diffs[-1] / pl.Series(diffs).std())
+    assert len(diffs) > HISTORY_QUARTERS + 1, "fixture must exceed the cap"
+    prior_capped = diffs[-1] / pl.Series(diffs[-9:-1]).std()      # the ruling
+    include_current = diffs[-1] / pl.Series(diffs[-8:]).std()     # rejected
+    every_prior = diffs[-1] / pl.Series(diffs[:-1]).std()         # rejected
+
+    assert pead.signal(ASOF)["score"][0] == pytest.approx(prior_capped)
+    assert prior_capped != pytest.approx(include_current)
+    assert prior_capped != pytest.approx(every_prior)
 
 
 def test_pead_drops_a_filer_whose_surprises_never_vary(tmp_path, monkeypatch):
@@ -479,9 +508,9 @@ def test_accruals_drops_a_non_positive_asset_base(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _write_ticker_map(tmp_path, [(1, "NOASSETS"), (2, "BLOAT"), (3, "NEGASSETS")])
-    _ingest(1, _annual({**BLOAT_BS, "AssetsTotal": [0.0, 0.0]}))
+    _ingest(1, _annual({**BLOAT_BS, "Assets": [0.0, 0.0]}))
     _ingest(2, _annual(BLOAT_BS))
-    _ingest(3, _annual({**BLOAT_BS, "AssetsTotal": [-500.0, -600.0]}))
+    _ingest(3, _annual({**BLOAT_BS, "Assets": [-500.0, -600.0]}))
     assert accruals.signal(ASOF)["symbol"].to_list() == ["BLOAT"]
 
 
@@ -500,7 +529,7 @@ def test_accruals_subtracts_cash_and_current_liabilities(tmp_path, monkeypatch):
     _ingest(1, _annual({"AssetsCurrent": [100.0, 190.0],       # +90
                         "CashAndCashEquivalentsAtCarryingValue": [50.0, 70.0],  # +20
                         "LiabilitiesCurrent": [40.0, 70.0],    # +30
-                        "AssetsTotal": [500.0, 600.0]}))
+                        "Assets": [500.0, 600.0]}))
     assert accruals.signal(ASOF)["score"][0] == pytest.approx(-(90 - 20 - 30) / 550)
 
 
