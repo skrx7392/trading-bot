@@ -1,3 +1,3 @@
 """tbot — systematic-trading research pipeline."""
 
-__all__ = ["config", "ledger", "warehouse"]
+__all__ = ["backtest", "config", "ledger", "replication", "warehouse"]
