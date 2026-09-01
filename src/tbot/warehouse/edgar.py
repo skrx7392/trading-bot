@@ -45,6 +45,7 @@ from pathlib import Path
 import polars as pl
 
 from tbot import config, ledger
+from tbot._dates import as_date
 
 #: One row per XBRL fact entry. ``filed`` is the PIT key; ``end`` is the period
 #: the number describes. Every parquet file under ``edgar/facts/`` has exactly
@@ -142,19 +143,6 @@ def _as_cik(value, label: str = "cik") -> int:
     if number <= 0:
         raise ValueError(f"{label} must be positive, got {number}")
     return number
-
-
-def _as_date(value, label: str) -> dt.date:
-    """Coerce a date, datetime or ISO date string to a `datetime.date`."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)  # raises ValueError if malformed
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
-    )
 
 
 def _opt_date(value) -> dt.date | None:
@@ -410,7 +398,7 @@ def pit_facts(tag: str, asof: dt.date) -> pl.DataFrame:
         raise TypeError(f"tag must be a string, got {type(tag).__name__}")
     if not tag.strip():
         raise ValueError("tag must be a non-empty string")
-    cutoff = _as_date(asof, "asof")
+    cutoff = as_date(asof, "asof")
 
     df = read_facts([tag])
     if df.height == 0:

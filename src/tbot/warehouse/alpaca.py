@@ -8,6 +8,11 @@ Credentials come from ``APCA_API_KEY_ID`` / ``APCA_API_SECRET_KEY``. The HTTP
 client is injectable so the parsing and pagination logic is testable without a
 network call; when none is injected one is built here and closed again.
 
+Requests are bounded on two axes. The *response* is paginated by the API, and
+pages are followed until the token stops changing. The *request* is bounded
+here: the symbol list rides in the query string, so it goes out
+:data:`PAGE_SYMBOLS` at a time rather than as one universe-sized URL.
+
 The response is turned into the store's input columns, and bars that do not
 parse cleanly are dropped rather than written as nulls — the store rejects null
 keys, and a NaN price would silently poison every downstream aggregate.
@@ -31,6 +36,15 @@ _URL = "https://data.alpaca.markets/v2/stocks/bars"
 TIMEFRAME = "1Day"
 FEED = "iex"
 PAGE_LIMIT = 10_000
+
+#: Symbols per request. The whole list goes into the query string, and the
+#: tradable universe is 2-3k names — 15-20 KB of URL, which servers, proxies and
+#: CDNs are entitled to reject with a 414 or truncate silently. 200 keeps the
+#: line comfortably under any of those limits while keeping the request count
+#: low; the response is paginated per chunk exactly as before, so this bounds the
+#: URL, not the data.
+PAGE_SYMBOLS = 200
+
 KEY_ENV = "APCA_API_KEY_ID"
 SECRET_ENV = "APCA_API_SECRET_KEY"
 
@@ -87,8 +101,12 @@ def fetch_bars(
 
     Returns the store's input columns with the store's dtypes, including when
     nothing comes back, so the result is always safe to hand to
-    :func:`store.write_bars`. Pages are followed until the API stops handing back
-    a new token. `client` accepts any object with httpx's ``get`` signature.
+    :func:`store.write_bars`. `symbols` is requested :data:`PAGE_SYMBOLS` at a
+    time — the list travels in the query string, and a universe-sized one does
+    not fit in a URL — and each chunk's pages are followed until the API stops
+    handing back a new token. The chunks' rows are concatenated, so the result is
+    the same frame a single unbounded request would have produced. `client`
+    accepts any object with httpx's ``get`` signature.
     """
     _check_range(start, end)
     syms = _normalise_symbols(symbols)
@@ -110,36 +128,40 @@ def fetch_bars(
         client = httpx.Client(timeout=_TIMEOUT)
 
     rows: list[dict] = []
-    token: str | None = None
-    seen_tokens: set[str] = set()
     try:
-        while True:
-            params = {
-                "symbols": ",".join(syms),
-                "timeframe": TIMEFRAME,
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "feed": FEED,
-                "limit": PAGE_LIMIT,
-            }
-            if token:
-                params["page_token"] = token
-            r = client.get(_URL, params=params, headers=headers)
-            r.raise_for_status()
-            body = r.json() or {}
+        for i in range(0, len(syms), PAGE_SYMBOLS):
+            chunk = ",".join(syms[i:i + PAGE_SYMBOLS])
+            # A page token belongs to the chunk that issued it, so both it and
+            # the loop guard are reset per chunk rather than carried across.
+            token: str | None = None
+            seen_tokens: set[str] = set()
+            while True:
+                params = {
+                    "symbols": chunk,
+                    "timeframe": TIMEFRAME,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "feed": FEED,
+                    "limit": PAGE_LIMIT,
+                }
+                if token:
+                    params["page_token"] = token
+                r = client.get(_URL, params=params, headers=headers)
+                r.raise_for_status()
+                body = r.json() or {}
 
-            for sym, bars in (body.get("bars") or {}).items():
-                symbol = str(sym).strip().upper()
-                for bar in bars or ():
-                    row = _bar_row(symbol, bar)
-                    if row is not None:
-                        rows.append(row)
+                for sym, bars in (body.get("bars") or {}).items():
+                    symbol = str(sym).strip().upper()
+                    for bar in bars or ():
+                        row = _bar_row(symbol, bar)
+                        if row is not None:
+                            rows.append(row)
 
-            token = body.get("next_page_token")
-            # A server that keeps handing back the same token must not spin us.
-            if not token or token in seen_tokens:
-                break
-            seen_tokens.add(token)
+                token = body.get("next_page_token")
+                # A server that keeps handing back the same token must not spin us.
+                if not token or token in seen_tokens:
+                    break
+                seen_tokens.add(token)
     finally:
         if owned:
             client.close()

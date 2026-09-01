@@ -141,6 +141,81 @@ def test_alpaca_collects_every_symbol_in_a_page():
     assert sorted(df["symbol"].unique().to_list()) == ["AAPL", "MSFT"]
 
 
+# --- alpaca: symbol chunking --------------------------------------------------------
+# The universe is 2-3k names and every one of them goes into the query string. A
+# single GET carrying all of them is 15-20 KB of URL, which servers and proxies
+# are entitled to reject outright — so the symbol list is chunked and the
+# existing page loop runs per chunk.
+
+class EchoClient:
+    """Answers every request with one bar for each symbol it was asked about."""
+
+    def __init__(self, pages_per_chunk=1):
+        self.pages_per_chunk = pages_per_chunk
+        self.requests = []
+
+    def get(self, url, params=None, headers=None):
+        params = dict(params or {})
+        self.requests.append(params)
+        syms = params["symbols"].split(",")
+        # Which page of this chunk is being served: count the requests seen so
+        # far for this same symbol list, this one included.
+        n = sum(1 for r in self.requests if r["symbols"] == params["symbols"])
+        token = f"p{n}" if n < self.pages_per_chunk else None
+        return _Response(_page({s: [_bar(n + 1)] for s in syms}, token=token))
+
+    @property
+    def symbol_lists(self):
+        return [r["symbols"].split(",") for r in self.requests]
+
+
+def _universe(n: int) -> list[str]:
+    """`n` distinct tickers, wide enough to need several chunks."""
+    return [f"S{i:04d}" for i in range(n)]
+
+
+def test_alpaca_chunks_the_symbol_list():
+    syms = _universe(alpaca.PAGE_SYMBOLS * 2 + 1)
+    c = EchoClient()
+    alpaca.fetch_bars(syms, dt.date(2020, 1, 1), dt.date(2020, 1, 5), client=c)
+    assert len(c.requests) == 3
+    assert [len(lst) for lst in c.symbol_lists] == [
+        alpaca.PAGE_SYMBOLS, alpaca.PAGE_SYMBOLS, 1
+    ]
+    assert all(len(lst) <= alpaca.PAGE_SYMBOLS for lst in c.symbol_lists)
+
+
+def test_alpaca_chunks_partition_the_symbol_list_and_aggregate():
+    """Every requested symbol is asked for exactly once, and every bar comes back."""
+    syms = _universe(alpaca.PAGE_SYMBOLS * 2 + 1)
+    c = EchoClient()
+    df = alpaca.fetch_bars(syms, dt.date(2020, 1, 1), dt.date(2020, 1, 5), client=c)
+    requested = [s for lst in c.symbol_lists for s in lst]
+    assert requested == syms  # a partition, in order: nothing dropped, nothing twice
+    assert df.height == len(syms)
+    assert sorted(df["symbol"].to_list()) == sorted(syms)
+
+
+def test_alpaca_paginates_within_each_chunk():
+    """Each chunk runs the page loop from scratch: no token leaks across chunks."""
+    syms = _universe(alpaca.PAGE_SYMBOLS + 2)
+    c = EchoClient(pages_per_chunk=2)
+    df = alpaca.fetch_bars(syms, dt.date(2020, 1, 1), dt.date(2020, 1, 5), client=c)
+    assert len(c.requests) == 4  # two chunks, two pages each
+    firsts = [c.requests[0], c.requests[2]]
+    assert all("page_token" not in r for r in firsts)
+    assert [r.get("page_token") for r in (c.requests[1], c.requests[3])] == ["p1", "p1"]
+    assert df.height == 2 * len(syms)  # one bar per symbol per page
+
+
+def test_alpaca_single_chunk_makes_one_request():
+    """The common small-list case is unchanged: no extra round trips."""
+    c = EchoClient()
+    alpaca.fetch_bars(_universe(alpaca.PAGE_SYMBOLS), dt.date(2020, 1, 1),
+                      dt.date(2020, 1, 5), client=c)
+    assert len(c.requests) == 1
+
+
 # --- alpaca: result shape and bad data ----------------------------------------------
 
 def test_alpaca_returns_canonical_input_schema():

@@ -148,7 +148,7 @@ import polars as pl
 
 from tbot import ledger
 from tbot.backtest import metrics
-from tbot.replication import _as_date
+from tbot._dates import as_date
 
 #: The published-series schema. ``month`` is the first of the month the return
 #: was earned in, matching :data:`tbot.backtest.metrics.SERIES_SCHEMA`'s label
@@ -389,8 +389,8 @@ def run(
         raise ValueError("anomaly must be a non-empty string")
     if not callable(series_fn):
         raise TypeError(f"series_fn must be callable, got {type(series_fn).__name__}")
-    start = _as_date(start, "start")
-    end = _as_date(end, "end")
+    start = as_date(start, "start")
+    end = as_date(end, "end")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
     # Resolved before `series_fn` runs: a bad path should not cost a full

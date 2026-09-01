@@ -41,7 +41,8 @@ import datetime as dt
 
 import polars as pl
 
-from tbot.replication import _as_date, _empty, _finalise, _positive_int
+from tbot._dates import as_date
+from tbot.replication import _empty, _finalise, _positive_int
 from tbot.warehouse import edgar
 from tbot.warehouse.universe import _ticker_map
 
@@ -98,7 +99,7 @@ def signal(asof: dt.date, window_days: int = DEFAULT_WINDOW_DAYS) -> pl.DataFram
     unmappable warehouse cannot be mistaken for a month in which nothing
     surprised. `window_days` must be a positive int.
     """
-    asof = _as_date(asof)
+    asof = as_date(asof, "asof")
     window_days = _positive_int(window_days, "window_days")
     tickers = _ticker_map()  # fail on a missing map before doing any work
 

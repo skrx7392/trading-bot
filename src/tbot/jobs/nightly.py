@@ -10,6 +10,23 @@ because reconciliation votes on whatever closes the store holds: run it against
 a single vendor and every symbol-day passes unanimously on one vote, which is
 the one outcome that looks healthy and proves nothing.
 
+**Two vendors, not three, and that changes what a disagreement costs.** Stooq is
+a bulk historical dump with no incremental path, so the nightly run ingests
+alpaca and yf only: a fresh session-day reaches the vote with at most two
+closes, never the three the reconciler is written for. At ``n = 2``
+:func:`tbot.warehouse.reconcile.run`'s ``majority`` verdict is arithmetically
+unreachable — a strict majority of two is two, which is unanimity — so the vote
+is binary. Either the two closes agree within ``tol`` and the day is ``ok``, or
+they do not and it is quarantined; there is no middle verdict that publishes a
+close over one dissenter. Any disagreement beyond tolerance is therefore a hole
+in the canonical series rather than a best-of-three number, which is the
+intended trade: a gap a backtest can see and skip beats a close nobody can
+vouch for. It does mean the quarantine count in the summary is a direct read on
+how often the two vendors differ — a rate that climbs is a vendor problem to
+investigate, not noise to widen ``tol`` against — and that a day only one vendor
+covered still settles as ``ok`` on its single vote, exactly as the Stooq-only
+era did.
+
 Three things are deliberately *not* special-cased:
 
 *A non-trading day.* ``asof - 1`` is often a holiday or a Saturday. The fetchers
@@ -42,23 +59,11 @@ import sys
 from collections.abc import Iterable
 
 from tbot import ledger
+from tbot._dates import as_date
 from tbot.warehouse import alpaca, reconcile, universe, yf
 
 #: Ledger event kind for the run summary.
 EVENT_KIND = "job.nightly"
-
-
-def _as_date(value, label: str) -> dt.date:
-    """Coerce a date, datetime or ISO date string, mirroring the warehouse reads."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)  # raises ValueError if malformed
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
-    )
 
 
 def _as_symbols(value) -> list[str]:
@@ -83,7 +88,7 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
     is written to the ledger under :data:`EVENT_KIND` before it is returned, so
     a run is auditable even when the caller drops the result.
     """
-    asof = dt.date.today() if asof is None else _as_date(asof, "asof")
+    asof = dt.date.today() if asof is None else as_date(asof, "asof")
     day = asof - dt.timedelta(days=1)
 
     if symbols is None:

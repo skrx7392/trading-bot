@@ -119,13 +119,15 @@ ACCRUAL_TAGS = ("AssetsCurrent", "CashAndCashEquivalentsAtCarryingValue",
                 "LiabilitiesCurrent", "Assets")
 
 
-def _annual(snapshots, form="10-K", filed_offset=45):
+def _annual(snapshots, form="10-K", filed_offset=45, ends=None):
     """Balance-sheet instants: ``{tag: [val_y0, val_y1]}`` at two fiscal year ends.
 
     Instants carry no ``start`` — that absence is the whole point of the second
-    controller ruling, and these entries omit it exactly as EDGAR does.
+    controller ruling, and these entries omit it exactly as EDGAR does. `ends`
+    defaults to two consecutive December year ends; pass it to place the same
+    snapshots on a different pair of period ends.
     """
-    ends = [dt.date(2018, 12, 31), dt.date(2019, 12, 31)]
+    ends = [dt.date(2018, 12, 31), dt.date(2019, 12, 31)] if ends is None else ends
     return {
         tag: [{"end": end.isoformat(), "val": vals[i],
                "filed": (end + dt.timedelta(days=filed_offset)).isoformat(),
@@ -531,6 +533,38 @@ def test_accruals_subtracts_cash_and_current_liabilities(tmp_path, monkeypatch):
                         "LiabilitiesCurrent": [40.0, 70.0],    # +30
                         "Assets": [500.0, 600.0]}))
     assert accruals.signal(ASOF)["score"][0] == pytest.approx(-(90 - 20 - 30) / 550)
+
+
+def test_accruals_excludes_a_filer_whose_two_year_ends_are_not_adjacent(tmp_path,
+                                                                        monkeypatch):
+    """`GAPPED`'s two complete snapshots are seven years apart.
+
+    Taking the latest two *complete* year ends says nothing about how far apart
+    they are: a filer that went dark and came back has a seven-year change in
+    working capital reported as one year of accruals. Same reasoning as pead's
+    :data:`~tbot.replication.pead.SEASONAL_GAP_DAYS`.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "GAPPED"), (2, "BLOAT")])
+    _ingest(1, _annual(BLOAT_BS,
+                       ends=[dt.date(2012, 12, 31), dt.date(2019, 12, 31)]))
+    _ingest(2, _annual(BLOAT_BS))
+    sig = accruals.signal(ASOF)
+    assert sig["symbol"].to_list() == ["BLOAT"]
+    assert sig["score"][0] == pytest.approx(-100 / 550)
+
+
+def test_accruals_keeps_a_52_53_week_fiscal_calendar(tmp_path, monkeypatch):
+    """A 52-week fiscal year ends 364 days after the last one, not 365.
+
+    The band has to be loose enough for a retailer's floating year end, or the
+    guard above would quietly delete a whole class of filers.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "RETAILER")])
+    _ingest(1, _annual(BLOAT_BS,
+                       ends=[dt.date(2018, 12, 29), dt.date(2019, 12, 28)]))
+    assert accruals.signal(ASOF)["score"][0] == pytest.approx(-100 / 550)
 
 
 # --- accruals: the frame contract ---------------------------------------------------

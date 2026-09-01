@@ -34,13 +34,12 @@ not a signal: it is the harness that scores a reproduced series against the
 published one and writes the ``replication.calibration`` verdict to the ledger.
 It also carries the runbook for obtaining the published files.
 
-The shared frame contract, coercions and finiteness guards live in this module's
-namespace; the submodules are imported explicitly
+The shared frame contract and finiteness guards live in this module's namespace;
+`asof` coercion is :func:`tbot._dates.as_date`, shared with the warehouse reads
+these signals sit on top of. The submodules are imported explicitly
 (``from tbot.replication import momentum``) to match :mod:`tbot.warehouse` and
 :mod:`tbot.backtest`.
 """
-
-import datetime as dt
 
 import polars as pl
 
@@ -74,19 +73,6 @@ def _finalise(df: pl.DataFrame) -> pl.DataFrame:
         .cast(dict(SCHEMA))
         .filter(pl.col("score").is_not_null() & pl.col("score").is_finite())
         .sort(["symbol", "score"])
-    )
-
-
-def _as_date(value, label: str = "asof") -> dt.date:
-    """Coerce a date, datetime or ISO date string, mirroring the warehouse reads."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)  # raises ValueError if malformed
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
     )
 
 

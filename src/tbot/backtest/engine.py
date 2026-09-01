@@ -97,6 +97,7 @@ import numpy as np
 import polars as pl
 
 from tbot import config, ledger
+from tbot._dates import as_date
 from tbot.backtest import costs as costs_mod
 from tbot.backtest.strategy import Strategy
 from tbot.backtest.tax import TaxLots
@@ -170,19 +171,6 @@ class BacktestResult:
     trades: int
     cost_model_version: str
     costs_paid: float
-
-
-def _as_date(value, label: str) -> dt.date:
-    """Coerce a date-ish argument, mirroring the warehouse read filters."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
-    )
 
 
 def _period_ends(days: list[dt.date], key) -> list[dt.date]:
@@ -458,8 +446,8 @@ def run(
     """
     if not isinstance(strat, Strategy):
         raise TypeError(f"strat must be a Strategy, got {type(strat).__name__}")
-    start = _as_date(start, "start")
-    end = _as_date(end, "end")
+    start = as_date(start, "start")
+    end = as_date(end, "end")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
     if isinstance(capital, bool) or not isinstance(capital, (int, float)):

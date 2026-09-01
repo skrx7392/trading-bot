@@ -107,6 +107,7 @@ from collections.abc import Callable, Iterable
 import numpy as np
 import polars as pl
 
+from tbot._dates import as_date
 from tbot.warehouse import reconcile
 
 #: The long-short series schema. Task 13 joins on ``month``; nothing else is
@@ -118,19 +119,6 @@ SERIES_SCHEMA = pl.Schema({"month": pl.Date, "ret_ls": pl.Float64})
 #: Two points are always perfectly correlated; three is the first number that
 #: can be wrong.
 MIN_OVERLAP = 3
-
-
-def _as_date(value, label: str) -> dt.date:
-    """Coerce a date-ish argument, mirroring the warehouse read filters."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
-    )
 
 
 def _month_ends(days: list[dt.date]) -> list[dt.date]:
@@ -289,8 +277,8 @@ def monthly_longshort(
         raise TypeError(f"signal_fn must be callable, got {type(signal_fn).__name__}")
     if universe_fn is not None and not callable(universe_fn):
         raise TypeError(f"universe_fn must be callable, got {type(universe_fn).__name__}")
-    start = _as_date(start, "start")
-    end = _as_date(end, "end")
+    start = as_date(start, "start")
+    end = as_date(end, "end")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
     if isinstance(n_deciles, bool) or not isinstance(n_deciles, int):

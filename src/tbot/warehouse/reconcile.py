@@ -47,6 +47,7 @@ from pathlib import Path
 import polars as pl
 
 from tbot import config, ledger
+from tbot._dates import as_date
 from tbot.warehouse import store
 
 #: The canonical close schema. Five columns, no more: every downstream consumer
@@ -100,19 +101,6 @@ def _run_timestamp() -> dt.datetime:
             now = _last_stamp + dt.timedelta(microseconds=1)
         _last_stamp = now
     return now
-
-
-def _as_date(value, label: str) -> dt.date:
-    """Coerce a date-ish argument, mirroring ``store``'s read filters."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
-    )
 
 
 def _check_tol(tol) -> float:
@@ -191,8 +179,8 @@ def run(start: dt.date, end: dt.date, tol: float = DEFAULT_TOL) -> dict[str, int
     for audit) and one ledger event per non-unanimous symbol-day. Re-running a
     range is safe and is how corrections are applied: the newest verdict wins.
     """
-    start = _as_date(start, "start")
-    end = _as_date(end, "end")
+    start = as_date(start, "start")
+    end = as_date(end, "end")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
     tol = _check_tol(tol)
@@ -312,7 +300,7 @@ def read_canonical(
     if symbols is not None:
         df = df.filter(pl.col("symbol").is_in(pl.lit(list(symbols), dtype=pl.List(pl.Utf8))))
     if start is not None:
-        df = df.filter(pl.col("ts") >= _as_date(start, "start"))
+        df = df.filter(pl.col("ts") >= as_date(start, "start"))
     if end is not None:
-        df = df.filter(pl.col("ts") <= _as_date(end, "end"))
+        df = df.filter(pl.col("ts") <= as_date(end, "end"))
     return df.sort(["symbol", "ts"]).select(list(SCHEMA))

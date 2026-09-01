@@ -389,3 +389,102 @@ def test_issuance_rejects_a_non_date_asof(tmp_path, monkeypatch):
     _write_ticker_map(tmp_path, [(1, "A")])
     with pytest.raises(TypeError, match="asof"):
         issuance.signal(20200901)
+
+
+# --- issuance: the two share counts must be the same concept, and both current ------
+# A ratio is only a share-count change when its numerator and denominator measure
+# the same thing at two known dates. Two ways that quietly fails: the filer's
+# available tag differs between the endpoints (one count is one share class, the
+# other is every class), and the filer stopped filing years ago (the "change" is
+# a stale number differenced against itself, which scores a confident 0.0 and
+# lands mid-cross-section as if the count had genuinely held steady).
+
+def _mixer_facts(cik: int, gaap: tuple[str, str, float],
+                 dei: tuple[str, str, float]) -> None:
+    """One filer reporting the primary tag and the dei tag at different times.
+
+    Both tags in one companyfacts document, because a document is a filer's
+    complete snapshot and a second ingest would replace the first.
+    """
+    edgar.ingest_companyfacts(json.dumps({"cik": cik, "facts": {
+        taxonomy: {tag: {"units": {"shares": [
+            {"end": end, "filed": filed, "val": val, "accn": f"{tag}-{filed}",
+             "fy": int(end[:4]), "fp": "Q2", "form": "10-Q"}]}}}
+        for taxonomy, tag, (end, filed, val) in (
+            ("us-gaap", "CommonStockSharesOutstanding", gaap),
+            ("dei", "EntityCommonStockSharesOutstanding", dei))}}).encode())
+
+
+def test_issuance_never_divides_one_tag_by_the_other(tmp_path, monkeypatch):
+    """`MIXER` has the us-gaap count only now and the dei count at both ends.
+
+    Resolving the fallback independently at each endpoint divides the us-gaap
+    numerator by the dei denominator and reports a 40% buyback at a filer whose
+    count never moved. Resolved once per filer, the dei tag carries both ends
+    and the score is the ``166/166`` it should always have been.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "MIXER"), (2, "STEADY")])
+    _mixer_facts(1, gaap=("2020-06-30", "2020-08-01", 100.0),
+                 dei=("2019-06-30", "2019-08-01", 166.0))
+    _shares_facts(2, [("2019-06-30", "2019-08-01", 100.0),
+                      ("2020-06-30", "2020-08-01", 100.0)])
+    sig = issuance.signal(dt.date(2020, 9, 1)).sort("symbol")
+    assert sig["symbol"].to_list() == ["MIXER", "STEADY"]
+    assert sig["score"][0] == pytest.approx(0.0)
+    assert sig["score"][0] != pytest.approx(-pl.Series([100 / 166]).log()[0])
+
+
+def test_issuance_drops_a_filer_no_single_tag_can_pair(tmp_path, monkeypatch):
+    """The same mixing, with neither tag covering both ends: no score at all.
+
+    `MIXER`'s dei count is 427 days old at `asof` and cannot stand for the near
+    endpoint, and its us-gaap count did not exist a year ago. Two half-series
+    are not a ratio.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "MIXER"), (2, "STEADY")])
+    _mixer_facts(1, gaap=("2020-06-30", "2020-08-01", 100.0),
+                 dei=("2019-06-30", "2019-07-01", 166.0))
+    _shares_facts(2, [("2019-06-30", "2019-08-01", 100.0),
+                      ("2020-06-30", "2020-08-01", 100.0)])
+    assert issuance.signal(dt.date(2020, 9, 1))["symbol"].to_list() == ["STEADY"]
+
+
+def test_issuance_drops_a_filer_that_stopped_filing(tmp_path, monkeypatch):
+    """A decade-stale count is unknown, not "no issuance"."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "DELINQUENT"), (2, "CURRENT")])
+    _shares_facts(1, [("2009-06-30", "2009-08-01", 100.0),
+                      ("2010-06-30", "2010-08-01", 100.0)])
+    _shares_facts(2, [("2019-06-30", "2019-08-01", 100.0),
+                      ("2020-06-30", "2020-08-01", 100.0)])
+    assert issuance.signal(dt.date(2020, 9, 1))["symbol"].to_list() == ["CURRENT"]
+
+
+def test_issuance_drops_a_filer_whose_prior_year_count_is_stale(tmp_path, monkeypatch):
+    """`LATECOMER` doubled its count over a *decade*, not over the year.
+
+    Its only pre-`asof - 365d` count is from 2010, so the denominator is not the
+    count the market held a year ago and the ratio is not a one-year change.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "LATECOMER"), (2, "CURRENT")])
+    _shares_facts(1, [("2010-06-30", "2010-08-01", 100.0),
+                      ("2020-06-30", "2020-08-01", 200.0)])
+    _shares_facts(2, [("2019-06-30", "2019-08-01", 100.0),
+                      ("2020-06-30", "2020-08-01", 100.0)])
+    assert issuance.signal(dt.date(2020, 9, 1))["symbol"].to_list() == ["CURRENT"]
+
+
+def test_issuance_staleness_bound_is_inclusive(tmp_path, monkeypatch):
+    """Exactly :data:`MAX_FACT_AGE_DAYS` old still counts; a day older does not."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "EDGE"), (2, "OVER")])
+    asof = dt.date(2020, 9, 1)
+    edge = asof - dt.timedelta(days=issuance.MAX_FACT_AGE_DAYS)
+    _shares_facts(1, [("2019-06-30", edge.isoformat(), 100.0)])
+    _shares_facts(2, [("2019-06-30", (edge - dt.timedelta(days=1)).isoformat(), 100.0)])
+    sig = issuance.signal(asof)
+    assert sig["symbol"].to_list() == ["EDGE"]
+    assert sig["score"][0] == pytest.approx(0.0)

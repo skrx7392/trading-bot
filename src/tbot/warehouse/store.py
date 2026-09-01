@@ -25,6 +25,7 @@ from pathlib import Path
 import polars as pl
 
 from tbot import config
+from tbot._dates import as_date
 
 #: The canonical bar schema. Every parquet file under ``bars/`` has exactly
 #: these columns, in this order, with these dtypes.
@@ -109,18 +110,6 @@ def _ts_expr(dtype: pl.DataType) -> pl.Expr:
     raise TypeError(
         f"ts must be Date, Datetime or Utf8, got {dtype}; "
         "numeric dates would be silently read as days-since-epoch"
-    )
-
-
-def _as_date(value, label: str) -> dt.date:
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
     )
 
 
@@ -226,7 +215,7 @@ def read_bars(
         wanted = pl.lit(list(symbols), dtype=pl.List(pl.Utf8))
         df = df.filter(pl.col("symbol").is_in(wanted))
     if start is not None:
-        df = df.filter(pl.col("ts") >= _as_date(start, "start"))
+        df = df.filter(pl.col("ts") >= as_date(start, "start"))
     if end is not None:
-        df = df.filter(pl.col("ts") <= _as_date(end, "end"))
+        df = df.filter(pl.col("ts") <= as_date(end, "end"))
     return df.sort(["symbol", "ts", "source"]).select(list(SCHEMA))

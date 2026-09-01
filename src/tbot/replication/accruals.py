@@ -26,13 +26,21 @@ independently would happily divide a change in current assets over one pair of
 years by an asset base averaged over another. So the facts are pivoted to one
 row per ``(cik, end)``, rows missing any of the four are dropped, and the latest
 two *complete* year ends are differenced.
+
+**And those two ends must be adjacent.** "The latest two complete year ends" is
+a statement about rows, not about time: a filer that went dark and came back has
+two perfectly complete snapshots seven years apart, and differencing them
+reports seven years of working-capital growth as one year of accruals. So the
+gap between them is bounded by :data:`YEAR_GAP_DAYS`, and a filer with a hole in
+its annual history is dropped rather than mis-scaled.
 """
 
 import datetime as dt
 
 import polars as pl
 
-from tbot.replication import _as_date, _empty, _finalise
+from tbot._dates import as_date
+from tbot.replication import _empty, _finalise
 from tbot.warehouse import edgar
 from tbot.warehouse.universe import _ticker_map
 
@@ -57,6 +65,16 @@ FORM = "10-K"
 #: snapshots, and `prior_latest` below indexes them as 0 and 1.
 MIN_OBSERVATIONS = 2
 
+#: Inclusive day-count bounds on the gap between the two period ends being
+#: differenced. Same rationale as :data:`tbot.replication.pead.SEASONAL_GAP_DAYS`:
+#: taking the latest two *rows* is only a year-over-year difference when those
+#: rows really are consecutive fiscal years, and a filer that went dark for a
+#: while would otherwise have a seven-year change in working capital divided by
+#: a two-point asset average and reported as one year of accruals. The band is
+#: loose enough for a 52/53-week fiscal calendar (364 days) and a year end that
+#: shifts by a month, and tight enough to exclude a skipped year.
+YEAR_GAP_DAYS = (330, 400)
+
 
 def signal(asof: dt.date) -> pl.DataFrame:
     """Balance-sheet accruals for every filer with two complete annual snapshots.
@@ -64,9 +82,10 @@ def signal(asof: dt.date) -> pl.DataFrame:
     Returns :data:`tbot.replication.SCHEMA` sorted by symbol, and a typed empty
     frame when no filer qualifies. A filer is scored when, among the 10-K facts
     it had *filed* by `asof`, there are at least :data:`MIN_OBSERVATIONS` period
-    ends carrying all four of :data:`TAGS`, and the average total assets across
-    the two is finite and positive (a zero asset base would make the ratio
-    infinite rather than large).
+    ends carrying all four of :data:`TAGS`, the latest two of those ends are
+    :data:`YEAR_GAP_DAYS` apart, and the average total assets across the two is
+    finite and positive (a zero asset base would make the ratio infinite rather
+    than large).
 
     Strictly point-in-time: a fiscal year that ended before `asof` but was filed
     after it is invisible, which is the common case — a 10-K lands 60-90 days
@@ -74,7 +93,7 @@ def signal(asof: dt.date) -> pl.DataFrame:
 
     Raises `FileNotFoundError` if the SEC ticker map has not been fetched.
     """
-    asof = _as_date(asof)
+    asof = as_date(asof, "asof")
     tickers = _ticker_map()  # fail on a missing map before doing any work
 
     tags = list(TAGS.values())
@@ -105,9 +124,15 @@ def signal(asof: dt.date) -> pl.DataFrame:
         # `sort_by` rather than relying on the frame's order: `tail` must take
         # the two *latest* year ends, and every tag must take the same two.
         .agg(*[pl.col(tag).sort_by("end").tail(MIN_OBSERVATIONS) for tag in tags],
+             ends=pl.col("end").sort().tail(MIN_OBSERVATIONS),
              n=pl.len())
         .filter(pl.col("n") >= MIN_OBSERVATIONS)
     )
+
+    # Adjacency: the two ends must be about a year apart. Filtered only after the
+    # count guard, so `list.get(1)` always has an element to reach.
+    gap = (pl.col("ends").list.get(1) - pl.col("ends").list.get(0)).dt.total_days()
+    pairs = pairs.filter(gap.is_between(*YEAR_GAP_DAYS))
 
     # `tail(2)` leaves [prior, latest] in every list; index 0 is the base year.
     prior_latest = {

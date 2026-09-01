@@ -27,7 +27,8 @@ import datetime as dt
 
 import polars as pl
 
-from tbot.replication import _as_date, _empty, _finalise
+from tbot._dates import as_date
+from tbot.replication import _empty, _finalise
 from tbot.warehouse import reconcile
 
 #: Trading days in a year and in a month. `SKIP_DAYS` is the reversal skip.
@@ -52,7 +53,7 @@ def signal(asof: dt.date) -> pl.DataFrame:
     itself is the one that existed on `asof` and no later print can move a past
     score.
     """
-    asof = _as_date(asof)
+    asof = as_date(asof, "asof")
 
     # `read_canonical` has already dropped quarantined symbol-days; the finite
     # and positive filter is the second line of defence, because a published

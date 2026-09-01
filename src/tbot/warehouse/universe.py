@@ -52,6 +52,7 @@ import math
 import polars as pl
 
 from tbot import config
+from tbot._dates import as_date
 from tbot.warehouse import edgar, reconcile, store
 
 #: The universe frame: the tradable symbol and the filer behind it. Two columns,
@@ -76,19 +77,6 @@ TICKER_MAP_PATH = ("raw", "company_tickers.json")
 
 
 # --- input coercion -----------------------------------------------------------------
-
-
-def _as_date(value, label: str) -> dt.date:
-    """Coerce a date, datetime or ISO date string, mirroring the other reads."""
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    if isinstance(value, str):
-        return dt.date.fromisoformat(value)  # raises ValueError if malformed
-    raise TypeError(
-        f"{label} must be a date, datetime or ISO date string, got {type(value).__name__}"
-    )
 
 
 def _threshold(value, label: str) -> float:
@@ -212,7 +200,7 @@ def build(
     result for a past date is stable no matter what the warehouse learns later —
     including that the company subsequently died.
     """
-    asof = _as_date(asof, "asof")
+    asof = as_date(asof, "asof")
     min_price = _threshold(min_price, "min_price")
     min_adv = _threshold(min_adv, "min_adv")
     lookback_days = _lookback(lookback_days)
