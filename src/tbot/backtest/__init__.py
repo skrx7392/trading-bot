@@ -15,6 +15,12 @@ turns a :mod:`tbot.backtest.strategy` specification into an equity curve, a
 cost bill and a tax bill — always stamped with the cost-model version that
 produced them.
 
+:mod:`tbot.backtest.metrics` sits deliberately outside that chain. It builds the
+conventional equal-weight long-short factor series — *gross*, because the
+published anomaly returns it is calibrated against are gross — so that the
+replication harness can ask whether a signal is the one the literature named
+before the engine is asked what it would have paid to trade it.
+
 Submodules are imported explicitly (``from tbot.backtest import costs``) to
 match :mod:`tbot.warehouse`; this package's namespace holds only the shared
 argument validation the modules use.
@@ -22,7 +28,7 @@ argument validation the modules use.
 
 import math
 
-__all__ = ["costs", "engine", "strategy", "tax"]
+__all__ = ["costs", "engine", "metrics", "strategy", "tax"]
 
 
 def _number(name: str, value: object) -> float:
