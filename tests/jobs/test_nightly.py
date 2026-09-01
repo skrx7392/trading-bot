@@ -205,6 +205,27 @@ def test_summary_is_logged_to_the_ledger(tmp_path, monkeypatch):
     assert json.loads(events.row(0, named=True)["payload"]) == out
 
 
+def test_a_vendor_failure_aborts_before_any_summary_is_written(tmp_path, monkeypatch):
+    """Half a night must not leave a ``job.nightly`` event behind claiming it ran.
+
+    Reconciling on one vendor's bars is the failure that looks healthiest: every
+    symbol-day passes unanimously on a single vote. So an ingest error takes the
+    whole run down — yf and reconcile are never reached, no summary is logged,
+    and the Job goes red.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    calls = _wire(monkeypatch, [])
+
+    def _boom(syms, start, end):
+        raise RuntimeError("alpaca is down")
+
+    monkeypatch.setattr("tbot.warehouse.alpaca.ingest", _boom)
+    with pytest.raises(RuntimeError, match="alpaca is down"):
+        nightly.run(asof=ASOF, symbols=["AAPL"])
+    assert calls == []  # yf and reconcile never ran
+    assert ledger.read_events(nightly.EVENT_KIND).height == 0
+
+
 def test_summary_survives_a_json_round_trip(tmp_path, monkeypatch):
     """The ledger stores JSON and the CLI prints JSON; nothing exotic may leak in."""
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))

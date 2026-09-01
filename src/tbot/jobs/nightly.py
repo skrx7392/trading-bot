@@ -24,6 +24,15 @@ empty is a bug upstream, and it must not read as a holiday.
 allowed to leave the process. A pod that exits 0 having ingested nothing is the
 worst outcome available: the gap is invisible until a backtest trips over it
 weeks later. Better a red Job tonight.
+
+The same applies to a vendor: an exception out of :func:`alpaca.ingest` aborts
+the run before yf is called, before reconciliation, and before any
+``job.nightly`` event is written — so a night that half-ran leaves no summary
+claiming it succeeded, and the operator sees a failed Job instead of a
+one-vendor day that would have reconciled unanimously on a single vote. Whatever
+the failing vendor did manage to store stays on disk; re-running the day is
+safe, since the store dedupes on ``(symbol, ts, resolution, source)`` and the
+newest reconciliation verdict wins.
 """
 
 import argparse

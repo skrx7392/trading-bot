@@ -6,6 +6,7 @@ typo'd schedule, a mount path that does not match the container's ``TBOT_DATA``,
 a ``COPY`` of a file that is not in the repo — are caught here instead.
 """
 
+import json
 import tomllib
 from pathlib import Path
 
@@ -20,6 +21,9 @@ CRONJOB = DEPLOY / "nightly-cronjob.yaml"
 
 DATA_MOUNT = "/data"
 ENTRYPOINT_MODULE = "tbot.jobs.nightly"
+#: Flags the runtime `uv run` must carry. Dropping either lets uv re-resolve at
+#: pod start -- which wants a network on a job whose whole point is determinism.
+ENTRYPOINT_UV_FLAGS = ("--frozen", "--no-dev")
 
 
 @pytest.fixture(scope="module")
@@ -105,11 +109,25 @@ def test_the_warehouse_is_a_persistent_volume(pod, container):
 # --- the image ----------------------------------------------------------------------
 
 
-def test_entrypoint_runs_the_nightly_module(dockerfile):
-    lines = dockerfile.splitlines()
-    entrypoint = [line for line in lines if line.startswith("ENTRYPOINT")]
-    assert len(entrypoint) == 1
-    assert f'"-m", "{ENTRYPOINT_MODULE}"' in entrypoint[0]
+@pytest.fixture(scope="module")
+def entrypoint(dockerfile):
+    """The single ENTRYPOINT line, parsed out of its JSON exec-form array."""
+    lines = [line for line in dockerfile.splitlines() if line.startswith("ENTRYPOINT")]
+    assert len(lines) == 1
+    return json.loads(lines[0][len("ENTRYPOINT"):].strip())
+
+
+def test_entrypoint_runs_the_nightly_module(entrypoint):
+    assert entrypoint[-2:] == ["-m", ENTRYPOINT_MODULE]
+
+
+def test_entrypoint_resolves_nothing_at_pod_start(entrypoint):
+    """`uv run` without these re-resolves the environment when the container
+    starts, so the image the suite was built against is not necessarily the one
+    that trades -- and the resolution wants a network the Job should not need."""
+    assert entrypoint[:2] == ["uv", "run"]
+    for flag in ENTRYPOINT_UV_FLAGS:
+        assert flag in entrypoint, f"ENTRYPOINT must pass {flag} to `uv run`"
 
 
 def test_the_entrypoint_module_exists():
