@@ -15,9 +15,22 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
+      # Forbid makes a hung run permanent, not merely late: while the pod is
+      # alive every later window is skipped, silently, with no failed Job to
+      # notice. A vendor socket that never returns would quietly end the
+      # nightly. An hour is many times the honest runtime, so reaching it means
+      # stuck -- and failing the Job hands the schedule back to the next window.
+      activeDeadlineSeconds: 3600
       template:
         spec:
           restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000       # the uid deploy/Dockerfile creates and USERs
+            # The kubelet chowns the PVC to this gid on mount. That, not
+            # anything in the image, is what lets the job write /data.
+            fsGroup: 1000
+            seccompProfile: {type: RuntimeDefault}
           containers:
             - name: nightly
               image: tbot-nightly:latest   # built/pushed per private-configs conventions
@@ -25,6 +38,23 @@ spec:
               # imported straight into k3s containerd, and the implicit policy
               # for a `latest` tag is Always -- which would ImagePullBackOff.
               imagePullPolicy: IfNotPresent
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: {drop: ["ALL"]}
+                # readOnlyRootFilesystem is deliberately absent. `uv run` writes
+                # under $HOME at start (its cache, and the venv bookkeeping it
+                # does even with --frozen), and the full set of paths has not
+                # been observed against a real run. Deferred to deploy-time
+                # verification: turn it on once a read-only run has been seen to
+                # survive, with emptyDir volumes for whatever it still needs.
+              # Nightly ingest + reconcile is a few hundred symbols of pandas
+              # work -- bursty, not sustained. quasar is shared (k3s system
+              # workloads, ai-proxy, ddns), so the request is what the scheduler
+              # should actually set aside and the limit is a ceiling on a bad
+              # night rather than an allocation.
+              resources:
+                requests: {cpu: "250m", memory: "512Mi"}
+                limits: {cpu: "2", memory: "2Gi"}
               envFrom:
                 - secretRef: {name: tbot-secrets}   # APCA_API_KEY_ID / APCA_API_SECRET_KEY
               volumeMounts:

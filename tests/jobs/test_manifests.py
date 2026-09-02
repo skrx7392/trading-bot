@@ -7,6 +7,7 @@ a ``COPY`` of a file that is not in the repo — are caught here instead.
 """
 
 import json
+import re
 import tomllib
 from pathlib import Path
 
@@ -24,6 +25,13 @@ ENTRYPOINT_MODULE = "tbot.jobs.nightly"
 #: Flags the runtime `uv run` must carry. Dropping either lets uv re-resolve at
 #: pod start -- which wants a network on a job whose whole point is determinism.
 ENTRYPOINT_UV_FLAGS = ("--frozen", "--no-dev")
+#: The unprivileged identity the night runs as. The image has to contain it
+#: (``USER``) and the pod has to name it (``runAsUser``/``fsGroup``); if the two
+#: drift, the pod either fails admission on ``runAsNonRoot`` or cannot write the
+#: PVC it was scheduled to fill.
+RUN_AS_UID = 1000
+#: A nightly that has not finished in an hour is stuck, not slow.
+MAX_RUNTIME_SECONDS = 3600
 
 
 @pytest.fixture(scope="module")
@@ -106,6 +114,43 @@ def test_the_warehouse_is_a_persistent_volume(pod, container):
     assert mounts["data"] == DATA_MOUNT
 
 
+def test_a_hung_run_cannot_swallow_every_later_window(cron):
+    """``concurrencyPolicy: Forbid`` makes a stuck run permanent: while it is
+    alive every subsequent window is skipped, quietly, with no failed Job to
+    alert on. The deadline is what turns "the nightly stopped running" into a
+    single failure the next window can recover from."""
+    assert cron["spec"]["concurrencyPolicy"] == "Forbid"
+    job = cron["spec"]["jobTemplate"]["spec"]
+    assert job["activeDeadlineSeconds"] == MAX_RUNTIME_SECONDS
+    # Shorter than the 24h gap to the next window, or the deadline buys nothing.
+    assert job["activeDeadlineSeconds"] < 24 * 60 * 60
+
+
+def test_the_nightly_declares_what_it_takes_from_a_shared_box(container):
+    """quasar also carries k3s system workloads, ai-proxy and ddns. Without a
+    request the scheduler treats the job as free and it lands anywhere; without
+    a limit a runaway pandas step can starve everything else on the node."""
+    resources = container["resources"]
+    assert resources["requests"] == {"cpu": "250m", "memory": "512Mi"}
+    assert resources["limits"] == {"cpu": "2", "memory": "2Gi"}
+
+
+def test_the_pod_runs_as_the_unprivileged_image_user(pod):
+    security = pod["securityContext"]
+    assert security["runAsNonRoot"] is True
+    assert security["runAsUser"] == RUN_AS_UID
+    # The PVC is chowned to fsGroup on mount: this, not anything baked into the
+    # image, is what lets a non-root job write /data.
+    assert security["fsGroup"] == RUN_AS_UID
+    assert security["seccompProfile"] == {"type": "RuntimeDefault"}
+
+
+def test_the_container_can_gain_nothing_it_was_not_given(container):
+    security = container["securityContext"]
+    assert security["allowPrivilegeEscalation"] is False
+    assert security["capabilities"]["drop"] == ["ALL"]
+
+
 # --- the image ----------------------------------------------------------------------
 
 
@@ -178,3 +223,46 @@ def test_the_base_image_satisfies_requires_python(dockerfile):
     pyproject = tomllib.loads((config.REPO_ROOT / "pyproject.toml").read_text())
     floor = pyproject["project"]["requires-python"].lstrip(">=")
     assert f"FROM python:{floor}-slim" in dockerfile
+
+
+@pytest.fixture(scope="module")
+def user_directive(dockerfile):
+    """The single ``USER`` line's argument, e.g. ``"1000:1000"``."""
+    lines = [line for line in dockerfile.splitlines() if line.startswith("USER ")]
+    assert len(lines) == 1, "the image must switch to exactly one runtime user"
+    return lines[0].split(maxsplit=1)[1].strip()
+
+
+def test_the_image_does_not_run_as_root(user_directive):
+    """``runAsNonRoot`` in the pod spec only refuses a root image at admission;
+    it does not make one unprivileged. The image has to drop root itself, and
+    to the same uid the pod names, or the PVC arrives unwritable."""
+    uid = user_directive.split(":")[0]
+    assert uid not in ("root", "0"), f"USER {user_directive} still runs as root"
+    assert uid == str(RUN_AS_UID)
+
+
+def test_the_user_switch_precedes_the_entrypoint(dockerfile):
+    """A ``USER`` after ``ENTRYPOINT`` is not a later instruction -- ENTRYPOINT
+    only records the command -- but it reads as one, and any RUN placed between
+    them would silently go back to root."""
+    lines = dockerfile.splitlines()
+    user = next(i for i, line in enumerate(lines) if line.startswith("USER "))
+    entrypoint = next(i for i, line in enumerate(lines) if line.startswith("ENTRYPOINT"))
+    assert user < entrypoint
+
+
+def test_the_image_creates_the_uid_it_switches_to(dockerfile):
+    """Switching to a bare numeric uid that owns no home leaves ``$HOME``
+    unresolvable, and `uv run` wants somewhere to put its cache."""
+    assert re.search(rf"useradd .*--uid {RUN_AS_UID}\b", dockerfile), (
+        "USER must name an account the image actually creates"
+    )
+
+
+def test_uv_itself_is_pinned(dockerfile):
+    """uv is the one thing the build installs outside the lockfile. Unpinned, a
+    uv release that changes resolution or venv layout reaches the image without
+    a commit -- and `uv sync --frozen` cannot protect the tool running it."""
+    match = re.search(r'pip install --no-cache-dir "uv==(\d+\.\d+\.\d+)"', dockerfile)
+    assert match, "uv must be installed as a `==`-pinned version"
