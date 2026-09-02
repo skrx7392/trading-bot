@@ -1,0 +1,32 @@
+[project]
+name = "tbot"
+version = "0.1.0"
+description = "Systematic-trading research pipeline"
+readme = "README.md"
+authors = [
+    { name = "Sai Krishna Podduturi", email = "skrx7392@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.5",
+    "httpx>=0.28.1",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "polars>=1.44.1",
+    "pyarrow>=25.0.1",
+    "yfinance>=1.7.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pyyaml>=6.0.3",
+]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not integration'"
+markers = ["integration: requires network/local services"]

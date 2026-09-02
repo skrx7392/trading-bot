@@ -655,7 +655,7 @@ def pit_facts(tag: str, asof: dt.date) -> pl.DataFrame:
 ```
 
 - [ ] **Step 3: Run tests → PASS, commit** — `git commit -m "feat: EDGAR facts and submissions ingestion with PIT reads"`.
-- [ ] **Step 4: Backfill runbook (document in task report):** download `companyfacts.zip` (~1.3GB) and the `company_tickers.json` mapping (`https://www.sec.gov/files/company_tickers.json` → save to `data/raw/`); iterate zip entries through `ingest_companyfacts`. Send header `User-Agent: krishna <saikrishnareddy7392@gmail.com>` on all SEC requests; ≤10 req/s.
+- [ ] **Step 4: Backfill runbook (document in task report):** download `companyfacts.zip` (~1.3GB) and the `company_tickers.json` mapping (`https://www.sec.gov/files/company_tickers.json` → save to `data/raw/`); iterate zip entries through `ingest_companyfacts`. Send header `User-Agent: <your-name> <contact@example.com>` on all SEC requests; ≤10 req/s.
 
 ---
 
