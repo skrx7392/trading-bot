@@ -29,7 +29,7 @@ import polars as pl
 import pytest
 
 from tbot.backtest import metrics
-from tbot.warehouse import reconcile, store
+from tbot.warehouse import actions, reconcile, store
 
 
 def _write_both(df):
@@ -356,6 +356,100 @@ def test_series_feeds_pearson_and_sharpe_directly(tmp_path, monkeypatch):
     assert n == ls.height == 5
     assert rho == pytest.approx(1.0, abs=1e-9)  # affine copy: a perfect replication
     assert metrics.sharpe(ls["ret_ls"]) > 0
+
+
+# --- dividends ----------------------------------------------------------------------
+#
+# `_seed_levels` seeds weekdays of January and February 2020, so the only
+# formation date is Friday 2020-01-31 and the only hold end Friday 2020-02-28
+# (the 29th was a Saturday). Every test below holds exactly that one month, with
+# two names and `n_deciles=2`, so each leg is a single name and the spread is
+# `long - short` with no averaging to unpick.
+
+#: The two seeded month ends: the formation close and the hold end.
+FORMED, HELD_TO = dt.date(2020, 1, 31), dt.date(2020, 2, 28)
+
+
+def _divs(rows):
+    return pl.DataFrame(rows, schema=actions.DIVIDEND_SCHEMA)
+
+
+def _win_lose_signal():
+    """WIN scores above LOSE, so WIN is the long leg and LOSE the short one."""
+    def sig(asof):
+        return pl.DataFrame({"symbol": ["WIN", "LOSE"], "score": [1.0, 0.0]})
+    return sig
+
+
+def test_dividends_add_to_the_long_leg_return(tmp_path, monkeypatch):
+    # WIN rises 100->110, LOSE flat 100->100; a $5 dividend on WIN inside the hold.
+    days = _seed_levels(tmp_path, monkeypatch, {"WIN": [100.0, 110.0], "LOSE": [100.0, 100.0]})
+    d = _divs([{"symbol": "WIN", "ex_date": dt.date(2020, 2, 10), "rate": 5.0, "special": False}])
+    price_only = metrics.monthly_longshort(
+        _win_lose_signal(), days[0], days[-1], n_deciles=2, dividends=None
+    )
+    with_div = metrics.monthly_longshort(
+        _win_lose_signal(), days[0], days[-1], n_deciles=2, dividends=d
+    )
+    assert price_only["ret_ls"][0] == pytest.approx(0.10)
+    assert with_div["ret_ls"][0] == pytest.approx(0.15)
+
+
+def test_dividend_on_the_formation_date_is_not_ours_but_on_the_hold_end_is(tmp_path, monkeypatch):
+    """Ex-date attribution is the half-open window ``(formed, held_to]``."""
+    days = _seed_levels(tmp_path, monkeypatch, {"WIN": [100.0, 100.0], "LOSE": [100.0, 100.0]})
+    d = _divs([{"symbol": "WIN", "ex_date": FORMED, "rate": 1.0, "special": False},
+               {"symbol": "WIN", "ex_date": HELD_TO, "rate": 2.0, "special": False}])
+    out = metrics.monthly_longshort(
+        _win_lose_signal(), days[0], days[-1], n_deciles=2, dividends=d
+    )
+    assert out["ret_ls"][0] == pytest.approx(0.02)
+
+
+def test_dividends_on_the_short_leg_are_paid_not_received(tmp_path, monkeypatch):
+    """A short pays the dividend away; ``long - short`` books that automatically."""
+    days = _seed_levels(tmp_path, monkeypatch, {"WIN": [100.0, 100.0], "LOSE": [100.0, 100.0]})
+    d = _divs([{"symbol": "LOSE", "ex_date": dt.date(2020, 2, 10), "rate": 3.0, "special": False}])
+    out = metrics.monthly_longshort(
+        _win_lose_signal(), days[0], days[-1], n_deciles=2, dividends=d
+    )
+    assert out["ret_ls"][0] == pytest.approx(-0.03)
+
+
+def test_dividends_default_reads_the_store(tmp_path, monkeypatch):
+    days = _seed_levels(tmp_path, monkeypatch, {"WIN": [100.0, 100.0], "LOSE": [100.0, 100.0]})
+
+    class FakeClient:
+        def get(self, url, params=None, headers=None):
+            class R:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return {"corporate_actions": {"cash_dividends": [
+                        {"symbol": "WIN", "ex_date": "2020-02-10", "rate": 4.0,
+                         "special": False}]}, "next_page_token": None}
+            return R()
+
+    monkeypatch.setenv("APCA_API_KEY_ID", "k")
+    monkeypatch.setenv("APCA_API_SECRET_KEY", "s")
+    actions.ingest(dt.date(2020, 1, 1), dt.date(2020, 12, 31), client=FakeClient())
+    out = metrics.monthly_longshort(_win_lose_signal(), days[0], days[-1], n_deciles=2)
+    assert out["ret_ls"][0] == pytest.approx(0.04)
+
+
+def test_dividends_argument_is_validated(tmp_path, monkeypatch):
+    days = _seed_levels(tmp_path, monkeypatch, {"WIN": [100.0, 100.0], "LOSE": [100.0, 100.0]})
+    sig = _win_lose_signal()
+    with pytest.raises(TypeError, match="dividends"):
+        metrics.monthly_longshort(sig, days[0], days[-1], n_deciles=2, dividends="yes")
+    with pytest.raises(TypeError, match="dividends"):
+        metrics.monthly_longshort(sig, days[0], days[-1], n_deciles=2, dividends=object())
+    with pytest.raises(ValueError, match="rate"):
+        metrics.monthly_longshort(
+            sig, days[0], days[-1], n_deciles=2,
+            dividends=pl.DataFrame({"symbol": ["WIN"], "ex_date": [dt.date(2020, 2, 1)]}),
+        )
 
 
 # --- sharpe -------------------------------------------------------------------------

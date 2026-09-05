@@ -84,10 +84,29 @@ indistinguishable from a delisting. None of it is quantified; Task 13's
 calibration is what will show whether it bites, and the real fix — an explicit
 ``delisted`` flag carrying a delisting return — belongs in the warehouse.
 
-Also not modelled: dividends beyond the vendors' own adjustment, any lag between
-the formation close and a tradeable price (the engine's next-day execution is
-deliberately *not* replicated — the literature forms at the close), and rebalance
-costs of any kind.
+Dividend income, and the basis it sits on
+------------------------------------------
+
+Returns are **total** returns. A name's hold return is ``(p1 + D) / p0 - 1``,
+where ``D`` is the cash per share of every dividend whose ex-date falls in
+``(formed, held_to]``. That window is half-open deliberately: the holder of
+record at the close *before* the ex-date is paid, and this portfolio is bought
+at the formation close, so a dividend going ex on the formation date belongs to
+the previous holder while one going ex on the hold end is ours. The short leg
+pays away what the long leg receives, and ``long - short`` books that for free.
+
+The rates come from :func:`tbot.warehouse.actions.read_dividends`, which returns
+them already divided onto the store's split-adjusted price basis (spec A3) — a
+$0.77 AAPL dividend declared in 2019 is added as $0.1925 to a 2019 close that
+has been divided by four. Adding a declared rate to an adjusted price is the one
+mistake this whole path exists to avoid, and it is a *large* one: for a 2016
+dividend on a name that later split 7:1 it overstates the month by a factor of
+seven. ``dividends=None`` restores the previous price-only series, which is what
+every test that seeds no dividends still measures.
+
+Still not modelled: any lag between the formation close and a tradeable price
+(the engine's next-day execution is deliberately *not* replicated — the
+literature forms at the close), and rebalance costs of any kind.
 
 Reading the statistics
 ----------------------
@@ -108,7 +127,7 @@ import numpy as np
 import polars as pl
 
 from tbot._dates import as_date
-from tbot.warehouse import reconcile
+from tbot.warehouse import actions, reconcile
 
 #: The long-short series schema. Task 13 joins on ``month``; nothing else is
 #: promised, and one row per month is guaranteed (months with no row were
@@ -216,19 +235,82 @@ def _universe_symbols(universe_fn, asof: dt.date) -> list[str]:
     )
 
 
+def _income_between(
+    divs: pl.DataFrame, formed: dt.date, held_to: dt.date
+) -> dict[str, float]:
+    """``{symbol: cash per share}`` for ex-dates in ``(formed, held_to]``.
+
+    Summed, not taken first: a month can hold two ex-dates for one name (a
+    regular quarterly and a special), and keeping only one of them would book a
+    silent shortfall no assertion downstream could see.
+    """
+    if divs.height == 0:
+        return {}
+    part = (
+        divs.filter(
+            (pl.col("ex_date") > formed)
+            & (pl.col("ex_date") <= held_to)
+            & pl.col("rate").is_finite()
+        )
+        .group_by("symbol")
+        .agg(pl.col("rate").sum())
+    )
+    return dict(zip(part["symbol"].to_list(), part["rate"].to_list()))
+
+
 def _leg_return(
-    symbols: list[str], p0: dict[str, float], p1: dict[str, float]
+    symbols: list[str],
+    p0: dict[str, float],
+    p1: dict[str, float],
+    income: dict[str, float] | None = None,
 ) -> float | None:
-    """Equal-weight mean return of a leg, or ``None`` if nothing in it survived.
+    """Equal-weight mean **total** return of a leg: ``(p1 + income) / p0 - 1``.
+
+    `income` is the per-share dividend cash received over the hold, keyed by
+    symbol and already on the split-adjusted price basis. A short leg pays it
+    rather than receiving it, which the caller gets for free from
+    ``long - short``.
 
     Every symbol has a formation price by construction; one with no price at the
     hold end has left the leg (see the module docstring's simplification note).
+    Returns ``None`` if nothing in the leg survived.
     """
-    rets = [p1[s] / p0[s] - 1.0 for s in symbols if s in p1]
+    inc = income or {}
+    rets = [(p1[s] + inc.get(s, 0.0)) / p0[s] - 1.0 for s in symbols if s in p1]
     if not rets:
         return None
     out = sum(rets) / len(rets)
     return out if math.isfinite(out) else None
+
+
+def _dividends_arg(dividends, start: dt.date, end: dt.date) -> pl.DataFrame:
+    """Normalise the `dividends` argument to a frame of ``symbol, ex_date, rate``.
+
+    ``"store"`` reads the warehouse over ``[start, end]`` on the adjusted basis;
+    ``None`` is the price-only series; a frame is taken as given, which is what
+    tests and callers with their own dividend source inject.
+    """
+    if dividends is None:
+        return pl.DataFrame(schema=actions.DIVIDEND_SCHEMA)
+    if isinstance(dividends, str):
+        if dividends != "store":
+            raise TypeError(
+                f"dividends must be 'store', None, or a DataFrame, got {dividends!r}"
+            )
+        return actions.read_dividends(start=start, end=end)
+    if not isinstance(dividends, pl.DataFrame):
+        raise TypeError(
+            "dividends must be 'store', None, or a DataFrame, got "
+            f"{type(dividends).__name__}"
+        )
+    missing = [c for c in ("symbol", "ex_date", "rate") if c not in dividends.columns]
+    if missing:
+        raise ValueError(f"dividends frame is missing column(s) {', '.join(missing)}")
+    return dividends.select(
+        pl.col("symbol").cast(pl.Utf8),
+        pl.col("ex_date").cast(pl.Date),
+        pl.col("rate").cast(pl.Float64),
+    )
 
 
 def monthly_longshort(
@@ -237,14 +319,16 @@ def monthly_longshort(
     end: dt.date,
     n_deciles: int = 10,
     universe_fn: Callable[[dt.date], pl.DataFrame] | None = None,
+    *,
+    dividends: str | pl.DataFrame | None = "store",
 ) -> pl.DataFrame:
     """Build the monthly equal-weight long-short return series for a signal.
 
     At each month end in ``[start, end]`` the cross-section is scored, ranked and
     split into `n_deciles` buckets; the top bucket is held long and the bottom
-    short until the next month end. Returns are **gross** — see the module
-    docstring for that decision and for how thin months, missing prices and
-    mid-hold delistings are handled.
+    short until the next month end. Returns are **gross** of costs but **include
+    dividend income** by ex-date — see the module docstring for both decisions
+    and for how thin months, missing prices and mid-hold delistings are handled.
 
     Args:
         signal_fn: ``signal_fn(asof) -> pl.DataFrame[symbol, score]``, higher
@@ -260,6 +344,11 @@ def monthly_longshort(
             names on that date, either as a frame with a ``symbol`` column (what
             :func:`tbot.warehouse.universe.build` returns) or as an iterable of
             symbols. Names outside it are dropped before ranking.
+        dividends: Keyword-only. ``"store"`` (the default) books the cash
+            dividends in the warehouse over ``[start, end]``, on the
+            split-adjusted price basis. ``None`` restores price-only returns. A
+            ``pl.DataFrame`` with ``symbol``, ``ex_date`` and ``rate`` columns
+            is used as given — the caller owns the split adjustment then.
 
     Returns:
         :data:`SERIES_SCHEMA` — ``month`` (the first of the month the return was
@@ -268,10 +357,11 @@ def monthly_longshort(
 
     Raises:
         TypeError: If `signal_fn` or `universe_fn` is not callable, the dates are
-            not date-ish, `n_deciles` is not an int, or the signal frame is not a
+            not date-ish, `n_deciles` is not an int, `dividends` is neither
+            ``"store"``, ``None`` nor a DataFrame, or the signal frame is not a
             DataFrame with a numeric score.
-        ValueError: If `start` is after `end`, `n_deciles` < 2, or the signal
-            frame is missing a required column.
+        ValueError: If `start` is after `end`, `n_deciles` < 2, or the signal or
+            dividend frame is missing a required column.
     """
     if not callable(signal_fn):
         raise TypeError(f"signal_fn must be callable, got {type(signal_fn).__name__}")
@@ -285,6 +375,9 @@ def monthly_longshort(
         raise TypeError(f"n_deciles must be an int, got {type(n_deciles).__name__}")
     if n_deciles < 2:
         raise ValueError(f"n_deciles must be >= 2, got {n_deciles}")
+    # Resolved before the panel is read so a bad argument fails in milliseconds
+    # rather than after a multi-second canonical scan.
+    divs = _dividends_arg(dividends, start, end)
 
     # The vetted series, and only it. A non-positive or non-finite close is not a
     # price a return can be computed from, and NaN would pass every threshold it
@@ -320,9 +413,10 @@ def monthly_longshort(
         if width < 1:
             continue  # fewer names than buckets; the month is skipped, not zeroed
 
+        income = _income_between(divs, formed, held_to)
         ranked = scores["symbol"].to_list()  # worst score first
-        long_leg = _leg_return(ranked[-width:], p0, p1)
-        short_leg = _leg_return(ranked[:width], p0, p1)
+        long_leg = _leg_return(ranked[-width:], p0, p1, income)
+        short_leg = _leg_return(ranked[:width], p0, p1, income)
         if long_leg is None or short_leg is None:
             continue  # a leg lost every name mid-hold; half a spread is not a spread
         rows.append({"month": held_to.replace(day=1), "ret_ls": long_leg - short_leg})
