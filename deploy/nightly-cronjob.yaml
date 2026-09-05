@@ -61,10 +61,17 @@ spec:
               # The previous 512Mi/2Gi was a guess and the job was OOMKilled
               # against it: `read_canonical` and `store.read_bars` each collected
               # their whole store before filtering, which put the same run at
-              # 25.0 GB. Both now push the window into the lazy scan. What is
-              # left is almost entirely `edgar.read_filings()`, which still reads
-              # its 7.8M rows whole -- acceptable at ~2 GB, and the thing to fix
-              # before these numbers can come down again.
+              # 25.0 GB. Both now push the window into the lazy scan, and as of
+              # 2026-09-05 so does `edgar.read_filings()`.
+              #
+              # Measured again after that pushdown, on the full new nightly
+              # (2,874-symbol universe, actions ingest, split re-base, ledger
+              # compaction): peak RSS 1.955 GiB in 190.9s, with the filings read
+              # down from 7.8M rows / 1.94 GiB to ~28.6k rows / 0.33 GiB. So the
+              # residual is no longer the filings scan -- the reconcile pass over
+              # ~2,865 symbols is the leading candidate, and the re-base leg is
+              # arithmetically too small to be it. This sizing stands until that
+              # is attributed.
               resources:
                 requests: {cpu: "250m", memory: "2Gi"}
                 limits: {cpu: "2", memory: "4Gi"}

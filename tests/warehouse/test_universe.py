@@ -303,12 +303,19 @@ def test_thresholds_are_overridable(tmp_path, monkeypatch):
 
 
 def test_only_bars_inside_the_lookback_are_used(tmp_path, monkeypatch):
-    """The window is ``asof - lookback_days`` .. ``asof``, inclusive at both ends."""
+    """The window is ``asof - lookback_days`` .. ``asof``, inclusive at both ends.
+
+    The two price levels are a factor of 4.4 apart — inside `max_jump`, so the
+    step between them is not a level break. What is under test here is the
+    *window* boundary, and a break on the window's newest row would be an
+    unconfirmed one that `read_canonical` drops, which would make this pass or
+    fail for a reason that has nothing to do with the lookback.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _tickers(tmp_path, [(1, "EDGE")])
     _filing(1, "2020-05-01")
-    _bars("EDGE", [63], 50.0)               # exactly the first day of the window
-    _bars("EDGE", [64, 65, 66], 1.0)        # a day too early: penny, must be ignored
+    _bars("EDGE", [63], 20.0)               # exactly the first day of the window
+    _bars("EDGE", [64, 65, 66], 4.5)        # a day too early: penny, must be ignored
     _reconcile()
     assert universe.build(ASOF)["symbol"].to_list() == ["EDGE"]
     assert universe.build(ASOF, lookback_days=62).height == 0   # window now empty

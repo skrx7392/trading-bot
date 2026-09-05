@@ -429,10 +429,15 @@ def test_max_jump_is_tunable(tmp_path, monkeypatch):
 
 
 def test_breaks_are_detected_per_symbol(tmp_path, monkeypatch):
-    """One symbol's splice must not truncate its neighbour in the same frame."""
+    """One symbol's splice must not truncate its neighbour in the same frame.
+
+    The splice carries a row past the break so that it is *confirmed* — an
+    unconfirmed break is judged per symbol too, which is
+    :func:`test_unconfirmed_break_is_judged_per_symbol`'s job.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
-    days = _seed_series([1.0, 1.0, 10.0], sym="SPLICED")
-    _seed_series([2.0, 2.0, 2.0], sym="CLEAN")
+    days = _seed_series([1.0, 1.0, 10.0, 10.0], sym="SPLICED")
+    _seed_series([2.0, 2.0, 2.0, 2.0], sym="CLEAN")
     can = reconcile.read_canonical()
     assert can.filter(pl.col("symbol") == "SPLICED")["ts"].to_list() == days[2:]
     assert can.filter(pl.col("symbol") == "CLEAN")["ts"].to_list() == days
@@ -516,12 +521,14 @@ def test_a_break_after_end_does_not_truncate(tmp_path, monkeypatch):
     that was legitimately tradable then: that is look-ahead, and it is
     survivorship bias in the direction that flatters a backtest. The
     contamination is still removed — one horizon later, as soon as `end` reaches
-    the break.
+    a row that *confirms* the break. The horizon in between, where `end` is the
+    break day itself and the break is not yet confirmed, is
+    :func:`test_confirmation_is_judged_through_end_only`'s case.
     """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
-    days = _seed_series([1.0, 1.0, 1.0, 10.0])
+    days = _seed_series([1.0, 1.0, 1.0, 10.0, 10.0])
     assert reconcile.read_canonical(end=days[2])["ts"].to_list() == days[:3]
-    assert reconcile.read_canonical(end=days[3])["ts"].to_list() == days[3:]
+    assert reconcile.read_canonical(end=days[4])["ts"].to_list() == days[3:]
     assert reconcile.read_canonical()["ts"].to_list() == days[3:]
 
 
@@ -538,6 +545,55 @@ def test_breaks_are_measured_after_the_min_sources_filter(tmp_path, monkeypatch)
     assert reconcile.read_canonical()["ts"].to_list() == [days[0], days[1], days[3], days[4]]
     # with the spike admitted it is two breaks, and only the tail survives
     assert reconcile.read_canonical(min_sources=1)["ts"].to_list() == days[3:]
+
+
+def test_a_break_on_the_final_row_drops_that_row_not_the_history(tmp_path, monkeypatch):
+    """One junk print cannot establish a regime; the history it would erase is kept."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0])   # 10x on the last day
+    can = reconcile.read_canonical(end=days[-1])
+    assert can["close"].to_list() == [100.0, 101.0, 102.0]
+    assert can["ts"].to_list() == days[:-1]
+
+
+def test_the_same_break_is_confirmed_by_the_next_row(tmp_path, monkeypatch):
+    """The day after, the level persisted: the break is real and truncates as before."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0, 1030.0])
+    can = reconcile.read_canonical(end=days[-1])
+    assert can["close"].to_list() == [1020.0, 1030.0]
+
+
+def test_confirmation_is_judged_through_end_only(tmp_path, monkeypatch):
+    """At `end` = the break day the later row is invisible, so the row is dropped;
+    the later horizon sees the confirmation. Neither answer uses the future."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0, 1030.0])
+    assert reconcile.read_canonical(end=days[3])["close"].to_list() == [100.0, 101.0, 102.0]
+    assert reconcile.read_canonical(end=days[4])["close"].to_list() == [1020.0, 1030.0]
+
+
+def test_an_unconfirmed_break_reveals_the_previous_confirmed_one(tmp_path, monkeypatch):
+    """Two breaks: an old confirmed one still truncates; the new unconfirmed one is dropped."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 10.0, 11.0, 12.0, 120.0])
+    can = reconcile.read_canonical(end=days[-1])
+    assert can["close"].to_list() == [10.0, 11.0, 12.0]
+
+
+def test_a_downward_unconfirmed_break_is_dropped_too(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 10.0])
+    assert reconcile.read_canonical(end=days[-1])["close"].to_list() == [100.0, 101.0, 102.0]
+
+
+def test_unconfirmed_break_is_judged_per_symbol(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 1010.0], sym="JUNK")
+    _seed_series([50.0, 51.0, 52.0], sym="FINE")
+    can = reconcile.read_canonical(end=days[-1])
+    assert can.filter(pl.col("symbol") == "JUNK")["close"].to_list() == [100.0, 101.0]
+    assert can.filter(pl.col("symbol") == "FINE")["close"].to_list() == [50.0, 51.0, 52.0]
 
 
 # --- read-side validation ------------------------------------------------------------
