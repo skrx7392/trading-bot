@@ -69,7 +69,20 @@ holdouts, live trading (phase 3). "No edge found" is an accepted outcome. Read, 
   Manifests in `deploy/`. Nightly peak ≈ 2 GB; limit 4Gi.
 - Operator drivers for the gate runbook are in `tools/t17/` (see its README).
 
-## Where to start next (decided 2026-09-05)
+## Where to start next (updated 2026-09-05, after the phase-1 hardening branch)
+
+The hardening plan (`docs/superpowers/plans/2026-09-05-phase1-hardening.md`) is implemented on branch
+`phase1-hardening`: split re-basing in the nightly, the point-in-time ticker map, a delisting-aware engine,
+the filings pushdown, the 8-K event scaffolding, the calibration limits measured (`docs/phase1/calibration-limits.md`,
+report §12, rulings 42–47) and the quarantine spike explained. Every decision taken without sign-off is in
+`docs/phase1/decisions-taken.md`. The search-protocol plan (`2026-09-05-phase1-search-protocol.md`) builds the
+registry, the gate 1→2 statistics and the one-shot holdout on branch `phase1-search`; **nothing registers a
+hypothesis or spends a holdout until the gate closes** (five green nightlies + the user's sign-off on the report).
+Deployment of the hardening branch to quasar (image, `SEC_USER_AGENT` in `tbot-secrets`, PVC sync of
+`data/edgar/{filings,entities}`, `data/actions/{name_changes,mergers}`, `data/tickers`, the `rebase-catchup` Job)
+happens after the PR merges — decision D7.
+
+### The original sequencing (2026-09-05, kept for the record)
 
 Phase 0 is merged; gate 0→1 is **open** until nightly runs 2–5 are green (Tue–Sat
 02:30 UTC, check `kubectl -n tbot get jobs` or the `job.nightly` ledger events on the
