@@ -378,3 +378,134 @@ source we do not have — that is itself the signal to take (c) deliberately rat
 
 Either way, one thing holds: **the nightly is green once, not five times.** Runs 2–5 arrive on the
 schedule and cost nothing but waiting.
+
+---
+
+## 11. Fix-round re-run (2026-09-05)
+
+Plan: `docs/superpowers/plans/2026-09-05-gate-fix-round.md`. Commits `d01e7d5` (lazy EDGAR reads),
+`b78a9cd` (corporate-actions warehouse), `5df06d1` (dividend income), `84bac9b` (delisting exits),
+`39e900b` (backfill driver, calibration panel extended one month). Rulings 37, 39, 40.
+
+### 11.1 What the fix round changed — and what it did not
+
+**It changed the cost of iterating.** EDGAR reads became lazy, predicate-pushed and per-process
+cached: `pead.signal` fell from **23 s to 0.9 s** on a first call and to **0 s** cached, and a
+per-anomaly calibration from **49–121 min to 127–185 s** (`data/raw/calib3_*.log`). Whole-market
+corporate actions were backfilled 2016-01-01..2026-09-03 in **115 s** — **357,250 cash dividends
+over 17,337 symbols** (357,064 after dedupe on `(symbol, ex_date)`) and **6,414 splits**
+(`data/raw/pull_actions.log`). `metrics.monthly_longshort` books dividend income by ex-date and
+delisting exits at the last canonical close, −30% below $1 (ruling 39).
+
+**It did not change the numbers. Dividends and delistings moved nothing.** Against the same
+unscreened `deciles_ew` reference, ρ went 0.755 → **0.7557**, 0.662 → **0.6605**, 0.458 → **0.4560**,
+0.132 → **0.1293**, and every mean moved by ≤ 0.1 pp/month. Ruling 39 stated in advance that the fix
+should *widen* our spreads; it did not. **The §10 option-(a) hypothesis — that the momentum and
+issuance magnitude gaps were the missing total-return and delisting components — is refuted.** The
+gaps are real and their cause is elsewhere.
+
+What did move ρ was **which OSAP portfolio set we compare against** (§11.3).
+
+### 11.2 All runs, unscreened reference (`deciles_ew`)
+
+Cleaned panel, investable-universe screen, 2016-01..2019-12 (panel read to 2020-01-31, series cut to
+≤ 2019-12). 95% CIs are Fisher-z on n−3.
+
+| Anomaly | Run | ρ | 95% CI | n | mean ours | mean OSAP | Ledger event |
+|---|---|---:|---|---:|---:|---:|---|
+| `Mom12m` | contaminated panel | 0.1270 | [−0.16, 0.39] | 47 | −5.23% | +0.79% | `b70272e8d4f640f1b8a36d1e5fd19a11` |
+| `Mom12m` | cleaned panel | 0.7549 | [0.567, 0.868] | 36 | +0.25% | +1.36% | `b85581f28c624b3ba7e203b8f96059e4` |
+| `Mom12m` | **fix round** | **0.7557** | [0.568, 0.869] | 36 | **+0.17%** | +1.36% | `eb4fb3a7555d4a4d8eacffa55575c4fe` |
+| `ShareIss1Y` | cleaned panel | 0.6621 | [0.463, 0.798] | 47 | +0.42% | +1.19% | `eaffc753e7994b06912a728ff2f55600` |
+| `ShareIss1Y` | **fix round** | **0.6605** | [0.461, 0.797] | 47 | **+0.39%** | +1.19% | `2a3d7a0bdc8a4d6da35ff4f89d41e4af` |
+| `EarningsSurprise` | cleaned panel | 0.4576 | [0.196, 0.658] | 47 | −0.30% | −0.44% | `a61b9fa8c0304bb6a90e42ede06def33` |
+| `EarningsSurprise` | **fix round** | **0.4560** | [0.194, 0.657] | 47 | **−0.31%** | −0.44% | `1fa69440e8e84696bfd6f38e864b3ec0` |
+| `Accruals` | cleaned panel | 0.1320 | [−0.161, 0.404] | 47 | +0.26% | −0.00% | `bc7302c767934c64a0908616e3654ac8` |
+| `Accruals` | **fix round** | **0.1293** | [−0.164, 0.402] | 47 | **+0.29%** | −0.00% | `067359019ad44710ba24fce42ac577bc` |
+
+### 11.3 The same series against OSAP's *screened* portfolio sets
+
+Identical `mean ours` in every row — only the reference changed. `ex_price5` is OSAP's
+`PredictorAltPorts_LiqScreen_Price_gt_5`; `ex_nyse` is `LiqScreen_ME_gt_NYSE20pct`.
+
+| Anomaly | Reference | ρ | 95% CI | n | mean ours | mean OSAP | Ledger event |
+|---|---|---:|---|---:|---:|---:|---|
+| `Mom12m` | `ex_price5` | **0.9366** | [0.878, 0.967] | 36 | +0.17% | **+0.60%** | `12faae3a141349228aee2cc0ae654993` |
+| `Mom12m` | `ex_nyse` | 0.9063 | [0.823, 0.952] | 36 | +0.17% | +0.48% | `5f2cbd71e332498c972d8aa9f0c3413e` |
+| `ShareIss1Y` | `ex_price5` | 0.7851 | [0.643, 0.875] | 47 | +0.39% | **+0.13%** | `f31eab1601f74d3689ca3db8f3a7fc4f` |
+| `ShareIss1Y` | `ex_nyse` | 0.7918 | [0.653, 0.879] | 47 | +0.39% | −0.04% | `e363a6068ec04b148386348d479da57e` |
+| `EarningsSurprise` | `ex_price5` † | 0.4560 | [0.194, 0.657] | 47 | −0.31% | −0.44% | `80789ee15caa4a8c8180736d1228a272` |
+| `EarningsSurprise` | `ex_nyse` | 0.4849 | [0.230, 0.678] | 47 | −0.31% | −0.45% | `e59dcdcc284c4a0bad5a57ce5687fd02` |
+| `Accruals` | `ex_price5` † | 0.1293 | [−0.164, 0.402] | 47 | +0.29% | −0.00% | `681e0cde51a34a77b1add6b9b1b47d73` |
+| `Accruals` | `ex_nyse` | 0.1781 | [−0.115, 0.443] | 47 | +0.29% | −0.17% | `814b92bdccd14b4faf59c5418bf964c4` |
+
+† see the caveat in §11.6 — these two files are byte-identical to `deciles_ew`.
+
+Momentum reproduces OSAP's *screened* series in shape at **ρ 0.94**, whole CI above 0.85. Why the
+unscreened comparison looked worse is visible in OSAP's own 2016–2019 numbers: with the $5 screen
+`Mom12m` pays **+0.088%/mo** and `ShareIss1Y` **+0.269%/mo** (48 months each), against +0.84% and
++1.31% unscreened. **The unscreened spread is microcaps** — the names the panel excludes by design.
+
+### 11.4 Verdict under the adopted rule (user decision, 2026-09-05)
+
+Rule: price-screened `ex_price5` is the standard reference. Live anomalies (`Mom12m`, `ShareIss1Y`;
+live ⇔ |mean_osap| > 0.5%/mo on the *unscreened* reference, as ruling 37 classifies) need ρ ≥ 0.85
+**and** mean_ours within [0.5×, 1.5×] of the screened reference mean. Dormant anomalies need
+|Δmean| ≤ 0.5%/mo; ρ reported, not gated.
+
+| Anomaly | Class | ρ vs `ex_price5` | ρ ≥ 0.85? | mean ours | mean ref | level | in band? | Verdict |
+|---|---|---:|---|---:|---:|---:|---|---|
+| `Mom12m` | live | **0.9366** | **pass** | +0.171% | +0.595% | **0.29×** | **fail** ([0.5×, 1.5×]) | **pass with caveat** — shape reproduces, level short |
+| `ShareIss1Y` | live | 0.7851 | **fail** (CI reaches 0.875) | +0.392% | +0.132% | **2.97×** | **fail** | **FAIL** — both conditions |
+| `EarningsSurprise` | dormant | 0.4560 (not gated) | — | −0.308% | −0.444% | \|Δ\| = **0.136 pp** | **pass** (≤ 0.5) | **PASS** |
+| `Accruals` | dormant | 0.1293 (not gated) | — | +0.292% | −0.003% | \|Δ\| = **0.295 pp** | **pass** (≤ 0.5) | **PASS** |
+| **G1 overall** | | | | | | | | **not fully met** |
+
+The level band was **not** widened to fit. The user's words: *"we can iterate on paper-trading
+results."* Recorded for the audit trail: the alternative band **[0.25×, 4×] would have passed
+momentum** on both conditions — and it was declined.
+
+### 11.5 Blind proposal vs informed decision
+
+**The thresholds are unchanged.** ρ ≥ 0.85, the [0.5×, 1.5×] band, the |Δmean| ≤ 0.5%/mo dormant
+test and the live/dormant classification are exactly what A7 recorded blind, before any fix-round
+output existed. **The one thing that changed is the reference set**: A7 named `deciles_ew`; the
+decision adopts `PredictorAltPorts_LiqScreen_Price_gt_5`. The rationale is construction-matching,
+not fit — the panel is two-source, close > $5, ADV > $1M, alive EDGAR filer, so `deciles_ew`'s
+microcaps and delisted names sit outside it by design. It is still a change made **after** seeing
+that it lifts momentum from 0.756 to 0.937, which is why it is recorded beside the blind proposal
+rather than substituted into it. On the blind reference: `Mom12m` ρ fail (0.756), `ShareIss1Y` ρ
+fail (0.661) — G1 fails either way.
+
+### 11.6 Caveats
+
+1. **`EarningsSurprise_ex_price5.csv` and `Accruals_ex_price5.csv` are byte-identical to their
+   `deciles_ew` files** (matching SHA-256 and size): OSAP did not recompute those two under the
+   price screen, so for the dormant pair the "screened" reference *is* the unscreened one. Their G1b
+   pass is on the only check available, not on a second independent one.
+2. `ShareIss1Y`'s `ex_nyse` reference mean is −0.04%/mo — near zero and sign-flipped — so a level
+   ratio against it is meaningless; only `ex_price5` supports the band test.
+3. The reference-set choice was informed by the results (§11.5).
+4. Ruling 39's residual imprecisions stand: a quarantine- or break-truncated panel end can be booked
+   as a delisting it did not suffer, and the final month can book a spurious exit (mitigated by the
+   driver's one-month `end` offset, used in every run above).
+
+### 11.7 Next hypotheses — named, not resolved
+
+For the issuance **shape** gap (ρ 0.785) and the momentum **level** gap (0.29×):
+
+- **Universe composition inside the $5 screen** — ADV > $1M and the EDGAR alive-filer requirement are
+  tighter than OSAP's price screen; our panel may be a strict subset of theirs.
+- **Equal-weight rebalancing timing** — OSAP forms on the CRSP month-end, we on the last two-source
+  trading day; not always the same date.
+- **The two-source requirement drops thinly-covered names**, disproportionately the small-cap tail
+  both live anomalies live in.
+- **Issuance signal definition** — `ShareIss1Y` uses split-adjusted shares outstanding over 12
+  months; check the tag and the adjustment choice against OSAP's own code.
+
+### 11.8 Gate 0→1 status after the fix round
+
+G4 **pass**. G3 **met under amendment** (ruling 29). G1 **not fully met**, momentum replicating in
+shape at ρ 0.94 and short in level; G2 is subsumed by G1's level condition. Nightly green runs:
+**1 of 5**. Direction: **proceed with phase-1 planning while runs 2–5 accrue**, carrying the G1 items
+as registered calibration limits, and revisit with paper-trading results.

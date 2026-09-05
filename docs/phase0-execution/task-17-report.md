@@ -81,3 +81,62 @@ the canonical panel as it stood, returned ρ 0.127 with a **−5.23%/month** mom
 then was the read-side defect found. Every calibration in the gate report's headline table is from
 the **second** wave, after `a276988`. Both waves are reported: a gate report that showed only the
 post-fix number would hide that the instrument was, for several hours, confidently wrong.
+
+---
+
+## Fix-round run log (2026-09-05)
+
+Plan: `docs/superpowers/plans/2026-09-05-gate-fix-round.md`. Results and the user's decision:
+`docs/gate-0-1-report.md` §11; rulings 37, 39, 40, 41. Suite green throughout.
+
+### Commits
+
+| Commit | Task | What |
+|---|---|---|
+| `163c9f2` | 5 | A7 pre-registered (power-aware criterion) and ruling 37 |
+| `d14a831` | 5 | A7 reframed as a **reference proposal**, not a binding criterion (user ruling) |
+| `d01e7d5` | 1 | Lazy, predicate-pushed, per-process-cached EDGAR reads |
+| `b78a9cd` | 2 | Corporate-actions warehouse (dividends, splits) from Alpaca |
+| `5df06d1` | 3 | `monthly_longshort` books dividend income by ex-date |
+| `84bac9b` | 4 | `monthly_longshort` books delisting exits with a below-floor haircut |
+| `39e900b` | 6 | `tools/t17/pull_actions.py`; calibration panel extended one month past the dev window |
+| (this) | 6 | Fix-round results, screened reference adopted, ruling 40 |
+
+`tools/t17/calib_one.py` also gained an optional second argument selecting the OSAP portfolio set
+(`data/raw/osap/<name>_<reference>.csv`); it is what produced the `calib4_*` runs.
+
+### Read-cost measurement (Task 1)
+
+`pead.signal` on the real warehouse: **23 s → 0.9 s** first call, **0 s** cached. Per-anomaly
+calibration wall time collapsed accordingly — the T17 wave ran 5,424 s (`EarningsSurprise`,
+`Accruals`) and 7,276 s (`ShareIss1Y`); the fix-round wave runs in seconds:
+
+| Run | Mom12m | ShareIss1Y | EarningsSurprise | Accruals |
+|---|---:|---:|---:|---:|
+| `calib3_*` (deciles_ew) | 185 s | 129 s | 127 s | 127 s |
+| `calib4_*_ex_price5` | 312 s | 262 s | 253 s | 262 s |
+| `calib4_*_ex_nyse_p20_me` | 313 s | 261 s | 256 s | 261 s |
+
+The `calib4` runs are slower only because eight of them ran concurrently on one machine against
+four for `calib3`.
+
+### Corporate-actions backfill
+
+`tools/t17/pull_actions.py`, whole market in quarterly windows, 2016-01-01..2026-09-03:
+**357,250 dividends and 6,414 splits in 115 s** (`data/raw/pull_actions.log`, 43 windows). The store
+reads back 357,064 dividend rows over **17,337 symbols** after the `(symbol, ex_date)` dedupe, and
+6,414 splits over 4,834 symbols. Spot checks: AAPL 2019-08-09 rate 0.77 declared → **0.1925**
+adjusted onto the split basis; NVDA's 2024 10:1 present.
+
+### Calibration runs
+
+Twelve calibrations, all on the cleaned panel with `universe_fn=universe.build`, panel read to
+2020-01-31 and the series cut to months ≤ 2019-12. Logs `data/raw/calib3_<anomaly>.log` (unscreened
+`deciles_ew` reference) and `data/raw/calib4_<anomaly>_<reference>.log` (screened). Every run's
+ledger event id, ρ, CI, n and both means are tabulated in gate report §11.2 and §11.3; the
+`replication.calibration` event stream is the source of record.
+
+Headline: **the fix round's dividend and delisting work moved no ρ by more than 0.003**, and the
+momentum ρ of **0.9366** in `calib4_Mom12m_ex_price5.log` comes entirely from comparing against
+OSAP's price-screened portfolio set instead of its unscreened deciles. That is what the user's
+2026-09-05 decision adopts, and why G1 is still recorded as not fully met.
