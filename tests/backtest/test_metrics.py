@@ -452,6 +452,154 @@ def test_dividends_argument_is_validated(tmp_path, monkeypatch):
         )
 
 
+# --- delisting exits ----------------------------------------------------------------
+#
+# `_seed_levels` cannot express a delisting: it seeds a whole calendar month of
+# weekdays at a time, so a name's last bar always lands on a month end. The thing
+# under test is a name whose last bar falls *strictly inside* a hold, so these
+# tests seed explicit ``(symbol, date, close)`` rows instead — through the same
+# two-agreeing-vendor path (`_write_both`) plus `reconcile.run`, because a
+# one-vendor fixture reconciles to a close `read_canonical` then drops.
+#
+# The seeded month ends are the same FORMED / HELD_TO as the dividend block, so a
+# panel of {FORMED, some mid-February day, HELD_TO} yields exactly one hold.
+
+
+def _seed_days(tmp_path, monkeypatch, rows):
+    """Seed two-source bars for explicit ``(symbol, date, close)`` rows.
+
+    Closes are chosen to stay inside `read_canonical`'s 5x break detector — a
+    larger single-day drop would truncate the name's pre-break history and the
+    test would be measuring the break detector, not the delisting rule.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    df = pl.DataFrame(
+        {"symbol": [r[0] for r in rows], "ts": [r[1] for r in rows],
+         "close": [float(r[2]) for r in rows]},
+        schema_overrides={"ts": pl.Date},
+    ).with_columns(
+        open=pl.col("close"), high=pl.col("close"), low=pl.col("close"),
+        volume=pl.lit(1e6),
+    )
+    _write_both(df)
+    reconcile.run(min(r[1] for r in rows), max(r[1] for r in rows))
+    return sorted({r[1] for r in rows})
+
+
+def test_a_midhold_delisting_exits_at_the_last_close(tmp_path, monkeypatch):
+    """LOSE stops printing on 14 February: it is sold there, not dropped."""
+    _seed_days(tmp_path, monkeypatch, [
+        ("WIN", FORMED, 100.0), ("WIN", HELD_TO, 100.0),
+        ("LOSE", FORMED, 100.0), ("LOSE", dt.date(2020, 2, 14), 50.0),
+    ])
+    out = metrics.monthly_longshort(
+        _win_lose_signal(), dt.date(2020, 1, 1), dt.date(2020, 2, 29),
+        n_deciles=2, dividends=None,
+    )
+    # Dropping LOSE would have emptied the short leg and skipped the month.
+    assert out["month"].to_list() == [dt.date(2020, 2, 1)]
+    assert out["ret_ls"][0] == pytest.approx(0.0 - (-0.50))
+
+
+def test_a_delisting_below_the_floor_takes_the_shumway_haircut(tmp_path, monkeypatch):
+    """Under $1 the last printed close is not the recovered value; -30% on top."""
+    _seed_days(tmp_path, monkeypatch, [
+        ("WIN", FORMED, 100.0), ("WIN", HELD_TO, 100.0),
+        ("LOSE", FORMED, 2.0), ("LOSE", dt.date(2020, 2, 14), 0.50),
+    ])
+    out = metrics.monthly_longshort(
+        _win_lose_signal(), dt.date(2020, 1, 1), dt.date(2020, 2, 29),
+        n_deciles=2, dividends=None,
+    )
+    exit_ret = 0.50 * (1 + metrics.DELIST_RETURN) / 2.0 - 1.0  # -0.825
+    assert metrics.DELIST_PRICE_FLOOR == 1.0
+    assert out["ret_ls"][0] == pytest.approx(0.0 - exit_ret)
+
+
+def test_a_gap_that_is_not_a_delisting_still_drops_the_name(tmp_path, monkeypatch):
+    """GAP prints again in March, so its missing 28 February close is a gap.
+
+    The regression guard on the rule's upper bound: an exit may only be booked
+    from a last close *inside* the hold. GAP sits in the long leg here precisely
+    so that booking one would move the number.
+    """
+    _seed_days(tmp_path, monkeypatch, [
+        ("WIN", FORMED, 100.0), ("WIN", HELD_TO, 110.0),
+        ("GAP", FORMED, 100.0), ("GAP", dt.date(2020, 2, 14), 60.0),
+        ("GAP", dt.date(2020, 3, 31), 60.0),
+        ("MID", FORMED, 100.0), ("MID", HELD_TO, 100.0),
+        ("LOSE", FORMED, 100.0), ("LOSE", HELD_TO, 100.0),
+    ])
+
+    def sig(asof):
+        return pl.DataFrame({"symbol": ["WIN", "GAP", "MID", "LOSE"],
+                             "score": [3.0, 2.0, 1.0, 0.0]})
+
+    out = metrics.monthly_longshort(
+        sig, dt.date(2020, 1, 1), dt.date(2020, 3, 31), n_deciles=2, dividends=None,
+    )
+    feb = out.filter(pl.col("month") == dt.date(2020, 2, 1))
+    # Long leg is WIN and GAP; GAP is dropped, so the leg is WIN alone at +10%.
+    # An exit at GAP's 60 would make it (0.10 - 0.40) / 2 = -0.15.
+    assert feb["ret_ls"][0] == pytest.approx(0.10)
+
+
+def test_delisting_on_the_long_leg_is_a_loss(tmp_path, monkeypatch):
+    """The rule is symmetric: it books the loss it would otherwise have hidden."""
+    _seed_days(tmp_path, monkeypatch, [
+        ("WIN", FORMED, 100.0), ("WIN", dt.date(2020, 2, 3), 40.0),
+        ("LOSE", FORMED, 100.0), ("LOSE", HELD_TO, 100.0),
+    ])
+    out = metrics.monthly_longshort(
+        _win_lose_signal(), dt.date(2020, 1, 1), dt.date(2020, 2, 29),
+        n_deciles=2, dividends=None,
+    )
+    assert out["ret_ls"][0] == pytest.approx(-0.60)
+
+
+def test_a_last_close_on_the_formation_date_is_not_an_exit(tmp_path, monkeypatch):
+    """The rule's lower bound, on the same fixture idiom as the tests above.
+
+    A name whose last vetted close *is* the formation close carries no evidence
+    of what it was worth afterwards — booking an exit there would assert a 0%
+    hold return, which is a claim, not a measurement. It stays dropped, as
+    `test_name_without_end_price_is_dropped_from_its_leg` already pins on the
+    monthly fixture.
+    """
+    _seed_days(tmp_path, monkeypatch, [
+        ("WIN", FORMED, 100.0), ("WIN", HELD_TO, 110.0),
+        ("GONE", FORMED, 100.0),
+        ("MID", FORMED, 100.0), ("MID", HELD_TO, 100.0),
+        ("LOSE", FORMED, 100.0), ("LOSE", HELD_TO, 100.0),
+    ])
+
+    def sig(asof):
+        return pl.DataFrame({"symbol": ["WIN", "GONE", "MID", "LOSE"],
+                             "score": [3.0, 2.0, 1.0, 0.0]})
+
+    out = metrics.monthly_longshort(
+        sig, dt.date(2020, 1, 1), dt.date(2020, 2, 29), n_deciles=2, dividends=None,
+    )
+    # Long leg is WIN and GONE; GONE is dropped, so the leg is WIN alone.
+    # An exit at GONE's formation close would make it (0.10 + 0.0) / 2 = 0.05.
+    assert out["ret_ls"][0] == pytest.approx(0.10)
+
+
+def test_a_delisting_still_collects_its_dividends(tmp_path, monkeypatch):
+    """Income booked before the exit is income the holder actually received."""
+    _seed_days(tmp_path, monkeypatch, [
+        ("WIN", FORMED, 100.0), ("WIN", HELD_TO, 100.0),
+        ("LOSE", FORMED, 100.0), ("LOSE", dt.date(2020, 2, 14), 50.0),
+    ])
+    d = _divs([{"symbol": "LOSE", "ex_date": dt.date(2020, 2, 7), "rate": 10.0,
+                "special": True}])
+    out = metrics.monthly_longshort(
+        _win_lose_signal(), dt.date(2020, 1, 1), dt.date(2020, 2, 29),
+        n_deciles=2, dividends=d,
+    )
+    assert out["ret_ls"][0] == pytest.approx(0.0 - (-0.40))
+
+
 # --- sharpe -------------------------------------------------------------------------
 
 def test_sharpe_annualises_monthly_returns():
