@@ -26,12 +26,17 @@ valid_to)``, inclusive, with a null end open. :func:`ticker_map` answers "on
     lineage: ``NXH`` runs from 2016 at Overstock prices across three renames
     and the store holds no ``OSTK``/``BYON``/``BBBY`` series at all — whereas
     history the nightly ingests *after* a rename stops under ``old`` at
-    ``D - 1`` and starts under ``new`` at ``D``. So a boundary at ``D`` is
-    applied to a symbol only when its alpaca series is absent or begins within
-    :data:`RELIST_DAYS` before ``D``; a series that predates that is a lineage
-    and keeps its open start, and no ``old`` interval is inferred for the owner
-    when another filer holds ``old`` on ``D - 1`` and the ``old`` series is
-    that filer's lineage.
+    ``D - 1`` and starts under ``new`` at ``D`` (the nightly ingests the
+    week's rename targets and the re-base job pulls their history whole, so
+    ``new`` carries the lineage from both vendors from its first night —
+    decision D13). So a boundary at ``D`` is applied to a symbol only when its
+    alpaca series is absent or begins within :data:`RELIST_DAYS` before ``D``;
+    a series that predates that is a lineage and keeps its open start, **and
+    then no ``old`` interval is inferred at all** — the bars it would attribute
+    already live under ``new``, and a company is represented once. When
+    ``new`` is bounded, the ``old`` interval is still withheld if another
+    filer holds ``old`` on ``D - 1`` and the ``old`` series is that filer's
+    lineage.
 ``merger``
     A merger of ``S`` on ``D`` (:func:`~tbot.warehouse.actions.read_mergers`)
     closes every interval of ``S`` covering ``D`` at ``D - 1``. *Evidence
@@ -338,9 +343,13 @@ def _apply_renames(rows: list[dict], renames: pl.DataFrame, spans: Spans) -> int
     1. every interval holding ``new`` on ``D`` starts at ``D`` — unless the
        ``new`` series is a lineage that predates the rename, in which case its
        start is left alone;
-    2. each such owner gets ``(cik, old, .., D - 1)`` — unless another filer
-       holds ``old`` on ``D - 1`` and the ``old`` series is that filer's
-       lineage, in which case no interval is inferred for the owner;
+    2. each owner whose ``new`` interval was bounded in (1) gets
+       ``(cik, old, .., D - 1)`` — unless another filer holds ``old`` on
+       ``D - 1`` and the ``old`` series is that filer's lineage, in which case
+       no interval is inferred for the owner. An owner whose ``new`` series is
+       the lineage gets no ``old`` interval either: the bars it would
+       attribute are already under ``new``, and a company is represented once
+       (decision D13);
     3. any other filer holding ``old`` on ``D - 1`` starts at ``D`` — again only
        when the ``old`` series is not a lineage.
 
@@ -366,8 +375,9 @@ def _apply_renames(rows: list[dict], renames: pl.DataFrame, spans: Spans) -> int
         new_bounded = _series_starts_at(new, on, spans)
         old_bounded = _series_starts_at(old, on, spans)
         for owner in owners:
-            if new_bounded:
-                owner["valid_from"] = on
+            if not new_bounded:
+                continue  # `new` is the lineage: its pre-rename bars need no `old` row
+            owner["valid_from"] = on
             if others and not old_bounded:
                 continue  # the `old` series is the other holder's lineage
             rows.append({"cik": owner["cik"], "symbol": old, "valid_from": None,

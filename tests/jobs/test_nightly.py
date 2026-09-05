@@ -32,6 +32,7 @@ import pytest
 
 from tbot import ledger
 from tbot.jobs import nightly
+from tbot.warehouse import actions
 
 ASOF = dt.date(2026, 9, 1)
 DAY = dt.date(2026, 8, 31)
@@ -271,6 +272,54 @@ def test_a_missing_ticker_map_fails_the_run_loudly(tmp_path, monkeypatch):
         nightly.run(asof=ASOF)
     assert calls == []
     assert ledger.read_events("job.nightly").height == 0
+
+
+# --- rename targets (decision D13) --------------------------------------------------
+
+
+def _renames(tmp_path, rows):
+    d = tmp_path / "actions" / "name_changes"
+    d.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(rows, schema=actions.NAME_CHANGE_SCHEMA).write_parquet(
+        d / "20260101T000000000000-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.parquet")
+
+
+def test_the_trailing_weeks_rename_targets_join_the_universe_ingest(tmp_path, monkeypatch):
+    """A renamed-into symbol has no canonical history yet, so the universe cannot
+    admit it; without this the nightly would never ingest it and the company would
+    vanish for good. Both vendors get the same extended list."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _renames(tmp_path, [
+        {"old_symbol": "OLD", "new_symbol": "NEW", "process_date": DAY - dt.timedelta(days=3)},
+        {"old_symbol": "EDGE0", "new_symbol": "EDGE", "process_date": DAY - dt.timedelta(days=7)},
+        {"old_symbol": "OUT0", "new_symbol": "OUT", "process_date": DAY - dt.timedelta(days=8)},
+        {"old_symbol": "FUT0", "new_symbol": "FUT", "process_date": DAY + dt.timedelta(days=1)},
+        {"old_symbol": "AAPL0", "new_symbol": "AAPL", "process_date": DAY},   # already in the universe
+        {"old_symbol": "SAME", "new_symbol": "SAME", "process_date": DAY},    # a company-name change
+    ])
+    calls = _wire(monkeypatch, [], universe_df=_universe("AAPL", "MSFT"))
+    out = nightly.run(asof=ASOF)
+    assert [syms for _, syms, _, _ in calls[1:3]] == [["AAPL", "MSFT", "EDGE", "NEW"]] * 2
+    assert out["symbols"] == 4 and out["symbols_added_by_rename"] == 2
+    assert out["symbol_source"] == "universe"
+
+
+def test_an_explicit_symbol_list_is_not_extended_by_renames(tmp_path, monkeypatch):
+    """The operator's list is exact; the summary still carries the count, as zero."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _renames(tmp_path, [
+        {"old_symbol": "OLD", "new_symbol": "NEW", "process_date": DAY - dt.timedelta(days=3)}])
+    calls = _wire(monkeypatch, [])
+    out = nightly.run(asof=ASOF, symbols=["AAPL"])
+    assert [syms for _, syms, _, _ in calls[:2]] == [["AAPL"]] * 2
+    assert out["symbols"] == 1 and out["symbols_added_by_rename"] == 0
+
+
+def test_the_summary_counts_no_renames_on_a_quiet_week(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _wire(monkeypatch, [], universe_df=_universe("AAPL"))
+    out = nightly.run(asof=ASOF)
+    assert out["symbols_added_by_rename"] == 0 and out["symbols"] == 1
 
 
 # --- the audit trail ----------------------------------------------------------------

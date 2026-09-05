@@ -262,17 +262,39 @@ CHAIN = [
 
 
 def test_a_rename_into_a_lineage_keyed_series_keeps_the_open_start(root):
+    """The real chain with the lineage under NXH from 2016 (decision D13).
+
+    Before the fix wave this test expected OSTK's inferred interval beside NXH on
+    2020-01-01 and a bounded BBBY interval: the old-symbol intervals were added
+    even though the bars they would attribute already live under NXH. A company
+    is represented once, so now the map holds only the open NXH interval for
+    CIK 1130713 and no OSTK/BYON/BBBY row at all.
+    """
     _current(root, [(1130713, "NXH")])
     _renames(root, CHAIN)
     _bars("NXH", [D(2016, 1, 4), D(2026, 9, 3)])          # the lineage, keyed under NXH
-    tickers.build()
-    # OSTK's inferred interval (open start .. 2023-11-05) is present as well: no
-    # other filer holds OSTK, so it is added — inert, since the store has no OSTK series.
-    assert tickers.ticker_map(D(2020, 1, 1)).rows() == [(1130713, "NXH"), (1130713, "OSTK")]
+    counts = tickers.build()
+    assert counts["rename"] == 0
+    assert tickers.ticker_map(D(2020, 1, 1)).rows() == [(1130713, "NXH")]
     assert tickers.ticker_map(D(2026, 9, 1)).rows() == [(1130713, "NXH")]
-    bbby = tickers.intervals().filter(pl.col("symbol") == "BBBY")
-    assert bbby.select("cik", "valid_from", "valid_to").rows() == [
-        (1130713, D(2025, 8, 29), D(2026, 8, 16))]
+    filer = tickers.intervals().filter(pl.col("cik") == 1130713)
+    assert filer.select("symbol", "valid_from", "valid_to", "source").rows() == [
+        ("NXH", None, None, "current")]
+
+
+@pytest.mark.parametrize("first, bounded", [
+    (D(2026, 8, 17) - dt.timedelta(days=tickers.RELIST_DAYS), True),        # starts at the rename
+    (D(2026, 8, 17) - dt.timedelta(days=tickers.RELIST_DAYS + 1), False),   # predates it: lineage
+])
+def test_the_old_interval_is_inferred_only_when_the_new_series_starts_at_the_rename(root, first, bounded):
+    _current(root, [(1, "NEW")])
+    _renames(root, [{"old_symbol": "OLD", "new_symbol": "NEW", "process_date": D(2026, 8, 17)}])
+    _bars("NEW", [first, D(2026, 9, 3)])
+    counts = tickers.build()
+    assert counts["rename"] == (1 if bounded else 0)
+    iv = tickers.intervals()
+    assert iv.filter(pl.col("symbol") == "OLD").height == (1 if bounded else 0)
+    assert iv.filter(pl.col("symbol") == "NEW")["valid_from"].to_list() == [D(2026, 8, 17) if bounded else None]
 
 
 def test_a_rename_into_a_series_that_starts_at_the_rename_is_bounded(root):

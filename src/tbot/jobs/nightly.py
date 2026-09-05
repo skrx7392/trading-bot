@@ -27,14 +27,27 @@ investigate, not noise to widen ``tol`` against — and that a day only one vend
 covered still settles as ``ok`` on its single vote, exactly as the pre-2016
 history does, where yf is the only source there is.
 
+**The symbol list is the universe plus the trailing week's rename targets**
+(decision D13). The universe admits a name only after 63 days of canonical
+closes, so a symbol a company was just renamed into has none and could never
+be ingested by a run that ingests only the universe: the company would vanish
+the night of its rename, for good. The targets are the ``new_symbol`` of every
+rename processed in the last :data:`tbot.jobs.rebase.LOOKBACK_DAYS` days
+(``actions.read_name_changes``, as ingested by earlier nights), appended
+de-duplicated; the summary counts them as ``symbols_added_by_rename``. The old
+symbol stays in the list while the universe still holds it, so both are
+ingested for up to a week — the ticker map's rebuild is what represents the
+company once. A caller-supplied list is exact and is not extended.
+
 After the vote the run ingests the trailing week of corporate actions,
-re-bases every symbol that split in it (both vendors re-adjust history on the
-ex-date; the store does not — `tbot.jobs.rebase`), rebuilds the point-in-time
-ticker map from the actions just ingested (`tbot.warehouse.tickers`; SEC's
-current map is refreshed first only when ``SEC_USER_AGENT`` names a contact,
-since SEC fair access requires one — the summary says whether it was), and
-compacts yesterday's ledger files. Each is a collaborator with its own tests;
-the nightly owns their order.
+re-bases every symbol that split in it and every rename target (both vendors
+re-adjust history on the ex-date and serve a renamed company's lineage under
+its new symbol; the store does neither — `tbot.jobs.rebase`), rebuilds the
+point-in-time ticker map from the actions just ingested
+(`tbot.warehouse.tickers`; SEC's current map is refreshed first only when
+``SEC_USER_AGENT`` names a contact, since SEC fair access requires one — the
+summary says whether it was), and compacts yesterday's ledger files. Each is a
+collaborator with its own tests; the nightly owns their order.
 
 A refresh of SEC's map that fails is the one collaborator error the run
 survives: it is logged as :data:`REFRESH_FAILED_KIND`, the summary reports
@@ -114,11 +127,19 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
     if symbols is None:
         # Raises on a missing ticker map; see the module docstring for why that
         # is preferable to an empty list.
-        symbols = universe.build(asof)["symbol"].to_list()
+        in_universe = _as_symbols(universe.build(asof)["symbol"].to_list())
+        # Plus the trailing week's rename targets (decision D13): a renamed-into
+        # symbol has no canonical history yet and the universe cannot admit it.
+        present = set(in_universe)
+        added = [s for s in rebase.rename_targets(day) if s not in present]
+        symbols = in_universe + added
         source = "universe"
+        empty_universe = not in_universe
     else:
         symbols = _as_symbols(symbols)
+        added = []
         source = "argument"
+        empty_universe = False
 
     # Both fetchers no-op on an empty symbol list without issuing a request, so
     # an empty universe costs nothing and still leaves a summary behind.
@@ -151,7 +172,8 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
         "day": day.isoformat(),
         "symbols": len(symbols),
         "symbol_source": source,
-        "empty_universe": source == "universe" and not symbols,
+        "symbols_added_by_rename": len(added),
+        "empty_universe": empty_universe,
         "alpaca_rows": alpaca_rows,
         "yf_rows": yf_rows,
         "recon": recon,

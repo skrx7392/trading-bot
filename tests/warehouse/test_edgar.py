@@ -959,3 +959,77 @@ def test_fetch_document_requires_a_user_agent(tmp_path, monkeypatch):
 def test_fetch_budget_validates():
     with pytest.raises(ValueError):
         edgar.FetchBudget(0)
+
+
+# --- the filings schema migration ------------------------------------------------------
+#
+# Files written before `accepted`/`items` existed have five columns. Merging a new
+# document into one raises inside polars, and scanning a directory that mixes the
+# two schemas fails on whichever file polars reads second. Both are handled
+# explicitly: an old-schema file is replaced, and a mixed directory names the
+# fix.
+
+OLD_COLUMNS = ["cik", "accn", "form", "filed", "primary_doc"]
+
+
+def _old_schema_file(tmp_path, cik, accn="old-1"):
+    d = tmp_path / "edgar" / "filings"
+    d.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"cik": [cik], "accn": [accn], "form": ["10-K"], "filed": [dt.date(2019, 2, 1)],
+                  "primary_doc": ["k.htm"]},
+                 schema={"cik": pl.Int64, "accn": pl.Utf8, "form": pl.Utf8, "filed": pl.Date,
+                         "primary_doc": pl.Utf8}).write_parquet(d / f"{cik}.parquet")
+    assert pl.read_parquet_schema(d / f"{cik}.parquet").names() == OLD_COLUMNS
+
+
+def test_an_old_schema_filings_file_is_replaced_not_merged(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    _old_schema_file(tmp_path, 320193)
+    assert edgar.ingest_submissions(json.dumps(SUBS).encode(), cik=320193) == 1
+    df = edgar.read_filings()
+    assert df.columns == list(edgar.FILINGS_SCHEMA)
+    assert df["accn"].to_list() == ["0000320193-20-000010"]   # the old row is gone, not merged
+    payload = json.loads(ledger.read_events(edgar.FILINGS_EVENT)["payload"][0])
+    assert payload["replaced_old_schema"] is True
+
+
+def test_a_current_schema_file_is_merged_and_the_event_says_so(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    edgar.ingest_submissions(_subs(320193, accessionNumber=["old-1"], form=["10-K"],
+                                   filingDate=["2019-02-01"], primaryDocument=["k.htm"]), cik=320193)
+    edgar.ingest_submissions(json.dumps(SUBS).encode(), cik=320193)
+    assert edgar.read_filings()["accn"].to_list() == ["old-1", "0000320193-20-000010"]
+    payloads = [json.loads(p) for p in ledger.read_events(edgar.FILINGS_EVENT)["payload"]]
+    assert [p["replaced_old_schema"] for p in payloads] == [False, False]
+
+
+def test_an_old_schema_file_is_replaced_even_by_an_empty_document(tmp_path, monkeypatch):
+    """Nothing usable to store still must not leave the poison file in the directory."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    _old_schema_file(tmp_path, 7)
+    assert edgar.ingest_submissions(b'{"cik": "7"}', cik=7) == 0
+    assert edgar.read_filings().height == 0
+    assert pl.read_parquet_schema(tmp_path / "edgar" / "filings" / "7.parquet").names() == list(edgar.FILINGS_SCHEMA)
+    payload = json.loads(ledger.read_events(edgar.FILINGS_EVENT)["payload"][0])
+    assert payload["replaced_old_schema"] is True
+
+
+@pytest.mark.parametrize("old_cik, new_cik", [(1, 2), (2, 1)])
+def test_a_mixed_schema_filings_directory_names_the_fix(tmp_path, monkeypatch, old_cik, new_cik):
+    """Whichever schema polars reads first, the error says where and what to do."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    _old_schema_file(tmp_path, old_cik)
+    edgar.ingest_submissions(_subs(new_cik, accessionNumber=["n-1"], form=["8-K"],
+                                   filingDate=["2020-05-01"], primaryDocument=["q.htm"]), cik=new_cik)
+    edgar.clear_cache()
+    with pytest.raises(RuntimeError, match=r"more than one schema") as info:
+        edgar.read_filings()
+    message = str(info.value)
+    assert str(tmp_path / "edgar" / "filings") in message
+    assert "data/raw/submissions.zip" in message and "tools/t17/ingest_submissions.py" in message
+    assert "retired" in message
+    assert isinstance(info.value.__cause__, pl.exceptions.PolarsError)

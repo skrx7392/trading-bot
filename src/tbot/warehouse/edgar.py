@@ -121,6 +121,14 @@ _TABLES = {
     "entities": (ENTITIES_SCHEMA, ("cik",)),
 }
 
+#: Where each table is rebuilt from when its directory has to be re-ingested:
+#: the bulk zip under ``data/raw/`` and the driver that walks it.
+_REINGEST = {
+    "facts": ("data/raw/companyfacts.zip", "tools/t17/ingest_companyfacts.py"),
+    "filings": ("data/raw/submissions.zip", "tools/t17/ingest_submissions.py"),
+    "entities": ("data/raw/submissions.zip", "tools/t17/ingest_submissions.py"),
+}
+
 #: :func:`pit_facts` sorts on this and keeps the last row per cik: the most
 #: recent period ``end``, ties broken by the latest ``filed`` (a restatement
 #: supersedes the original), then ``accn``.
@@ -319,6 +327,11 @@ def _files(name: str) -> list[Path]:
     return sorted(d.glob("*.parquet")) if d.is_dir() else []
 
 
+def _is_old_filings_schema(path: Path) -> bool:
+    """Whether a per-company filings file predates the `accepted`/`items` columns."""
+    return "accepted" not in pl.read_parquet_schema(path).names()
+
+
 # --- ingestion ----------------------------------------------------------------------
 
 
@@ -455,14 +468,21 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
         subset=list(_FILINGS_DEDUPE_KEY), keep="last", maintain_order=True
     )
     stored = df.height
-    if stored:
+    # A file written before `accepted`/`items` existed has five columns. It
+    # cannot be merged with (polars refuses to concatenate the widths), and left
+    # in place it breaks every scan of the directory, so it is replaced outright
+    # — even by a document with nothing usable, which still must not leave it
+    # behind. The shards' rows it held come back when the shards are
+    # re-ingested, which the driver does in order after the main documents.
+    existing = _dir("filings", create=False) / f"{cik}.parquet"
+    replaced_old_schema = existing.is_file() and _is_old_filings_schema(existing)
+    if stored or replaced_old_schema:
         # Merge rather than replace: `filings.recent` holds only the newest ~1000
         # filings and the rest arrive as separate `filings.files` shards, so
         # replacing would make ingesting a company's full history self-defeating.
         # A filing is immutable once made, so a re-ingest of the same accession
         # is a correction and the incoming row wins.
-        existing = _dir("filings", create=False) / f"{cik}.parquet"
-        if existing.is_file():
+        if existing.is_file() and not replaced_old_schema:
             df = pl.concat([pl.read_parquet(existing), df]).unique(
                 subset=list(_FILINGS_DEDUPE_KEY), keep="last", maintain_order=True
             )
@@ -477,7 +497,8 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
         clear_cache()
     ledger.log_event(
         FILINGS_EVENT,
-        {"cik": cik, "rows": stored, "skipped": skipped, "entity": entity},
+        {"cik": cik, "rows": stored, "skipped": skipped, "entity": entity,
+         "replaced_old_schema": replaced_old_schema},
     )
     return stored
 
@@ -598,15 +619,33 @@ def _scan(
     return lf
 
 
-def _collect(lf: pl.LazyFrame, schema: pl.Schema, sort_key: tuple[str, ...]) -> pl.DataFrame:
+def _collect(
+    lf: pl.LazyFrame, schema: pl.Schema, sort_key: tuple[str, ...], *, table: str
+) -> pl.DataFrame:
     """Materialise a scan into the declared schema, or a typed empty frame.
 
     Stable: files are globbed in sorted order and parquet preserves write order,
     so rows that tie on the sort key keep document order instead of whatever the
     sort's worker threads happen to produce. See :data:`_PIT_SORT` for why that
     matters.
+
+    A directory that mixes two schemas — files from before a column was added
+    beside files from after — fails inside polars on whichever file it reads
+    second, with a message about that file. That is re-raised as a
+    ``RuntimeError`` naming the directory and the fix: move the old files aside
+    and re-ingest the table from its bulk zip with its driver.
     """
-    df = lf.collect()
+    try:
+        df = lf.collect()
+    except (pl.exceptions.SchemaError, pl.exceptions.ColumnNotFoundError) as exc:
+        d = _dir(table, create=False)
+        zip_path, driver = _REINGEST[table]
+        raise RuntimeError(
+            f"{d} holds files of more than one schema ({type(exc).__name__}: {exc}). "
+            f"Move the old files aside — `mv data/edgar/{table} "
+            f"data/retired/edgar-{table}-v1-<date>` — then re-ingest from {zip_path} "
+            f"with `uv run python -B {driver}`."
+        ) from exc
     if df.height == 0:
         return pl.DataFrame(schema=schema)
     return df.select(list(schema)).sort(list(sort_key), maintain_order=True)
@@ -628,6 +667,7 @@ def _cached(root: str, name: str, key: tuple) -> pl.DataFrame:
         _scan(name, schema, tags=tags, forms=forms, filed_from=filed_from, filed_to=filed_to),
         schema,
         sort_key,
+        table=name,
     )
 
 

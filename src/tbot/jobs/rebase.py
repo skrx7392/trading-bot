@@ -18,13 +18,33 @@ idempotent — re-basing a name twice yields the same rows — which is why the
 nightly can look back a week rather than remember what it did.
 
 Ranges are fixed by where each vendor's history starts: Alpaca's SIP feed at
-2016-01-01 (spec A1), yfinance at 1962-01-01 (the T17 backfill's floor). A
-symbol Yahoo no longer serves comes back empty and is not an error — the
-Alpaca side is re-based and the pre-2016 tail simply stays as it was.
+2016-01-01 (spec A1), yfinance at 1962-01-01 (the T17 backfill's floor).
+
+**A vendor that serves nothing for a symbol it used to serve poisons the
+re-vote, so that symbol is left out of it.** A symbol Yahoo no longer serves
+comes back empty and is not an error — but the store still holds Yahoo's old
+rows for it, on the old basis, and re-voting them against Alpaca's re-based
+rows would quarantine the name's whole pre-split history in one night. So
+after each vendor's pull, every symbol the store already held from that vendor
+(``store.symbol_spans`` before the pull) for which the pull wrote no rows
+(``store.symbols_ingested_since`` after it) is excluded from the re-vote and
+named under ``skipped`` in the summary and the ``rebase.split`` event. The
+rows the other vendor did return are in the store — a later re-vote will use
+them — and the canonical series keeps its old verdicts, split step included,
+which is the lesser harm and is now visible rather than silent. A symbol the
+vendor never held is not skipped: there is nothing of that vendor's to poison
+the vote with, and the name is re-voted on what the other vendor served.
+
+Rename targets are re-based too (decision D13): both vendors serve a renamed
+company's lineage under its new symbol, and pulling that history whole is
+what puts it in the store from both of them on the first night rather than
+one session at a time. :func:`symbols_to_rebase` is therefore the split
+symbols *and* the rename targets of the lookback window.
 
 ``python -m tbot.jobs.rebase --from YYYY-MM-DD [--to YYYY-MM-DD]`` re-bases
-every symbol with a split ex-date in that window — the one-off catch-up for
-splits that landed between the backfill and this job's deployment.
+every symbol with a split ex-date or a rename into it in that window — the
+one-off catch-up for events that landed between the backfill and this job's
+deployment.
 """
 
 import argparse
@@ -37,7 +57,7 @@ import polars as pl
 
 from tbot import ledger
 from tbot._dates import as_date
-from tbot.warehouse import actions, alpaca, reconcile, yf
+from tbot.warehouse import actions, alpaca, reconcile, store, yf
 
 #: Where each vendor's history begins; a re-base pulls from here to `end`.
 ALPACA_START = dt.date(2016, 1, 1)
@@ -73,33 +93,83 @@ def _symbols(value) -> list[str]:
     return out
 
 
-def symbols_to_rebase(day: dt.date, lookback_days: int = LOOKBACK_DAYS) -> list[str]:
-    """Symbols with a split ex-date in ``[day - lookback_days, day]``, sorted."""
+def _window(day: dt.date, lookback_days: int) -> tuple[dt.date, dt.date]:
+    """``(day, day - lookback_days)``, both validated."""
     day = as_date(day, "day")
     if isinstance(lookback_days, bool) or not isinstance(lookback_days, int) or lookback_days < 0:
         raise ValueError(f"lookback_days must be a non-negative int, got {lookback_days!r}")
-    lo = day - dt.timedelta(days=lookback_days)
+    return day, day - dt.timedelta(days=lookback_days)
+
+
+def rename_targets(day: dt.date, lookback_days: int = LOOKBACK_DAYS) -> list[str]:
+    """New symbols of the renames processed in ``[day - lookback_days, day]``, sorted.
+
+    A company-name change (``old == new``, which Alpaca reports as a name
+    change) is not a rename and yields nothing; a null target is skipped.
+    """
+    day, lo = _window(day, lookback_days)
+    renames = actions.read_name_changes().filter(
+        (pl.col("process_date") >= lo) & (pl.col("process_date") <= day)
+        & pl.col("old_symbol").ne_missing(pl.col("new_symbol"))
+    )
+    return sorted(_symbols(renames["new_symbol"].to_list()))
+
+
+def symbols_to_rebase(day: dt.date, lookback_days: int = LOOKBACK_DAYS) -> list[str]:
+    """Symbols to re-base on `day`: a split ex-date or a rename into the symbol
+    in ``[day - lookback_days, day]``; sorted, de-duplicated.
+
+    Splits because both vendors re-adjust history on the ex-date; rename
+    targets (:func:`rename_targets`, decision D13) because both vendors serve
+    the company's lineage under the new symbol and a whole-history pull is what
+    lands it in the store from both of them.
+    """
+    day, lo = _window(day, lookback_days)
     splits = actions.read_splits().filter(
         (pl.col("ex_date") >= lo) & (pl.col("ex_date") <= day)
     )
-    return sorted(_symbols(splits["symbol"].to_list()))
+    return sorted(set(_symbols(splits["symbol"].to_list())) | set(rename_targets(day, lookback_days)))
+
+
+def _pull(ingest, source: str, syms: list[str], start: dt.date, end: dt.date) -> tuple[int, list[str]]:
+    """One vendor's whole-history re-pull.
+
+    Returns the rows written and the symbols the store already held from this
+    vendor for which the pull wrote nothing — the ones whose old rows would
+    poison the re-vote (module docstring). Held-ness is read before the pull
+    and evidence of service after it, both narrowed to `syms`.
+    """
+    held = set(store.symbol_spans(source=source, symbols=syms)["symbol"].to_list())
+    since = dt.datetime.now(dt.timezone.utc)
+    rows = ingest(syms, start, end)
+    served = set(store.symbols_ingested_since(since, source=source, symbols=syms))
+    return rows, [s for s in syms if s in held and s not in served]
 
 
 def rebase(symbols: Iterable[str], end: dt.date) -> dict:
     """Re-pull and re-vote the whole history of `symbols` through `end`.
 
-    Returns ``{"symbols", "alpaca_rows", "yf_rows", "recon"}`` and logs it under
-    :data:`EVENT_KIND`. An empty list does nothing and logs nothing.
+    Returns ``{"symbols", "alpaca_rows", "yf_rows", "skipped", "recon"}`` —
+    ``skipped`` being ``{"alpaca": [...], "yf": [...]}``, the held symbols each
+    vendor served nothing for, which are left out of the re-vote — and logs it
+    under :data:`EVENT_KIND`. An empty list does nothing and logs nothing.
     """
     syms = _symbols(symbols)
     end = as_date(end, "end")
     if not syms:
         return {"symbols": [], "alpaca_rows": 0, "yf_rows": 0,
+                "skipped": {alpaca.SOURCE: [], yf.SOURCE: []},
                 "recon": dict.fromkeys(reconcile.STATUSES, 0)}
-    alpaca_rows = alpaca.ingest(syms, ALPACA_START, end)
-    yf_rows = yf.ingest(syms, YF_START, end)
-    recon = reconcile.run(YF_START, end, symbols=syms)
-    out = {"symbols": syms, "alpaca_rows": alpaca_rows, "yf_rows": yf_rows, "recon": recon}
+    alpaca_rows, alpaca_skipped = _pull(alpaca.ingest, alpaca.SOURCE, syms, ALPACA_START, end)
+    yf_rows, yf_skipped = _pull(yf.ingest, yf.SOURCE, syms, YF_START, end)
+    excluded = set(alpaca_skipped) | set(yf_skipped)
+    revote = [s for s in syms if s not in excluded]
+    recon = (
+        reconcile.run(YF_START, end, symbols=revote) if revote
+        else dict.fromkeys(reconcile.STATUSES, 0)
+    )
+    out = {"symbols": syms, "alpaca_rows": alpaca_rows, "yf_rows": yf_rows,
+           "skipped": {alpaca.SOURCE: alpaca_skipped, yf.SOURCE: yf_skipped}, "recon": recon}
     ledger.log_event(EVENT_KIND, {"end": end.isoformat(), **out})
     return out
 
@@ -113,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="python -m tbot.jobs.rebase",
-        description="Re-base every symbol with a split ex-date in [--from, --to].",
+        description="Re-base every symbol with a split ex-date or a rename into it in [--from, --to].",
     )
     parser.add_argument("--from", dest="start", type=dt.date.fromisoformat, required=True,
                         metavar="YYYY-MM-DD")
