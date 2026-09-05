@@ -70,8 +70,18 @@ spec:
               # down from 7.8M rows / 1.94 GiB to ~28.6k rows / 0.33 GiB. So the
               # residual is no longer the filings scan -- the reconcile pass over
               # ~2,865 symbols is the leading candidate, and the re-base leg is
-              # arithmetically too small to be it. This sizing stands until that
-              # is attributed.
+              # arithmetically too small to be it.
+              #
+              # Re-measured 2026-09-05 (fix wave) on the nightly as shipped by
+              # the phase-1 hardening branch: 2,877 symbols (2,861 universe +
+              # 16 rename targets), both `_drop_pre_break` passes of ruling 43,
+              # actions ingest, re-base of 45 symbols (29 splits + 16 rename
+              # targets; 49.9k alpaca + 86.6k yf rows re-voted), the ticker-map
+              # rebuild (`tickers.build`), ledger compaction: peak RSS
+              # 2,157,821,952 B = 2.01 GiB in 206.1s. The peak sits 10 MB above
+              # the request -- a scheduling hint, not a ceiling -- and half the
+              # limit. The plan's rule (below 1.0 GiB: 1Gi/2Gi; above 4 GiB:
+              # raise) leaves both pins where they are.
               resources:
                 requests: {cpu: "250m", memory: "2Gi"}
                 limits: {cpu: "2", memory: "4Gi"}

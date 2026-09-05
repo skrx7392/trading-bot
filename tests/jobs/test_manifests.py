@@ -39,7 +39,11 @@ MAX_RUNTIME_SECONDS = 3600
 #: pushed down, on the full new nightly including the split re-base: peak
 #: 1.955 GiB in 190.9s, with the filings read down to ~28.6k rows (0.33 GiB)
 #: from 7.8M. The residual is therefore elsewhere -- the reconcile pass is the
-#: leading candidate -- and this sizing stands.
+#: leading candidate. Re-measured once more the same day, in the fix wave, on
+#: the nightly as shipped (2,877 symbols incl. 16 rename targets, both
+#: break-detector passes, actions ingest, a 45-symbol re-base, the ticker-map
+#: rebuild, compaction): 2.01 GiB in 206.1s. Between the plan's two thresholds
+#: (1.0 GiB and 4 GiB), so this sizing stands.
 MEASURED_PEAK_REQUEST = "2Gi"
 MEASURED_PEAK_LIMIT = "4Gi"
 
