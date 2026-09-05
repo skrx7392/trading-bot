@@ -100,11 +100,41 @@ def test_alpaca_request_params(monkeypatch):
     assert req["params"]["symbols"] == "AAPL,MSFT"
     assert req["params"]["timeframe"] == "1Day"
     assert req["params"]["start"] == "2020-01-01" and req["params"]["end"] == "2020-01-03"
-    assert req["params"]["feed"] == "iex"
+    assert req["params"]["feed"] == "sip"
+    assert req["params"]["adjustment"] == "split"
     assert req["params"]["limit"] == 10000
     assert "page_token" not in req["params"]
     assert req["headers"]["APCA-API-KEY-ID"] == "kid"
     assert req["headers"]["APCA-API-SECRET-KEY"] == "secret"
+
+
+def test_alpaca_feed_and_adjustment_constants():
+    """The request's price basis is a named constant, not a literal buried in the
+    loop: SIP for consolidated closes, `split` for the store's price basis
+    (split-adjusted, dividend-unadjusted) — the basis yfinance's raw Close uses."""
+    assert alpaca.FEED == "sip"
+    assert alpaca.ADJUSTMENT == "split"
+
+
+def test_alpaca_request_uses_the_module_constants(monkeypatch):
+    """Changing the constants changes the wire request — they are not shadowed."""
+    monkeypatch.setattr(alpaca, "FEED", "sentinel-feed")
+    monkeypatch.setattr(alpaca, "ADJUSTMENT", "sentinel-adjustment")
+    c = RecordingClient(_page({"AAPL": [_bar(2)]}))
+    alpaca.fetch_bars(["AAPL"], dt.date(2020, 1, 1), dt.date(2020, 1, 3), client=c)
+    assert c.requests[0]["params"]["feed"] == "sentinel-feed"
+    assert c.requests[0]["params"]["adjustment"] == "sentinel-adjustment"
+
+
+def test_alpaca_every_page_of_every_chunk_carries_feed_and_adjustment():
+    """The basis has to hold for the whole fetch: a page or chunk that quietly
+    fell back to the default `raw` would splice unadjusted prices into the store."""
+    syms = _universe(alpaca.PAGE_SYMBOLS + 2)
+    c = EchoClient(pages_per_chunk=2)
+    alpaca.fetch_bars(syms, dt.date(2020, 1, 1), dt.date(2020, 1, 5), client=c)
+    assert len(c.requests) == 4  # two chunks, two pages each
+    assert [r.get("feed") for r in c.requests] == ["sip"] * 4
+    assert [r.get("adjustment") for r in c.requests] == ["split"] * 4
 
 
 def test_alpaca_normalises_requested_symbols():
