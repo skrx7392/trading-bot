@@ -7,6 +7,8 @@ import json
 import sys
 import time
 
+import polars as pl
+
 from tbot import config
 from tbot.backtest import metrics
 from tbot.replication import accruals, calibrate, issuance, momentum, pead
@@ -35,8 +37,12 @@ def sig(asof):
     return df
 rep = calibrate.run(
     name,
-    lambda s, e: metrics.monthly_longshort(sig, s, e, universe_fn=universe.build),
+    # The panel runs one month past the dev window so December-2019's hold is priced
+    # and no spurious final-month delisting exit is booked (plan Task 4 note); the
+    # series is then cut back to months <= 2019-12 so the calibration window is exact.
+    lambda s, e: metrics.monthly_longshort(sig, s, e, universe_fn=universe.build)
+    .filter(pl.col("month") <= dt.date(2019, 12, 1)),
     config.data_root() / "raw" / "osap" / f"{name}.csv",
-    dt.date(2016, 1, 1), dt.date(2019, 12, 31),
+    dt.date(2016, 1, 1), dt.date(2020, 1, 31),
 )
 print("CALIB_DONE", json.dumps({**rep, "elapsed_s": round(time.time() - t)}), flush=True)
