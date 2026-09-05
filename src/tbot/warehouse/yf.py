@@ -1,11 +1,21 @@
-"""yfinance daily-bar fetcher — a validation source, never a trading source.
+"""yfinance daily-bar fetcher — the validator, and the only pre-2016 history.
 
-Yahoo data is unlicensed, unversioned and quietly revised, so it is only ever
-used to cross-check the Stooq/Alpaca base: bars land under their own
-``source="yf"`` tag and are consumed by reconciliation alone (enforced in Task 5).
+Yahoo data is unlicensed, unversioned and quietly revised, so it is never the
+base: bars land under their own ``source="yf"`` tag and are consumed by
+reconciliation alone (enforced in Task 5), where they cross-check the Alpaca SIP
+base from 2016 forward.
 
-For that job the bars must be *raw*: ``auto_adjust=False``. Comparing yfinance's
-adjusted closes against unadjusted stooq bars would flag every dividend as a
+Before 2016 they are also the *only* series the warehouse has, because that is
+where Alpaca's SIP history stops. That stretch is therefore unvoted (a lone
+source trivially agrees with itself) and **survivorship-biased**: Yahoo drops
+delisted names rather than keeping their history, so a pre-2016 backtest is
+measured on companies that were still alive when the data was pulled. Any result
+that leans on pre-2016 data must say so.
+
+For that job the bars must be *raw*: ``auto_adjust=False``. That yields the
+store's basis — **split-adjusted, dividend-unadjusted** — the same basis Alpaca
+is asked for with ``adjustment=split``, and the two agree to ~1 bp. Comparing
+Yahoo's total-return adjusted closes against it would flag every dividend as a
 discrepancy. No adjustment logic lives here — this module only reshapes what
 yfinance returns into the store's canonical columns.
 
@@ -54,7 +64,10 @@ def _check_range(start, end) -> None:
 
 
 def fetch_bars(symbols: Iterable[str], start: dt.date, end: dt.date) -> pl.DataFrame:
-    """Fetch unadjusted daily bars for `symbols` over the inclusive `start`..`end`.
+    """Fetch raw daily bars for `symbols` over the inclusive `start`..`end`.
+
+    Raw means ``auto_adjust=False``: split-adjusted, dividend-unadjusted — the
+    store's price basis.
 
     Returns the store's input columns with the store's dtypes, including when
     nothing comes back, so the result is always safe to hand to

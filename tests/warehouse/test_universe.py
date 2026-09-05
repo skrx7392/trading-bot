@@ -317,8 +317,9 @@ def test_quarantined_days_do_not_reach_the_universe(tmp_path, monkeypatch):
 
 
 def test_volume_median_spans_every_source(tmp_path, monkeypatch):
-    """Volumes are not voted on — Alpaca's IEX volumes diverge by design — so the
-    ADV proxy takes the median across whatever sources reported."""
+    """Volumes are not voted on — they only feed the ADV screen, where a few
+    percent of error is harmless — so the ADV proxy takes the median across
+    whatever sources reported."""
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _tickers(tmp_path, [(1, "VOL")])
     _filing(1, "2020-05-01")

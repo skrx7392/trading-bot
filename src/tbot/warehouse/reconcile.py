@@ -1,23 +1,36 @@
-"""Three-way close reconciliation and quarantine.
+"""Cross-vendor close reconciliation and quarantine.
 
-The warehouse holds the same symbol-day from up to three independent vendors
-(``stooq``, ``alpaca``, ``yf``). Vendors disagree: adjustments land at different
-times, a bad tick survives one cleaner but not another, and Alpaca's free tier is
-the IEX feed (its *volumes* diverge from the consolidated tape by design — which
-is exactly why the vote is on **closes only**). Trading a vendor's raw series
-means trading its errors, so every close is voted on here first.
+The warehouse holds the same symbol-day from every vendor that covers it
+(``alpaca``, ``yf``; ``stooq`` was retired as a source on 2026-09-05 — see
+:mod:`tbot.warehouse.stooq`). Vendors disagree: adjustments land at different
+times and a bad tick survives one cleaner but not another. Trading a vendor's
+raw series means trading its errors, so every close is voted on here first.
+
+The vote is on **closes only**, and deliberately so: a close is what buys a
+position and what a backtest marks against, while volume feeds nothing but the
+ADV liquidity screen in :mod:`tbot.warehouse.universe`, where a few percent of
+error changes no decision. Voting on volume would buy nothing and would
+quarantine good closes over a number nothing trades on.
+
+Nothing here names its sources. The vote is over whatever the store holds for a
+``(symbol, ts)``, so adding or retiring a vendor is an ingestion change, not a
+change here.
 
 Per ``(symbol, ts)``, sources that reported a usable close are compared within a
 relative tolerance:
 
 ``ok``
     Every reporting source agrees (a lone source trivially agrees with itself —
-    the historical Stooq-only era). The median close is kept.
+    the pre-2016 era, where yfinance is the only history there is). The median
+    close is kept.
 ``majority``
     A strict majority agrees; their median is kept and the dissenting sources are
-    recorded in the ledger under ``reconcile.majority``.
+    recorded in the ledger under ``reconcile.majority``. With the two sources the
+    store now carries this verdict is arithmetically unreachable — a strict
+    majority of two *is* unanimity — so it is dormant until a third source
+    returns.
 ``quarantined``
-    No majority — three-way disagreement, two dissenting sources, or nothing
+    No majority — mutual disagreement between the reporting sources, or nothing
     usable at all. No close is published: the row is written to the canonical
     file for audit but :func:`read_canonical` excludes it, so downstream sees a
     *gap* rather than a number nobody can vouch for. Logged as

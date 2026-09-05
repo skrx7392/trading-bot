@@ -1,10 +1,15 @@
-"""Alpaca daily-bar fetcher — the incremental source on top of the Stooq base.
+"""Alpaca daily-bar fetcher — the base of the bar store, and what keeps it current.
 
-Stooq is a bulk historical dump; Alpaca is what keeps the store current. It is
-read through the SIP feed (``feed=sip``), the consolidated tape: official closes
-and consolidated volume, so both are comparable with the other sources. (The
-free IEX feed carries IEX-only prints — closes off the consolidated ones by a
-median ~17 bps and a sliver of the volume — and returns nothing before 2021.)
+Read through the SIP feed (``feed=sip``), the consolidated tape: official closes
+and consolidated volume, so both are comparable with the other sources. On this
+account SIP reaches back to 2016 and serves delisted tickers, which is what
+makes it the base rather than an incremental top-up — it carries the history and
+the dead names the survivorship-bias defence needs. (The free IEX feed carries
+IEX-only prints — closes off the consolidated ones by a median ~17 bps and a
+sliver of the volume — and returns nothing before 2021.)
+
+Before 2016 there is no SIP history and yfinance is the only source; see
+:mod:`tbot.warehouse.yf` for what that costs.
 
 Bars are requested ``adjustment=split``, which is the store's price basis:
 **split-adjusted, dividend-unadjusted**. That is what yfinance's raw

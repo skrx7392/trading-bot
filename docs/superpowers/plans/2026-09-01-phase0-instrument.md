@@ -1,5 +1,7 @@
 # Phase 0 — Instrument Implementation Plan
 
+> **Superseded in part by the gate-0→1 amendments** (2026-09-05). The plan body below is left as written and is not the current design of record for data sources, price basis, or the extraction model — notably it specifies `"feed": "iex"` for Alpaca and Stooq as the historical base, both since changed. See the spec's Amendments section (`docs/superpowers/specs/2026-09-01-trading-bot-design.md`) and `docs/phase0-execution/sdd-ledger.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the trustworthy measurement instrument — warehouse, backtester, replication suite, extraction golden set, Kronos vol-calibration — that gate 0→1 requires before any hypothesis search begins.

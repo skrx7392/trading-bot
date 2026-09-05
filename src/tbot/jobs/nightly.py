@@ -10,10 +10,10 @@ because reconciliation votes on whatever closes the store holds: run it against
 a single vendor and every symbol-day passes unanimously on one vote, which is
 the one outcome that looks healthy and proves nothing.
 
-**Two vendors, not three, and that changes what a disagreement costs.** Stooq is
-a bulk historical dump with no incremental path, so the nightly run ingests
-alpaca and yf only: a fresh session-day reaches the vote with at most two
-closes, never the three the reconciler is written for. At ``n = 2``
+**Two vendors, not three, and that changes what a disagreement costs.** Since
+stooq's retirement on 2026-09-05 the warehouse has two price sources, alpaca and
+yf, so a fresh session-day reaches the vote with at most two closes, never the
+three the reconciler is written for. At ``n = 2``
 :func:`tbot.warehouse.reconcile.run`'s ``majority`` verdict is arithmetically
 unreachable — a strict majority of two is two, which is unanimity — so the vote
 is binary. Either the two closes agree within ``tol`` and the day is ``ok``, or
@@ -24,8 +24,8 @@ intended trade: a gap a backtest can see and skip beats a close nobody can
 vouch for. It does mean the quarantine count in the summary is a direct read on
 how often the two vendors differ — a rate that climbs is a vendor problem to
 investigate, not noise to widen ``tol`` against — and that a day only one vendor
-covered still settles as ``ok`` on its single vote, exactly as the Stooq-only
-era did.
+covered still settles as ``ok`` on its single vote, exactly as the pre-2016
+history does, where yf is the only source there is.
 
 Three things are deliberately *not* special-cased:
 
