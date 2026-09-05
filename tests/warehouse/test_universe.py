@@ -504,3 +504,23 @@ def test_build_rejects_bad_input(tmp_path, monkeypatch, kwargs, exc):
     _tickers(tmp_path, [(1, "X")])
     with pytest.raises(exc):
         universe.build(**{"asof": ASOF, **kwargs})
+
+
+# --- the filings read ---------------------------------------------------------------
+
+def test_build_pushes_the_alive_predicates_into_the_filings_read(tmp_path, monkeypatch):
+    """The whole filings table is 7.8M rows; the question is two predicates wide."""
+    _liquid(tmp_path, monkeypatch)
+    seen = {}
+    real = edgar.read_filings
+
+    def recording(forms=None, filed_from=None, filed_to=None):
+        seen.update(forms=tuple(forms) if forms is not None else None,
+                    filed_from=filed_from, filed_to=filed_to)
+        return real(forms=forms, filed_from=filed_from, filed_to=filed_to)
+
+    monkeypatch.setattr(edgar, "read_filings", recording)
+    assert universe.build(ASOF)["symbol"].to_list() == ["X"]
+    assert seen == {"forms": universe.ALIVE_FORMS,
+                    "filed_from": ASOF - dt.timedelta(days=universe.ALIVE_WINDOW_DAYS),
+                    "filed_to": ASOF}

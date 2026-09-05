@@ -214,13 +214,12 @@ def build(
     tickers = _ticker_map()
 
     cutoff = asof - dt.timedelta(days=ALIVE_WINDOW_DAYS)
+    # Predicates go into the parquet scan: the filings table is millions of
+    # rows and this question is answered by a few thousand of them. The
+    # reader's `filed_from`/`filed_to` are inclusive at both ends, which is
+    # exactly the window this used to filter for in memory.
     alive = (
-        edgar.read_filings()
-        .filter(
-            pl.col("form").is_in(pl.lit(list(ALIVE_FORMS), dtype=pl.List(pl.Utf8)))
-            & (pl.col("filed") <= asof)
-            & (pl.col("filed") >= cutoff)
-        )
+        edgar.read_filings(forms=ALIVE_FORMS, filed_from=cutoff, filed_to=asof)
         .select("cik")
         .unique()
     )
