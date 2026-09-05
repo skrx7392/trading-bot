@@ -83,6 +83,7 @@ def test_ingest_writes_dedupes_and_logs(root):
     ev = ledger.read_events("ingest.actions")
     assert ev.height == 2
     assert json.loads(ev["payload"][0]) == {"start": "2019-01-01", "end": "2021-12-31",
+                                            "types": actions.TYPES,
                                             "dividends": 3, "splits": 2,
                                             "name_changes": 0, "mergers": 0}
 
@@ -214,3 +215,14 @@ def test_reingest_of_a_merger_supersedes(root):
     actions.ingest(dt.date(2023, 1, 1), dt.date(2023, 12, 31), client=FakeClient([page]))
     m = actions.read_mergers(["JNCE"])
     assert m.height == 1 and m["cash_rate"][0] == 1.90
+
+
+def test_ingest_records_the_types_it_asked_for(root):
+    # A narrowed pull reports zero for every table it never asked about, so the
+    # payload has to say what was asked: without `types` a backfill of renames
+    # alone would log "dividends: 0" over windows holding thousands of them.
+    actions.ingest(dt.date(2023, 1, 1), dt.date(2023, 12, 31),
+                   client=FakeClient([PAGE_NC]), types="name_change")
+    payload = json.loads(ledger.read_events(actions.EVENT_KIND)["payload"][0])
+    assert payload["types"] == "name_change"
+    assert payload["name_changes"] == 2 and payload["dividends"] == 0

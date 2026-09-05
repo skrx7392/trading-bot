@@ -312,7 +312,9 @@ def ingest(start, end, client=None, types: str = TYPES) -> dict[str, int]:
     supersedes the earlier batch rather than adding to it. A table that came
     back empty (because `types` did not ask for it, or the window holds none) is
     reported as zero and not written, so narrowing `types` cannot blank a table
-    the store already holds.
+    the store already holds. The ledger event carries `types` for that reason: a
+    zero from a narrowed pull is "not requested", not "the window holds none",
+    and the two are not otherwise distinguishable after the fact.
     """
     start, end = as_date(start, "start"), as_date(end, "end")
     tables = fetch_all(start, end, client=client, types=types)
@@ -321,7 +323,7 @@ def ingest(start, end, client=None, types: str = TYPES) -> dict[str, int]:
     counts = {name: df.height for name, df in tables.items()}
     ledger.log_event(
         EVENT_KIND,
-        {"start": start.isoformat(), "end": end.isoformat(), **counts},
+        {"start": start.isoformat(), "end": end.isoformat(), "types": types, **counts},
     )
     return counts
 
