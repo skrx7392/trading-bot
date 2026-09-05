@@ -32,6 +32,17 @@ from tbot.backtest import metrics
 from tbot.warehouse import reconcile, store
 
 
+def _write_both(df):
+    """Write one bar frame from two agreeing vendors.
+
+    `read_canonical` publishes a close only once a second source confirms it, so
+    a one-vendor fixture reconciles to an ``ok`` that the read side then drops.
+    """
+    cols = ["symbol", "ts", "open", "high", "low", "close", "volume"]
+    for src in ("stooq", "alpaca"):
+        store.write_bars(df.select(cols), source=src)
+
+
 # --- contract tests from the brief, verbatim ----------------------------------------
 
 def _seed(tmp_path, monkeypatch):
@@ -47,7 +58,7 @@ def _seed(tmp_path, monkeypatch):
             p *= 1 + i * 0.0002
     df = pl.DataFrame(rows, schema_overrides={"ts": pl.Date}).with_columns(
         open=pl.col("close"), high=pl.col("close"), low=pl.col("close"), volume=pl.lit(1e6))
-    store.write_bars(df.select(["symbol","ts","open","high","low","close","volume"]), source="stooq")
+    _write_both(df)
     reconcile.run(days[0], days[-1])
     return days
 
@@ -111,9 +122,7 @@ def _seed_levels(tmp_path, monkeypatch, levels, months=((2020, 1), (2020, 2))):
             rows += [{"symbol": symbol, "ts": d, "close": float(price)} for d in days]
     df = pl.DataFrame(rows, schema_overrides={"ts": pl.Date}).with_columns(
         open=pl.col("close"), high=pl.col("close"), low=pl.col("close"), volume=pl.lit(1e6))
-    store.write_bars(
-        df.select(["symbol", "ts", "open", "high", "low", "close", "volume"]), source="stooq"
-    )
+    _write_both(df)
     reconcile.run(all_days[0], all_days[-1])
     return all_days
 

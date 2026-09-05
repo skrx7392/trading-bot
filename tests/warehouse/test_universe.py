@@ -47,8 +47,9 @@ def _seed(tmp_path, monkeypatch):
                           schema_overrides={"ts": pl.Date})
         df = df.with_columns(open=pl.col("close"), high=pl.col("close"),
                              low=pl.col("close"), volume=pl.lit(1e6))
-        store.write_bars(df.select(["symbol","ts","open","high","low","close","volume"]),
-                         source="stooq")
+        for src in ("stooq", "alpaca"):  # two agreeing vendors: see `_bars`
+            store.write_bars(
+                df.select(["symbol","ts","open","high","low","close","volume"]), source=src)
     reconcile.run(ASOF - dt.timedelta(days=63), ASOF)
 
 
@@ -76,12 +77,26 @@ def _filing(cik, filed, form="10-Q"):
         "filingDate": [filed], "primaryDocument": ["x.htm"]}}}).encode(), cik=cik)
 
 
-def _bars(symbol, offsets, close, volume=1e6, source="stooq"):
+#: `read_canonical` only publishes a close two vendors confirmed, so the default
+#: fixture writes an agreeing pair. Tests about the vote itself name sources.
+AGREEING = ("stooq", "alpaca")
+
+
+def _bars(symbol, offsets, close, volume=1e6, source=None):
     """Write flat bars for `symbol`, one per offset in *days before* ``ASOF``.
 
     A negative offset is a day *after* ``ASOF`` — the future, which `build` must
     never look at.
+
+    `source` of ``None`` writes the same bar from both :data:`AGREEING` vendors,
+    so the day reconciles to a two-source ``ok`` and survives the read-side
+    ``min_sources`` filter. Naming a single source is how a test builds a
+    disagreement, or a coverage gap, on purpose.
     """
+    if source is None:
+        for src in AGREEING:
+            _bars(symbol, offsets, close, volume=volume, source=src)
+        return
     offsets = list(offsets)
     df = pl.DataFrame(
         {"symbol": [symbol] * len(offsets),
@@ -383,13 +398,19 @@ def test_a_non_finite_volume_cannot_admit_an_illiquid_name(tmp_path, monkeypatch
 
 
 def test_a_fat_fingered_print_cannot_buy_a_name_in(tmp_path, monkeypatch):
-    """Medians, not means: one $10,000 print on a $1 stock lifts the mean over the
-    screen ($160) but leaves the median where it belongs."""
+    """One $10,000 print on a $1 stock must not screen the name in.
+
+    Two guards point the same way here and either alone suffices. The print is
+    mid-window, so the series snaps back the next day: to `read_canonical`'s
+    break detector that is two level breaks, and only the penny history after
+    the second one survives into the screen. And the screen takes medians rather
+    than means, so even undetected the tick would move $1 by nothing.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _tickers(tmp_path, [(1, "FAT")])
     _filing(1, "2020-05-01")
-    _bars("FAT", range(2, 64), 1.0)          # 62 days of penny closes
-    _bars("FAT", [1], 10_000.0)              # one bad tick
+    _bars("FAT", [o for o in range(1, 64) if o != 32], 1.0)   # 62 days of penny closes
+    _bars("FAT", [32], 10_000.0)                              # one bad tick, mid-window
     _reconcile()
     assert universe.build(ASOF).height == 0
 

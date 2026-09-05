@@ -22,7 +22,9 @@ relative tolerance:
 ``ok``
     Every reporting source agrees (a lone source trivially agrees with itself —
     the pre-2016 era, where yfinance is the only history there is). The median
-    close is kept.
+    close is kept. Note the asymmetry this creates, and which the read side
+    below closes: a one-source day is ``ok`` because nothing contradicted it,
+    not because anything confirmed it.
 ``majority``
     A strict majority agrees; their median is kept and the dissenting sources are
     recorded in the ledger under ``reconcile.majority``. With the two sources the
@@ -38,6 +40,59 @@ relative tolerance:
 
 :func:`read_canonical` is the only close series the backtester and the anomaly
 signals may consume — the whole point is that no unvetted price reaches them.
+
+The read side: what "canonical" means
+-------------------------------------
+
+A verdict of ``ok`` is necessary but not sufficient, so :func:`read_canonical`
+vets twice more before it hands a close to a caller. **Canonical** is therefore
+a *two-source-confirmed, break-free tail*, and it is narrower than what
+:func:`run` writes. None of this touches the write path: ``run``'s verdict
+counts, its ledger events and the parquet batches on disk are exactly what they
+were, and re-reading an old batch under the new rules is what makes the fix
+retroactive.
+
+``min_sources`` (default 2)
+    A symbol-day only one vendor reported is dropped. A lone source agrees with
+    itself by construction, so ``ok`` on one source records that nothing
+    contradicted the print, not that anything confirmed it. Roughly 29% of the
+    2016-2019 panel was single-source, and the contamination measured there —
+    ticker splices and half-applied back-adjustments — lives almost entirely
+    inside that slice. *By design this makes the pre-2016 history invisible*:
+    yfinance is the only vendor that reaches back that far, so every pre-2016
+    day has one source and no second opinion exists to be had. A caller who
+    genuinely wants unvetted single-source rows — an audit, a coverage report,
+    a deliberately wider backtest — must say ``min_sources=1`` and own it.
+
+``max_jump`` (default 5.0)
+    A level-break detector, applied per symbol to the history that survived
+    ``min_sources``. A consecutive-close ratio above ``max_jump`` or below its
+    reciprocal is not a session, it is a discontinuity in what the series is
+    *measuring*: both vendors concatenate a dead issuer's history under a reused
+    ticker (HYFT $0.005 -> $4.30 overnight, AMPY $0.12 -> $18.75, IGLD $0.37 ->
+    $24.60), and a partially back-adjusted reverse split shows up as an exact
+    integer step. Everything before a symbol's *last* break is dropped: the tail
+    is the current issuer under the current adjustment regime, and the head is a
+    different company or a different scale wearing the same ticker.
+    ``max_jump=None`` disables the detector.
+
+    Breaks are found on the symbol's **whole** history up to ``end``, never on
+    the ``start..end`` slice alone. ``start`` narrows what is returned, not what
+    the detector may look at, so a splice earlier than ``start`` still truncates
+    and the window is applied after the truncation. ``end`` is the one boundary
+    the detector honours, because ``end`` is a *point-in-time horizon* and not a
+    display filter: every consumer here passes ``end=asof``, and letting a break
+    the caller could not yet have known about retract history it could
+    legitimately have traded would put look-ahead — and survivorship bias, in
+    the direction that flatters a backtest — into every result. A name that
+    collapses 100x in 2021 would otherwise vanish from the 2020 universe. The
+    contamination is still reached, one horizon later: the moment ``asof`` moves
+    past the splice, the dead issuer's history stops being returned.
+
+Requiring two sources alone took a 2016-2019 12-2 momentum replication from a
+long-short mean of -5.2%/month (rho 0.13 against OSAP) to rho 0.84 with a sane
+mean; the break detector removes the residual splices that survive inside the
+two-source slice.
 
 Layout mirrors the bar store: one immutable parquet file per run under
 ``<data_root>/canonical/closes``, named with a time-ordered stamp. Re-running a
@@ -84,6 +139,16 @@ RESOLUTION = "1d"
 #: 10 bps. Vendors round and adjust differently; smaller is noise, not signal.
 DEFAULT_TOL = 0.001
 
+#: Read-side default: how many vendors must have reported a close before it is
+#: tradable. Two is the whole point — see the module docstring.
+DEFAULT_MIN_SOURCES = 2
+
+#: Read-side default: the largest one-session close ratio that is still a price
+#: move rather than a change of issuer or of adjustment regime. Real single-day
+#: 5x moves happen (a biotech readout, a takeover bid on a $0.40 shell); 10x
+#: overnight on a name that then keeps trading at the new level does not.
+DEFAULT_MAX_JUMP = 5.0
+
 # Floor for the relative comparison, so two zero closes compare equal instead of
 # dividing by nothing.
 _EPS = 1e-9
@@ -125,6 +190,68 @@ def _check_tol(tol) -> float:
     if not math.isfinite(tol) or not 0.0 <= tol < 1.0:
         raise ValueError(f"tol must be a finite fraction in [0, 1), got {tol}")
     return tol
+
+
+def _check_min_sources(min_sources) -> int:
+    # `bool` is an `int` in Python and `min_sources=True` would silently mean 1 —
+    # the exact opt-out the default exists to make explicit. Reject it.
+    if isinstance(min_sources, bool) or not isinstance(min_sources, int):
+        raise TypeError(f"min_sources must be an int, got {type(min_sources).__name__}")
+    if min_sources < 1:
+        raise ValueError(f"min_sources must be >= 1, got {min_sources}")
+    return min_sources
+
+
+def _check_max_jump(max_jump) -> float | None:
+    if max_jump is None:  # detector disabled
+        return None
+    if isinstance(max_jump, bool) or not isinstance(max_jump, (int, float)):
+        raise TypeError(f"max_jump must be a number or None, got {type(max_jump).__name__}")
+    max_jump = float(max_jump)
+    # 1.0 would call every price change a break and take the panel down to one
+    # row per symbol; anything below it is incoherent (the band would be empty).
+    if not math.isfinite(max_jump) or max_jump <= 1.0:
+        raise ValueError(f"max_jump must be a finite ratio > 1, got {max_jump}")
+    return max_jump
+
+
+def _drop_pre_break(df: pl.DataFrame, max_jump: float) -> pl.DataFrame:
+    """Per symbol, keep only the rows at and after the *last* level break.
+
+    A break is a consecutive-row close ratio outside ``[1/max_jump, max_jump]``,
+    measured on `df` exactly as given — which is why the caller must pass the
+    symbol's whole surviving history and apply the date window afterwards. The
+    break row itself is the first row of the new regime, so it is kept.
+
+    Non-positive and non-finite closes cannot form a meaningful ratio. They
+    never reach a canonical row today (a quarantine, or the vote's usability
+    filter, catches them first), but the guard stays: without it a single 0.0
+    would divide the panel into an infinity and silently truncate a good symbol.
+
+    Fully vectorised — one sort, one window ratio, one window max, one filter.
+    """
+    if df.height == 0:
+        return df
+    prev = pl.col("close").shift(1).over("symbol")
+    ratio = pl.col("close") / prev
+    usable = (
+        pl.col("close").is_not_null()
+        & pl.col("close").is_finite()
+        & (pl.col("close") > 0)
+        & prev.is_not_null()
+        & prev.is_finite()
+        & (prev > 0)
+    )
+    is_break = usable & ((ratio > max_jump) | (ratio < 1.0 / max_jump))
+    # `max` over a `when` without an `otherwise` ignores the non-break rows, so a
+    # symbol that never breaks gets a null cutoff and keeps everything.
+    last_break = pl.when(is_break).then(pl.col("ts")).max().over("symbol")
+    return (
+        df.sort(["symbol", "ts"])
+        .with_columns(__cut=last_break)
+        .filter(pl.col("__cut").is_null() | (pl.col("ts") >= pl.col("__cut")))
+        .drop("__cut")
+    )
 
 
 def _agree(a: float, b: float, tol: float) -> bool:
@@ -287,20 +414,56 @@ def read_canonical(
     symbols: Iterable[str] | None = None,
     start: dt.date | None = None,
     end: dt.date | None = None,
+    *,
+    min_sources: int = DEFAULT_MIN_SOURCES,
+    max_jump: float | None = DEFAULT_MAX_JUMP,
 ) -> pl.DataFrame:
     """The vetted close series: one row per ``(symbol, ts)``, quarantines removed.
 
     `symbols` of ``None`` means every symbol (an empty collection means none);
     `start`/`end` are inclusive. Always returns the full :data:`SCHEMA`, sorted
     by ``symbol, ts``, including when nothing matches — and never a null close.
+
+    Two keyword-only filters decide what "vetted" means; see the module
+    docstring for why they are on by default and what they cost.
+
+    `min_sources`
+        Drop rows fewer than this many vendors reported. Defaults to
+        :data:`DEFAULT_MIN_SOURCES` (2), which requires a close to have been
+        *confirmed* rather than merely uncontradicted. **This makes the pre-2016
+        history invisible by design** — yfinance is the only vendor covering it,
+        so no second opinion exists there. Passing ``min_sources=1`` is the
+        explicit, deliberate opt-in to unvetted single-source rows; it is not a
+        neutral choice and callers that want it should say why.
+
+    `max_jump`
+        Drop, per symbol, everything before its last level break — a
+        consecutive-close ratio above `max_jump` or below ``1 / max_jump``.
+        Defaults to :data:`DEFAULT_MAX_JUMP` (5.0); ``None`` disables it. Breaks
+        are found on the symbol's whole surviving history through `end`, and
+        `start` is applied *afterwards*: a splice before `start` still truncates,
+        while one after `end` is invisible, because `end` is a point-in-time
+        horizon. See the module docstring for why that asymmetry is deliberate.
+
+    Order matters and is fixed: dedupe to the newest verdict, drop quarantines,
+    apply `min_sources`, cut to `end`, find breaks on what is left, then apply
+    `start`.
     """
+    min_sources = _check_min_sources(min_sources)
+    max_jump = _check_max_jump(max_jump)
+
     files = sorted(_canon_dir().glob("*.parquet"))
     if not files:
         return pl.DataFrame(schema=SCHEMA)
 
+    # `symbols` is per-row and independent of every filter below, so it is pushed
+    # into the scan: reading one symbol should not materialise the whole panel.
+    scan = pl.scan_parquet(files, include_file_paths=_FILE_COL)
+    if symbols is not None:
+        scan = scan.filter(pl.col("symbol").is_in(pl.lit(list(symbols), dtype=pl.List(pl.Utf8))))
+
     df = (
-        pl.scan_parquet(files, include_file_paths=_FILE_COL)
-        .collect()
+        scan.collect()
         # Filenames are stamp-ordered, so the last row for a key is the newest
         # verdict. Deduping *before* dropping quarantines is what lets a later
         # quarantine retract a close an earlier run published.
@@ -308,12 +471,21 @@ def read_canonical(
         .unique(subset=["symbol", "ts"], keep="last", maintain_order=True)
         .drop(_FILE_COL)
         .filter(pl.col("status") != "quarantined")
+        # Before the break detector, so an unconfirmed single-source spike is
+        # gone rather than being read as a level break in a good series.
+        .filter(pl.col("n_sources") >= min_sources)
     )
 
-    if symbols is not None:
-        df = df.filter(pl.col("symbol").is_in(pl.lit(list(symbols), dtype=pl.List(pl.Utf8))))
-    if start is not None:
-        df = df.filter(pl.col("ts") >= as_date(start, "start"))
+    # `end` first: it is the point-in-time horizon, so nothing after it may
+    # influence the answer — least of all a break that retracts tradable history.
     if end is not None:
         df = df.filter(pl.col("ts") <= as_date(end, "end"))
+
+    if max_jump is not None:
+        df = _drop_pre_break(df, max_jump)
+
+    # `start` last: truncation is a property of the symbol's history at the
+    # horizon, not of the earliest date the caller happened to ask for.
+    if start is not None:
+        df = df.filter(pl.col("ts") >= as_date(start, "start"))
     return df.sort(["symbol", "ts"]).select(list(SCHEMA))

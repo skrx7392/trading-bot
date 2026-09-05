@@ -98,7 +98,7 @@ def test_read_canonical_never_returns_a_null_close(tmp_path, monkeypatch):
     _write("stooq", 100.0); _write("alpaca", 95.0); _write("yf", 90.0)
     _write("stooq", 50.0, day=dt.date(2024, 1, 3))
     reconcile.run(D, dt.date(2024, 1, 3))
-    can = reconcile.read_canonical()
+    can = reconcile.read_canonical(min_sources=1)  # the surviving row is single-source
     assert can.height == 1 and can["close"].null_count() == 0
 
 
@@ -245,10 +245,10 @@ def test_rerun_supersedes_an_earlier_verdict(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _write("stooq", 100.0)
     reconcile.run(D, D)
-    assert reconcile.read_canonical().height == 1
+    assert reconcile.read_canonical(min_sources=1).height == 1
     _write("alpaca", 95.0); _write("yf", 90.0)
     assert reconcile.run(D, D)["quarantined"] == 1
-    assert reconcile.read_canonical().height == 0
+    assert reconcile.read_canonical(min_sources=1).height == 0
 
 
 def test_rerun_updates_a_corrected_close(tmp_path, monkeypatch):
@@ -257,7 +257,7 @@ def test_rerun_updates_a_corrected_close(tmp_path, monkeypatch):
     reconcile.run(D, D)
     _write("stooq", 101.0)  # correction re-ingest
     reconcile.run(D, D)
-    can = reconcile.read_canonical()
+    can = reconcile.read_canonical(min_sources=1)
     assert can.height == 1 and can["close"][0] == 101.0
 
 
@@ -277,7 +277,7 @@ def test_rerun_of_one_day_leaves_other_days_alone(tmp_path, monkeypatch):
     _write("stooq", 100.0); _write("stooq", 200.0, day=d2)
     reconcile.run(D, d2)
     assert reconcile.run(d2, d2) == {"ok": 1, "majority": 0, "quarantined": 0}
-    can = reconcile.read_canonical()
+    can = reconcile.read_canonical(min_sources=1)
     assert can["ts"].to_list() == [D, d2]
     assert can["close"].to_list() == [100.0, 200.0]
 
@@ -291,12 +291,14 @@ def test_read_canonical_filters(tmp_path, monkeypatch):
         _write("stooq", 100.0, day=day)
         _write("stooq", 200.0, sym="MSFT", day=day)
     reconcile.run(days[0], days[-1])
-    assert reconcile.read_canonical(symbols=["MSFT"])["symbol"].unique().to_list() == ["MSFT"]
+    # one vendor per symbol here: the date/symbol filters are what is under test
+    read = lambda **kw: reconcile.read_canonical(min_sources=1, **kw)
+    assert read(symbols=["MSFT"])["symbol"].unique().to_list() == ["MSFT"]
     # inclusive on both ends
-    assert reconcile.read_canonical(start=days[1], end=days[1])["ts"].unique().to_list() == [days[1]]
-    assert reconcile.read_canonical(end=days[0]).height == 2
+    assert read(start=days[1], end=days[1])["ts"].unique().to_list() == [days[1]]
+    assert read(end=days[0]).height == 2
     # an empty symbol list means no symbols (same convention as store.read_bars)
-    assert reconcile.read_canonical(symbols=[]).height == 0
+    assert read(symbols=[]).height == 0
 
 
 def test_read_canonical_is_sorted_by_symbol_then_ts(tmp_path, monkeypatch):
@@ -305,7 +307,7 @@ def test_read_canonical_is_sorted_by_symbol_then_ts(tmp_path, monkeypatch):
     _write("stooq", 1.0, sym="MSFT", day=d2); _write("stooq", 2.0, sym="AAPL", day=d2)
     _write("stooq", 3.0, sym="AAPL")
     reconcile.run(D, d2)
-    can = reconcile.read_canonical()
+    can = reconcile.read_canonical(min_sources=1)
     assert list(zip(can["symbol"], can["ts"])) == [("AAPL", D), ("AAPL", d2), ("MSFT", d2)]
 
 
@@ -313,7 +315,199 @@ def test_read_canonical_accepts_iso_date_strings(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _write("stooq", 100.0)
     reconcile.run(D, D)
-    assert reconcile.read_canonical(start="2024-01-02", end="2024-01-02").height == 1
+    assert reconcile.read_canonical(
+        start="2024-01-02", end="2024-01-02", min_sources=1
+    ).height == 1
+
+
+# --- read-side vetting: min_sources --------------------------------------------------
+
+def _seed_series(closes, sym="AAPL", first=D, sources=("stooq", "alpaca")):
+    """Write `closes` on consecutive days from every source, vote, return the days.
+
+    Every source reports the same number, so each day is a unanimous ``ok`` with
+    ``n_sources == len(sources)`` — which isolates the read-side filters from the
+    vote itself.
+    """
+    days = [first + dt.timedelta(days=i) for i in range(len(closes))]
+    for day, close in zip(days, closes):
+        for src in sources:
+            _write(src, close, sym=sym, day=day)
+    reconcile.run(days[0], days[-1])
+    return days
+
+
+def test_single_source_rows_are_excluded_by_default(tmp_path, monkeypatch):
+    """A lone source trivially agrees with itself; that is not confirmation."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write("yf", 100.0)
+    assert reconcile.run(D, D)["ok"] == 1  # the write-side verdict is unchanged
+    assert reconcile.read_canonical().height == 0
+    assert reconcile.read_canonical(min_sources=1).height == 1
+
+
+def test_two_agreeing_sources_survive_the_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write("yf", 100.0); _write("alpaca", 100.0)
+    reconcile.run(D, D)
+    can = reconcile.read_canonical()
+    assert can.height == 1 and can["n_sources"][0] == 2
+
+
+def test_min_sources_can_demand_more_than_two(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write("yf", 100.0); _write("alpaca", 100.0)
+    reconcile.run(D, D)
+    assert reconcile.read_canonical(min_sources=3).height == 0
+    for s in ("stooq", "alpaca", "yf"): _write(s, 100.0)
+    reconcile.run(D, D)
+    assert reconcile.read_canonical(min_sources=3).height == 1
+
+
+# --- read-side vetting: max_jump -----------------------------------------------------
+
+def test_a_break_drops_every_row_before_it(tmp_path, monkeypatch):
+    """A ticker splice: the pre-break rows are a different issuer's prices."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 1.0, 10.0, 10.0, 10.0])
+    assert reconcile.read_canonical()["ts"].to_list() == days[3:]
+
+
+def test_only_the_history_after_the_last_break_survives(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 10.0, 10.0, 100.0, 100.0])
+    assert reconcile.read_canonical()["ts"].to_list() == days[4:]
+
+
+def test_a_downward_break_truncates_too(tmp_path, monkeypatch):
+    """The detector is symmetric: 1/10 is as impossible a session as 10x."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([10.0, 10.0, 1.0, 1.0])
+    assert reconcile.read_canonical()["ts"].to_list() == days[2:]
+
+
+def test_a_move_within_max_jump_survives(tmp_path, monkeypatch):
+    """4x in a day is violent and real; the default must not eat it."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 4.0, 4.0])
+    assert reconcile.read_canonical()["ts"].to_list() == days
+
+
+def test_a_ratio_exactly_at_max_jump_is_not_a_break(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 5.0, 5.0])
+    assert reconcile.read_canonical()["ts"].to_list() == days
+
+
+def test_max_jump_none_keeps_the_whole_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 10.0, 10.0])
+    assert reconcile.read_canonical(max_jump=None)["ts"].to_list() == days
+
+
+def test_max_jump_is_tunable(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 4.0, 4.0])
+    assert reconcile.read_canonical()["ts"].to_list() == days      # 4x < 5x default
+    assert reconcile.read_canonical(max_jump=3.0)["ts"].to_list() == days[2:]
+
+
+def test_breaks_are_detected_per_symbol(tmp_path, monkeypatch):
+    """One symbol's splice must not truncate its neighbour in the same frame."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 10.0], sym="SPLICED")
+    _seed_series([2.0, 2.0, 2.0], sym="CLEAN")
+    can = reconcile.read_canonical()
+    assert can.filter(pl.col("symbol") == "SPLICED")["ts"].to_list() == days[2:]
+    assert can.filter(pl.col("symbol") == "CLEAN")["ts"].to_list() == days
+
+
+def test_a_break_before_start_still_truncates(tmp_path, monkeypatch):
+    """`start` narrows the answer, never what the detector may look at.
+
+    The break at ``days[2]`` is found from ``days[1]``, a row outside the
+    requested window, and the truncation is applied before the window is — so
+    the pre-break rows the caller asked for are gone rather than returned.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 10.0, 10.0, 10.0])
+    assert reconcile.read_canonical(start=days[1])["ts"].to_list() == days[2:]
+    assert reconcile.read_canonical(start=days[1], max_jump=None)["ts"].to_list() == days[1:]
+
+
+def test_a_break_after_end_does_not_truncate(tmp_path, monkeypatch):
+    """`end` is a point-in-time horizon, not a display filter.
+
+    A splice nobody could have known about on `end` must not retract history
+    that was legitimately tradable then: that is look-ahead, and it is
+    survivorship bias in the direction that flatters a backtest. The
+    contamination is still removed — one horizon later, as soon as `end` reaches
+    the break.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 1.0, 10.0])
+    assert reconcile.read_canonical(end=days[2])["ts"].to_list() == days[:3]
+    assert reconcile.read_canonical(end=days[3])["ts"].to_list() == days[3:]
+    assert reconcile.read_canonical()["ts"].to_list() == days[3:]
+
+
+def test_breaks_are_measured_after_the_min_sources_filter(tmp_path, monkeypatch):
+    """A single-source spike is dropped first, so it cannot fake a level break."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = [D + dt.timedelta(days=i) for i in range(5)]
+    for i, day in enumerate(days):
+        if i == 2:
+            _write("stooq", 10.0, day=day)  # one source only: unvetted spike
+        else:
+            _write("stooq", 1.0, day=day); _write("alpaca", 1.0, day=day)
+    reconcile.run(days[0], days[-1])
+    assert reconcile.read_canonical()["ts"].to_list() == [days[0], days[1], days[3], days[4]]
+    # with the spike admitted it is two breaks, and only the tail survives
+    assert reconcile.read_canonical(min_sources=1)["ts"].to_list() == days[3:]
+
+
+# --- read-side validation ------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_read_canonical_rejects_a_non_positive_min_sources(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(ValueError, match="min_sources"):
+        reconcile.read_canonical(min_sources=bad)
+
+
+@pytest.mark.parametrize("bad", [True, 2.0, "2", None])
+def test_read_canonical_rejects_a_non_int_min_sources(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(TypeError, match="min_sources"):
+        reconcile.read_canonical(min_sources=bad)
+
+
+@pytest.mark.parametrize("bad", [1.0, 0.5, 0.0, -2.0, float("nan"), float("inf")])
+def test_read_canonical_rejects_a_bad_max_jump(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(ValueError, match="max_jump"):
+        reconcile.read_canonical(max_jump=bad)
+
+
+@pytest.mark.parametrize("bad", [True, "5"])
+def test_read_canonical_rejects_a_non_numeric_max_jump(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(TypeError, match="max_jump"):
+        reconcile.read_canonical(max_jump=bad)
+
+
+def test_read_canonical_validates_before_touching_the_store(tmp_path, monkeypatch):
+    """An empty warehouse must not swallow a caller's bad argument."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    assert reconcile.read_canonical().height == 0  # nothing written at all
+    with pytest.raises(ValueError, match="min_sources"):
+        reconcile.read_canonical(min_sources=0)
+
+
+def test_read_canonical_filters_are_keyword_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(TypeError):
+        reconcile.read_canonical(None, None, None, 1)
 
 
 # --- range and validation -----------------------------------------------------------
@@ -328,7 +522,7 @@ def test_run_only_reconciles_the_requested_range(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _write("stooq", 100.0); _write("stooq", 200.0, day=dt.date(2024, 1, 5))
     assert reconcile.run(D, D)["ok"] == 1
-    assert reconcile.read_canonical()["ts"].to_list() == [D]
+    assert reconcile.read_canonical(min_sources=1)["ts"].to_list() == [D]
 
 
 def test_run_rejects_an_inverted_range(tmp_path, monkeypatch):
@@ -398,8 +592,10 @@ def test_matches_a_naive_reference_on_randomised_symbol_days(tmp_path, monkeypat
     counts = reconcile.run(D, D)
     assert sum(counts.values()) == len(expected)
 
+    # min_sources=1: the fixture deliberately lets a source skip a symbol, and it
+    # is the *vote* that is being cross-checked here, not the read-side filters.
     got = {r["symbol"]: (r["status"], r["close"])
-           for r in reconcile.read_canonical().rows(named=True)}
+           for r in reconcile.read_canonical(min_sources=1).rows(named=True)}
     for sym, (status, close) in expected.items():
         if status == "quarantined":
             assert sym not in got, sym
