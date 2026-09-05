@@ -377,6 +377,35 @@ class FakeYFinance:
         return _T()
 
 
+class YFRateLimitError(Exception):
+    """Named exactly as yfinance names it, so the fetcher's version-tolerant
+    detection is exercised the way a real throttle would exercise it."""
+
+
+class ScriptedYFinance(FakeYFinance):
+    """`history` walks a per-symbol script of outcomes: an exception is raised, a
+    frame is returned. The final outcome repeats, so a one-element script of an
+    exception throttles forever."""
+
+    def __init__(self, script):
+        super().__init__({})
+        self.script = {sym: list(outcomes) for sym, outcomes in script.items()}
+
+    def Ticker(self, symbol):  # noqa: N802 - mirrors yfinance's API
+        outer = self
+
+        class _T:
+            def history(self, **kwargs):
+                outer.calls.append((symbol, kwargs))
+                outcomes = outer.script.get(symbol) or [_hist([])]
+                out = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+                if isinstance(out, BaseException):
+                    raise out
+                return out
+
+        return _T()
+
+
 @pytest.fixture
 def fake_yf(monkeypatch):
     def _install(frames):
@@ -385,6 +414,24 @@ def fake_yf(monkeypatch):
         return fake
 
     return _install
+
+
+@pytest.fixture
+def scripted_yf(monkeypatch):
+    def _install(script):
+        fake = ScriptedYFinance(script)
+        monkeypatch.setitem(sys.modules, "yfinance", fake)
+        return fake
+
+    return _install
+
+
+@pytest.fixture
+def slept(monkeypatch):
+    """Replaces the fetcher's sleeper, so backoff is asserted, not waited out."""
+    calls = []
+    monkeypatch.setattr(yf, "_sleep", calls.append)
+    return calls
 
 
 # --- yfinance -----------------------------------------------------------------------
@@ -461,7 +508,7 @@ def test_yf_ingest_tags_source_yf(tmp_path, monkeypatch, fake_yf):
     assert out.height == 2 and set(out["source"].to_list()) == {"yf"}
     assert store.read_bars(source="stooq").height == 0
     payload = json.loads(ledger.read_events("ingest.yf")["payload"][0])
-    assert payload == {"symbols": 1, "rows": 2}
+    assert payload == {"symbols": 1, "rows": 2, "rate_limit_retries": 0}
 
 
 def test_yf_ingest_with_no_bars_still_logs(tmp_path, monkeypatch, fake_yf):
@@ -470,7 +517,7 @@ def test_yf_ingest_with_no_bars_still_logs(tmp_path, monkeypatch, fake_yf):
     assert yf.ingest(["NOPE"], dt.date(2020, 1, 2), dt.date(2020, 1, 3)) == 0
     assert store.read_bars().height == 0
     payload = json.loads(ledger.read_events("ingest.yf")["payload"][0])
-    assert payload == {"symbols": 1, "rows": 0}
+    assert payload == {"symbols": 1, "rows": 0, "rate_limit_retries": 0}
 
 
 def test_yf_result_is_accepted_by_the_store(tmp_path, monkeypatch, fake_yf):
@@ -479,6 +526,67 @@ def test_yf_result_is_accepted_by_the_store(tmp_path, monkeypatch, fake_yf):
     df = yf.fetch_bars(["AAPL"], dt.date(2020, 1, 2), dt.date(2020, 1, 3))
     assert store.write_bars(df, source="yf") == 1
     assert isinstance(df["ts"][0], dt.date) and df["ts"].dtype == pl.Date
+
+
+# --- yfinance rate-limit backoff ----------------------------------------------------
+
+def test_yf_waits_out_a_rate_limit_and_still_returns_the_bars(scripted_yf, slept):
+    """Yahoo throttles per IP for a while, not forever: a nightly that hit the
+    limit must wait rather than crash — and never skip the symbol it was fetching."""
+    scripted_yf({"AAPL": [YFRateLimitError("Rate limited"),
+                          YFRateLimitError("Rate limited"),
+                          _hist([2, 3])]})
+    df = yf.fetch_bars(["AAPL"], dt.date(2020, 1, 2), dt.date(2020, 1, 3))
+    assert df["ts"].to_list() == [dt.date(2020, 1, 2), dt.date(2020, 1, 3)]
+    assert slept == list(yf.RATE_LIMIT_BACKOFF_S[:2])
+
+
+def test_yf_ingest_reports_the_retries_it_absorbed(tmp_path, monkeypatch,
+                                                   scripted_yf, slept):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    scripted_yf({"AAPL": [YFRateLimitError("Rate limited"),
+                          YFRateLimitError("Rate limited"),
+                          _hist([2, 3])]})
+    assert yf.ingest(["AAPL"], dt.date(2020, 1, 2), dt.date(2020, 1, 3)) == 2
+    payload = json.loads(ledger.read_events("ingest.yf")["payload"][0])
+    assert payload == {"symbols": 1, "rows": 2, "rate_limit_retries": 2}
+
+
+def test_yf_recognises_a_throttle_by_message_across_yfinance_versions(scripted_yf,
+                                                                     slept):
+    """yfinance has moved (and renamed) its exception classes; the wire message is
+    the stable signal, so an unrecognised class still backs off."""
+    scripted_yf({"AAPL": [RuntimeError("Too Many Requests. Rate limited."),
+                          _hist([2])]})
+    df = yf.fetch_bars(["AAPL"], dt.date(2020, 1, 2), dt.date(2020, 1, 3))
+    assert df.height == 1
+    assert slept == [yf.RATE_LIMIT_BACKOFF_S[0]]
+
+
+def test_yf_reraises_once_the_backoffs_are_exhausted(scripted_yf, slept):
+    """Loudness is the point: a throttle that outlasts the schedule fails the job
+    rather than handing reconciliation a quietly short series."""
+    fake = scripted_yf({"AAPL": [YFRateLimitError("Rate limited")]})
+    with pytest.raises(Exception, match="Rate limited"):
+        yf.fetch_bars(["AAPL"], dt.date(2020, 1, 2), dt.date(2020, 1, 3))
+    assert slept == list(yf.RATE_LIMIT_BACKOFF_S)
+    assert len(fake.calls) == len(yf.RATE_LIMIT_BACKOFF_S) + 1
+
+
+def test_yf_does_not_retry_a_non_rate_limit_error(scripted_yf, slept):
+    fake = scripted_yf({"AAPL": [ValueError("boom")]})
+    with pytest.raises(ValueError, match="boom"):
+        yf.fetch_bars(["AAPL"], dt.date(2020, 1, 2), dt.date(2020, 1, 3))
+    assert slept == []
+    assert len(fake.calls) == 1
+
+
+def test_yf_retry_keeps_every_symbol_in_order(scripted_yf, slept):
+    scripted_yf({"AAPL": [YFRateLimitError("Rate limited"), _hist([2, 3])],
+                 "MSFT": [_hist([2])]})
+    df = yf.fetch_bars(["AAPL", "MSFT"], dt.date(2020, 1, 2), dt.date(2020, 1, 3))
+    assert df["symbol"].to_list() == ["AAPL", "AAPL", "MSFT"]
+    assert slept == [yf.RATE_LIMIT_BACKOFF_S[0]]
 
 
 # --- live smoke test (deselected by default) ----------------------------------------
