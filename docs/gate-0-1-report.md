@@ -579,3 +579,105 @@ if a vendor ever serves two companies under one symbol, that series is attribute
 its whole length. The controls are the override list (hand-verified rows win over every inferred interval),
 the break detector (ruling 43), and this coverage measurement, which is re-run whenever the map's sources
 change.
+
+### 12.5 The 2019–2020 quarantine spike (ruling 47)
+
+§9 gap 6 held that no result may lean on 2019–2020 until §5's quarantine spike — 7.02% of bars in 2019 and
+8.69% in 2020, against 4.27% in 2016 and 1.83% in 2026 — is explained. `tools/t17/quarantine_by_month.py`
+buckets every canonical symbol-day in 2018-01..2021-12 by month, and every `reconcile.quarantine` event in
+that window by the size of the disagreement `|alpaca/yf − 1|`. Ledger event
+`39e9d5f9e0f647d4bd59c41783909ed5` (`diagnosis.quarantine`); raw output in `data/raw/quarantine_diag.json`
+and `data/raw/quarantine_diag.log`. **7,221,479 canonical symbol-days, 434,692 quarantined (6.02%)**;
+437,574 quarantine events in the window carried both vendors' closes, over **5,225 distinct symbols**.
+(Events exceed quarantined rows by 0.7% because a re-voted symbol-day logs a second event; the read side
+keeps only the newest verdict.)
+
+**It is a regime with month-boundary edges, and the calendar year hid them.** The rate averages **4.03%**
+across 2018-01..2018-11 (range 3.87–4.47%), steps to 6.78% in **2018-12** and stays between 6.4% and 10.1% for 28 consecutive
+months through **2021-03**, then falls to 2.90% in 2021-04 and settles at **3.18%** across 2021-06..2021-12.
+So the elevated period starts a month before 2019 and ends a quarter into 2021; "2019–2020" is an artifact
+of bucketing by calendar year. The 29 months above 5%:
+
+| Month | Rows | Quar. | Rate | Month | Rows | Quar. | Rate | Month | Rows | Quar. | Rate |
+|---|---:|---:|---:|---|---:|---:|---:|---|---:|---:|---:|
+| 2018-12 | 131,451 | 8,918 | 6.78% | 2019-11 | 141,507 | 9,779 | 6.91% | 2020-10 | 160,770 | 13,842 | 8.61% |
+| 2019-01 | 145,271 | 10,228 | 7.04% | 2019-12 | 148,773 | 10,935 | 7.35% | 2020-11 | 146,742 | 12,220 | 8.33% |
+| 2019-02 | 131,523 | 8,801 | 6.69% | 2020-01 | 148,980 | 11,430 | 7.67% | 2020-12 | 162,696 | 12,289 | 7.55% |
+| 2019-03 | 145,294 | 10,098 | 6.95% | 2020-02 | 134,885 | 10,506 | 7.79% | 2021-01 | 141,632 | 10,173 | 7.18% |
+| 2019-04 | 145,509 | 9,259 | 6.36% | **2020-03** | 156,185 | 15,704 | **10.05%** | 2021-02 | 143,184 | 9,600 | 6.70% |
+| 2019-05 | 153,171 | 10,855 | 7.09% | 2020-04 | 148,597 | 14,009 | 9.43% | 2021-03 | 174,720 | 12,780 | 7.31% |
+| 2019-06 | 139,658 | 9,595 | 6.87% | 2020-05 | 141,816 | 13,261 | 9.35% | 2021-05 | 154,294 | 8,035 | 5.21% |
+| 2019-07 | 154,176 | 10,076 | 6.54% | 2020-06 | 156,449 | 14,088 | 9.00% | | | | |
+| 2019-08 | 154,538 | 12,224 | 7.91% | 2020-07 | 157,196 | 13,812 | 8.79% | | | | |
+| 2019-09 | 140,635 | 9,900 | 7.04% | 2020-08 | 150,991 | 12,329 | 8.17% | | | | |
+| 2019-10 | 162,284 | 11,401 | 7.03% | 2020-09 | 151,983 | 13,555 | 8.92% | | | | |
+
+Peak month **2020-03** (15,704 of 156,185 = 10.05%), the payload's `peak_month`. 2021-05 (5.21%) and
+2021-06 (4.08%) are a ragged two-month tail after the 2021-04 drop, not a second regime.
+
+**What kind of disagreement, over the whole window:**
+
+| Gap `abs(alpaca/yf − 1)` | 10–50 bps | 0.5–2% | 2–10% | 10–50% | 50%–5× | > 5× |
+|---|---:|---:|---:|---:|---:|---:|
+| Events | 177,315 | 71,493 | 46,599 | 63,484 | 54,079 | 24,604 |
+| Share | 40.5% | 16.3% | 10.6% | 14.5% | 12.4% | 5.6% |
+
+No single bucket dominates the window, so the aggregate alone selects none of the three diagnoses. The
+month-by-month cross-tab does, because the buckets move independently — mean events per month:
+
+| Regime | 10–50 bps | 0.5–2% | 2–10% | 10–50% | 50%–5× | > 5× | total | > 10% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2018-01..2018-11 (4.03%) | 968 | 695 | 925 | 1,485 | 1,288 | 396 | 5,756 | 3,169 |
+| **2018-12..2021-03 (7.69%)** | **5,564** | **2,066** | 1,082 | 1,294 | 1,080 | 460 | 11,546 | 2,834 |
+| — of which 2020-03..2020-07 (9.32%) | 6,514 | **3,428** | **1,490** | 1,280 | 1,068 | 461 | 14,239 | 2,808 |
+| 2021-06..2021-12 (3.18%) | 993 | 651 | 654 | 1,222 | 1,072 | 855 | 5,447 | 3,149 |
+
+**The lift is entirely sub-2%, and the price-corrupting buckets carry none of it.** The regime adds
+**+5,790 quarantines per month** over the 2018 baseline: **+4,596 of them (79.4%) are 10–50 bps** and
++1,371 are 0.5–2% — together **103% of the excess**, because the three buckets above 10% are *net −335*
+per month (−191, −208, +64). Large disagreements — splices, missed splits, partial back-adjustments — run
+at 2,515–3,416 events a month (mean 2,962) across all four years and are visibly *not* elevated in
+2019–2020 — their two quietest months, 2020-02 and 2021-01, are inside the regime. The COVID quarter adds its own component in the 0.5–2% and 2–10% buckets (2020-03 alone: 4,847 and 2,550,
+against 695 and 925 in the 2018 baseline) — two vendors disagreeing more about a close on days the close
+moved 10%, which is the one part of the picture with an obvious mechanism.
+
+**The constant floor is a set of names that never agree.** 140 of the 5,225 symbols are quarantined on ≥ 900
+of the window's ~1,008 trading days. The top-30 list is `FTFT` (1,166 events — re-votes) followed by 28
+names all tied at 1,008, i.e. every trading day: `APH`, `ABTS`, `ADEA`, `AEHL`, `AEMD`, `AGEN`, `ANAB`,
+`ARMK`, `AROW`, `ATRO`, `AVK`, `BDX`, `BHP`, `BWA`, `CBIO`, `CBSH`, `CENN`, `CENT`, `CHGX`, `CIG`, `CLM`,
+`CLWT`, `CMCSA`, `CMCT`, `CNH`, `CNQ`, `CRESY`, `CRF`, `DBVT`. That list is alphabetical inside the tie, so
+it is a sample of the 140 and not a ranking — but it is a broad cross-section (mega-caps `CMCSA`, `BDX`,
+`APH`; ADRs `BHP`, `CIG`, `CNQ`, `CRESY`; closed-end funds `AVK`, `CLM`, `CRF`; microcaps `AEHL`, `CLWT`).
+Being constant across all 48 months, they are the ~3% floor and arithmetically cannot be the lift.
+
+**Disposition: the third outcome — tolerance, not data. No action; `DEFAULT_TOL` stays at 10 bps.** Chosen
+on the excess rather than the window aggregate: 79.4% of the regime's extra quarantines are disagreements
+between 10 and 50 bps, and 103% of them are under 2%. The first outcome's re-pull is **not** triggered, on
+two grounds. *Size*: an adjustment-basis event (a silent yfinance dividend or split revision, spec A3) is
+percent-scale on a typical payer and an integer factor on a split, and four fifths of the excess is under
+50 bps. *Shape*, which is the stronger one: an adjustment basis applies to a vendor's whole stored series
+for a symbol, so it shows as a name that disagrees on **every** day — exactly the 140-name floor, flat
+across all 48 months — and not as a regime that switches on at one month boundary and off at another across
+thousands of names. A re-pull swaps our fixed-vintage yfinance series for today's; nothing here suggests
+today's vintage would print different closes for these months, and the set it would cover is not a short
+list of symbol-months but essentially the whole cross-section for 28 of them. The second outcome's splices
+are the flat >10% floor, already handled on the read side by ruling 43's break detector and by the
+quarantine itself. Ruling 29's rule stands as written: the climbing rate was a vendor problem to investigate, the
+investigation is this section, and its answer is not a reason to widen `tol`.
+
+**What this means for gap 6.** A result may lean on 2019–2020 — the exposure is *coverage*, not
+contamination. The rows the regime *adds* to the quarantine are ones where the two vendors printed closes
+within 2% (four fifths of them within 50 bps) of each other; the panel loses ~3.7 pp more of its
+symbol-days per month than in 2018, and — the large-gap buckets being net negative across the regime — not
+one of those extra losses is a bar where a vendor printed a price the other would call wrong by an order of
+magnitude. This bears directly on the replication window: 13 of the development window's 48 months
+(2018-12..2019-12) sit inside the regime, and the sensitivity check §9 asked for is the calibration grid in
+§12.2–12.4, which re-runs the same anomalies with the panel varied.
+
+**Registered limits.** (a) *Which* vendor moved is not identified. A 10–50 bps difference is a close
+convention — consolidated official close versus last trade, or rounding — and this measurement sees only
+the gap, not which side changed; the month-boundary edges (2018-12 in, 2021-04 out) say a vintage or
+convention changed on one side, and no ledger event of ours records such a change. (b) The event counts are
+per *vote*, so a re-voted symbol-day is counted twice; at 0.7% over the canonical row count this cannot
+move any share above. (c) Pairs where either vendor is absent are skipped by construction, so this says
+nothing about single-source days, which the `min_sources` filter handles separately.
