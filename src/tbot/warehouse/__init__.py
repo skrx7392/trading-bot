@@ -18,6 +18,10 @@ Price sources and their roles (as of 2026-09-05):
 Every source is on one price basis: **split-adjusted, dividend-unadjusted**.
 Mixing a second basis into the store is the failure mode the reconciler cannot
 distinguish from a bad vendor.
+
+``actions``
+    Dividends and splits: Alpaca corporate actions, ``actions.py`` — the
+    dividend income the price basis leaves out, adjusted onto it on read.
 """
 
-__all__ = ["alpaca", "edgar", "reconcile", "stooq", "store", "universe", "yf"]
+__all__ = ["actions", "alpaca", "edgar", "reconcile", "stooq", "store", "universe", "yf"]
