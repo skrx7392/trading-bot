@@ -327,6 +327,15 @@ def test_an_unknown_prompt_is_labelled_by_a_stable_hash():
         ("(415)", -415.0),               # a loss, printed the way filings print it
         ("$(415)", -415.0),
         ("-415", -415.0),
+        ("-$415", -415.0),
+        # A minus and parentheses are two spellings of one loss, so a reply that
+        # uses both is still negative — the sign is read once, never toggled.
+        ("-(415)", -415.0),
+        ("(-$415)", -415.0),
+        ("$-415", -415.0),
+        ("415", 415.0),                  # the unsigned shapes stay positive
+        ("$415", 415.0),
+        ("1,234.5", 1234.5),
         ("5e6", 5000000.0),
     ],
 )

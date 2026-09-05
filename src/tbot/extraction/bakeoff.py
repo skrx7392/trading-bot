@@ -254,16 +254,19 @@ def _bare_number(content: str) -> float | None:
     extracted from it by the harness.
     """
     text = content.strip()
-    negative = False
-    for _ in range(2):  # "(415)" and "$(415)" both reach the digits in two peels
-        if text.startswith("(") and text.endswith(")"):
-            negative, text = not negative, text[1:-1].strip()
+    minus = parenthesised = False
+    while True:  # every branch shortens `text`, so this terminates
+        if len(text) > 1 and text.startswith("(") and text.endswith(")"):
+            parenthesised, text = True, text[1:-1].strip()
         elif text.startswith("$"):
             text = text[1:].strip()
         elif text.startswith("-"):
-            negative, text = not negative, text[1:].strip()
+            minus, text = True, text[1:].strip()
         else:
             break
+    # The sign is read once, not toggled: a minus and parentheses are two ways of
+    # writing the same loss, so `-(415)` and `(-$415)` are -415, not +415.
+    negative = minus or parenthesised
     text = text.replace(",", "")
     if not _BARE_NUMBER.fullmatch(text):
         return None
