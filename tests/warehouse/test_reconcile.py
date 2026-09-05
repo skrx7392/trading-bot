@@ -693,3 +693,50 @@ def test_batch_filenames_sort_in_run_order(tmp_path, monkeypatch):
     files = sorted((tmp_path / "canonical" / "closes").glob("*.parquet"))
     assert len(files) == 2
     assert [pl.read_parquet(f)["close"][0] for f in files] == [100.0, 101.0]
+
+
+# --- symbol-scoped runs -------------------------------------------------------------
+
+def test_run_can_be_scoped_to_symbols(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    for sym in ("AAPL", "MSFT"):
+        _write("alpaca", 100.0, sym=sym)
+        _write("yf", 100.0, sym=sym)
+    out = reconcile.run(D, D, symbols=["aapl"])   # normalised like the fetchers
+    assert out == {"ok": 1, "majority": 0, "quarantined": 0}
+    can = reconcile.read_canonical()
+    assert can["symbol"].to_list() == ["AAPL"]
+
+
+def test_run_with_an_empty_symbol_list_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write("alpaca", 100.0); _write("yf", 100.0)
+    assert reconcile.run(D, D, symbols=[]) == {"ok": 0, "majority": 0, "quarantined": 0}
+    assert reconcile.read_canonical().height == 0
+    assert not list((tmp_path / "canonical" / "closes").glob("*.parquet"))
+
+
+def test_run_rejects_a_bare_string_symbol_list(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(TypeError):
+        reconcile.run(D, D, symbols="AAPL")
+
+
+def test_scoped_rerun_leaves_other_symbols_verdicts_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    for sym in ("AAPL", "MSFT"):
+        _write("alpaca", 100.0, sym=sym); _write("yf", 100.0, sym=sym)
+    reconcile.run(D, D)
+    _write("alpaca", 200.0, sym="AAPL")            # a correction for AAPL only
+    # Only AAPL is re-voted: MSFT contributes no verdict to the scoped run.
+    assert reconcile.run(D, D, symbols=["AAPL"]) == {"ok": 0, "majority": 0, "quarantined": 1}
+    can = reconcile.read_canonical()
+    assert can.filter(pl.col("symbol") == "MSFT")["close"][0] == 100.0
+    # AAPL's newest verdict is a quarantine (200 vs 100). `read_canonical` drops
+    # quarantines, so the verdict itself is read off the audit trail.
+    assert can.filter(pl.col("symbol") == "AAPL").height == 0
+    batches = sorted((tmp_path / "canonical" / "closes").glob("*.parquet"))
+    newest = pl.concat([pl.read_parquet(f) for f in batches]).unique(
+        subset=["symbol", "ts"], keep="last", maintain_order=True
+    )
+    assert newest.filter(pl.col("symbol") == "AAPL")["status"][0] == "quarantined"

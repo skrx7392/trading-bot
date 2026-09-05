@@ -239,6 +239,24 @@ def _check_max_jump(max_jump) -> float | None:
     return max_jump
 
 
+def _check_symbols(symbols) -> list[str] | None:
+    """``None`` for "every symbol"; otherwise a normalised, de-duplicated list.
+
+    A bare string is refused rather than iterated: ``symbols="AAPL"`` would
+    otherwise vote four one-letter tickers and report four verdicts.
+    """
+    if symbols is None:
+        return None
+    if isinstance(symbols, (str, bytes)):
+        raise TypeError("symbols must be a collection of strings, not a bare string")
+    out: list[str] = []
+    for raw in symbols:
+        sym = str(raw).strip().upper()
+        if sym and sym not in out:
+            out.append(sym)
+    return out
+
+
 def _drop_pre_break(df: pl.DataFrame, max_jump: float) -> pl.DataFrame:
     """Per symbol, keep only the rows at and after the *last* level break.
 
@@ -337,21 +355,35 @@ def _write_batch(rows: pl.DataFrame) -> Path:
     return target
 
 
-def run(start: dt.date, end: dt.date, tol: float = DEFAULT_TOL) -> dict[str, int]:
+def run(
+    start: dt.date,
+    end: dt.date,
+    tol: float = DEFAULT_TOL,
+    *,
+    symbols: Iterable[str] | None = None,
+) -> dict[str, int]:
     """Reconcile every symbol-day in ``[start, end]`` and return the verdict counts.
 
     Writes one canonical-closes parquet batch (including the quarantined rows,
     for audit) and one ledger event per non-unanimous symbol-day. Re-running a
     range is safe and is how corrections are applied: the newest verdict wins.
+
+    `symbols` (keyword-only) narrows the vote to those names; ``None`` votes
+    every symbol the store holds in the window and an empty collection votes
+    nothing and writes nothing. Used by the split re-base, which re-votes one
+    name's whole history after both vendors re-adjusted it.
     """
     start = as_date(start, "start")
     end = as_date(end, "end")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
     tol = _check_tol(tol)
+    symbols = _check_symbols(symbols)
 
     counts = dict.fromkeys(STATUSES, 0)
-    bars = store.read_bars(start=start, end=end, resolution=RESOLUTION)
+    if symbols is not None and not symbols:
+        return counts
+    bars = store.read_bars(symbols=symbols, start=start, end=end, resolution=RESOLUTION)
     if bars.height == 0:
         return counts
 
