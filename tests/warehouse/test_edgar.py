@@ -893,3 +893,69 @@ def test_a_former_name_with_no_end_is_an_open_window(tmp_path, monkeypatch):
     assert row["tickers"] == ["NOW"]  # normalised the way symbols are held elsewhere
     assert row["former_names"] == [
         {"name": "Then Inc.", "from": dt.date(1999, 1, 4), "to": None}]
+
+
+# --- the budgeted document fetcher (task 9) -----------------------------------------
+
+class _DocClient:
+    def __init__(self, body="<html><body><p>Item 2.02 Results.</p><script>x()</script></body></html>"):
+        self.body, self.requests = body, []
+    def get(self, url, headers=None):
+        self.requests.append((url, headers))
+        class R:
+            status_code = 200
+            text = self.body
+            def raise_for_status(self_): pass
+        return R()
+    def close(self): pass
+
+
+def test_fetch_document_builds_the_archive_url_strips_html_and_logs(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
+    monkeypatch.setattr(edgar, "_sleep", lambda s: None)
+    c = _DocClient()
+    text = edgar.fetch_document(320193, "0000320193-26-000018", "aapl-20260730.htm",
+                                budget=edgar.FetchBudget(1), client=c)
+    assert text == "Item 2.02 Results."
+    url, headers = c.requests[0]
+    assert url == "https://www.sec.gov/Archives/edgar/data/320193/000032019326000018/aapl-20260730.htm"
+    assert headers["User-Agent"] == "tbot test@example.com"
+    payload = json.loads(ledger.read_events("fetch.edgar.document")["payload"][0])
+    assert payload["cik"] == 320193 and payload["accn"] == "0000320193-26-000018" and payload["chars"] == len(text)
+
+
+def test_fetch_document_stops_at_the_budget_before_requesting(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
+    monkeypatch.setattr(edgar, "_sleep", lambda s: None)
+    c = _DocClient()
+    budget = edgar.FetchBudget(1)
+    edgar.fetch_document(1, "0000000001-20-000001", "a.htm", budget=budget, client=c)
+    with pytest.raises(edgar.BudgetExceeded):
+        edgar.fetch_document(1, "0000000001-20-000002", "b.htm", budget=budget, client=c)
+    assert len(c.requests) == 1 and budget.used == 1
+
+
+def test_fetch_document_paces_to_eight_per_second(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
+    slept = []
+    monkeypatch.setattr(edgar, "_sleep", slept.append)
+    monkeypatch.setattr(edgar, "_last_request", [0.0])
+    monkeypatch.setattr(edgar.time, "monotonic", lambda: 100.0)
+    edgar.fetch_document(1, "0000000001-20-000001", "a.htm", budget=edgar.FetchBudget(2), client=_DocClient())
+    edgar.fetch_document(1, "0000000001-20-000002", "b.htm", budget=edgar.FetchBudget(2), client=_DocClient())
+    assert slept and slept[-1] == pytest.approx(1 / edgar.MAX_REQ_PER_S)
+
+
+def test_fetch_document_requires_a_user_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    with pytest.raises(RuntimeError):
+        edgar.fetch_document(1, "0000000001-20-000001", "a.htm", budget=edgar.FetchBudget(1), client=_DocClient())
+
+
+def test_fetch_budget_validates():
+    with pytest.raises(ValueError):
+        edgar.FetchBudget(0)

@@ -36,19 +36,27 @@ merging its filings can never blank a company's identity. Point-in-time
 integrity does not depend on file history — the ``filed`` date inside the data
 carries it — and every ingest is recorded in the decision ledger.
 
-Nothing here talks to the network. Callers fetch the bytes (see the backfill
+The ingesters here talk to no network. Callers fetch the bytes (see the backfill
 runbook: bulk ``companyfacts.zip`` plus per-company ``submissions``, with a
 contact ``User-Agent`` and <=10 req/s per SEC fair access) and hand them over.
+The one exception is :func:`fetch_document`, which pulls a *single* filing's
+primary document from the EDGAR archive because there is no bulk feed for it —
+under a stated :class:`FetchBudget`, so a caller cannot drift into a bulk crawl
+without a decision that names the number.
 """
 
 import datetime as dt
+import html as html_lib
 import json
 import math
 import os
+import re
+import time
 from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
+import httpx
 import polars as pl
 
 from tbot import config, ledger
@@ -132,6 +140,22 @@ _FILINGS_DEDUPE_KEY = ("cik", "accn")
 #: Ledger event kinds emitted by the two ingesters.
 FACTS_EVENT = "ingest.edgar.facts"
 FILINGS_EVENT = "ingest.edgar.submissions"
+
+#: The contact address SEC fair access requires on every request.
+USER_AGENT_ENV = "SEC_USER_AGENT"
+#: One filing's primary document: ``.../data/<cik>/<accn without dashes>/<doc>``.
+ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/{doc}"
+#: SEC fair-access ceiling is 10 req/s; 8 leaves headroom for retries and clocks.
+MAX_REQ_PER_S = 8
+#: Ledger event kind emitted by :func:`fetch_document`.
+DOCUMENT_EVENT = "fetch.edgar.document"
+_TIMEOUT = 30.0
+_sleep = time.sleep
+_last_request = [0.0]  # monotonic seconds; a list so tests can reset it
+#: A script/style element with its body, or any single tag. The first
+#: alternative has to come first: ``<[^>]+>`` alone would strip ``<script>`` and
+#: leave the code inside it in the text.
+_TAG = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.S | re.I)
 
 
 # --- helpers ------------------------------------------------------------------------
@@ -456,6 +480,88 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
         {"cik": cik, "rows": stored, "skipped": skipped, "entity": entity},
     )
     return stored
+
+
+# --- the archive: one document at a time --------------------------------------------
+
+
+class BudgetExceeded(RuntimeError):
+    """The stated document budget is spent; ruling 34: decide, then fetch more."""
+
+
+class FetchBudget:
+    """A stated ceiling on documents fetched in one operation.
+
+    A ceiling is the whole point: EDGAR has no bulk feed for filing documents,
+    so the only way to read a thousand of them is a thousand requests, and a
+    loop that quietly grows into one is both a fair-access problem and a
+    measurement nobody decided to take. The budget makes the number an argument
+    the caller had to write down.
+    """
+
+    def __init__(self, max_docs: int) -> None:
+        if isinstance(max_docs, bool) or not isinstance(max_docs, int) or max_docs < 1:
+            raise ValueError(f"max_docs must be a positive int, got {max_docs!r}")
+        self.max_docs, self.used = max_docs, 0
+
+    def take(self) -> None:
+        """Spend one document, or raise :class:`BudgetExceeded`."""
+        if self.used >= self.max_docs:
+            raise BudgetExceeded(f"fetch budget of {self.max_docs} documents is spent")
+        self.used += 1
+
+
+def _pace() -> None:
+    """Hold the process to :data:`MAX_REQ_PER_S` requests per second."""
+    gap = 1.0 / MAX_REQ_PER_S
+    wait = _last_request[0] + gap - time.monotonic()
+    if wait > 0:
+        _sleep(wait)
+    _last_request[0] = time.monotonic()
+
+
+def fetch_document(cik: int, accn: str, primary_doc: str, *, budget: FetchBudget, client=None) -> str:
+    """The plain text of one filing's primary document from the EDGAR archive.
+
+    Counts against `budget` *before* the request — a refused fetch must not
+    reach SEC — paces to :data:`MAX_REQ_PER_S`, sends the contact
+    ``User-Agent`` SEC requires, strips tags, scripts and styles, and logs
+    :data:`DOCUMENT_EVENT`. Not for bulk use without a decision that names the
+    budget (ruling 34).
+
+    `client` accepts any object with httpx's ``get`` signature, which is how
+    this is unit-tested without a server; when it is omitted the function owns
+    and closes its own :class:`httpx.Client`.
+    """
+    cik = _as_cik(cik)
+    accn = _text(accn).strip()
+    primary_doc = _text(primary_doc).strip()
+    if not accn or not primary_doc:
+        raise ValueError("accn and primary_doc must be non-empty")
+    agent = os.environ.get(USER_AGENT_ENV, "").strip()
+    if not agent:
+        raise RuntimeError(f"{USER_AGENT_ENV} must be set to a real contact to fetch from SEC")
+    if not isinstance(budget, FetchBudget):
+        raise TypeError(f"budget must be a FetchBudget, got {type(budget).__name__}")
+    budget.take()
+    url = ARCHIVE_URL.format(cik=cik, accn=accn.replace("-", ""), doc=primary_doc)
+    owned = client is None
+    if owned:
+        client = httpx.Client(timeout=_TIMEOUT)
+    try:
+        _pace()
+        r = client.get(url, headers={"User-Agent": agent})
+        r.raise_for_status()
+        raw = r.text
+    finally:
+        if owned:
+            client.close()
+    text = html_lib.unescape(_TAG.sub(" ", raw))
+    text = re.sub(r"\s+", " ", text).strip()
+    ledger.log_event(
+        DOCUMENT_EVENT, {"cik": cik, "accn": accn, "doc": primary_doc, "chars": len(text)}
+    )
+    return text
 
 
 # --- reads --------------------------------------------------------------------------
