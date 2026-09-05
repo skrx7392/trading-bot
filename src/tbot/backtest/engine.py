@@ -14,11 +14,11 @@ Each trading day is processed in four steps, in this order:
 1. **Renames, gaps and exits.** A held symbol with *no vetted close today* and
    a name change (from :func:`~tbot.warehouse.actions.read_name_changes`) whose
    process date falls on or after its last vetted close and on or before today,
-   and whose target's series does not predate that process date, is carried into
-   the new symbol — shares, tax lots, pending target and last mark move
-   unchanged, nothing is traded — and an ``engine.rename`` event is written. A
-   symbol that is still printing, or one whose target was already printing
-   before the rename, is never carried. Then every
+   and whose target was moving with it beforehand, is carried into the new
+   symbol — shares, tax lots, pending target and last mark move unchanged,
+   nothing is traded — and an ``engine.rename`` event is written. A symbol that
+   is still printing, or one whose target's returns disagree with its own before
+   the rename, is never carried. Then every
    held symbol with no vetted close today is either *held* through the hole,
    marked at its last vetted close, for up to :data:`MAX_GAP_DAYS` consecutive
    trading days, or *exited* — on a merger for it (from
@@ -49,46 +49,60 @@ rebalance and would not be for a daily one. Upgrade this to true opens before
 trusting a high-turnover result.
 
 **Renames carry the position; they do not trade it — but only once the old
-series has stopped printing, and only into a symbol whose series does not
-predate the rename.** On the first trading day `t` at which a held
-symbol `S` has *no vetted close*, and a name change ``(old=S, new=S')`` whose
-process date lies on or after `S`'s last vetted close and on or before `t` and
-whose target `S'` passes :func:`_new_series_starts_at`, the
-shares, the open tax lots (merged FIFO by purchase date with any `S'` already
-holds), the pending target and the last mark move to `S'` unchanged: nothing is
-traded, charged or realised, and the holding period runs through the rename as
-it does for tax purposes. This runs before the gap check, so a rename day is
-not a gap. A name-change row whose two symbols are equal (Alpaca files a
-company-name change that way) is not a rename and is ignored.
+series has stopped printing, and only into a symbol the old one was moving with
+beforehand.** On the first trading day `t` at which a held symbol `S` has *no
+vetted close*, and a name change ``(old=S, new=S')`` whose process date lies on
+or after `S`'s last vetted close and on or before `t`, and whose two symbols
+:func:`_different_issuer` does not separate, the shares, the open tax lots
+(merged FIFO by purchase date with any `S'` already holds), the pending target
+and the last mark move to `S'` unchanged: nothing is traded, charged or
+realised, and the holding period runs through the rename as it does for tax
+purposes. This runs before the gap check, so a rename day is not a gap. A
+name-change row whose two symbols are equal (Alpaca files a company-name change
+that way) is not a rename and is ignored.
 
-All three halves of "not yet applied" are load-bearing. *The old symbol must
-have stopped printing:* vendor histories are keyed by lineage — a ticker's bars are
-filed under whoever owns it now — while the action table is keyed by the ticker
-as it was, so on a recycled symbol the two describe different issuers. Of the
-table's 2,864 renames, 100 have the old symbol printing both before and on or
-after its process date while the new symbol also has bars (75 on Alpaca alone,
-37 on yfinance; ``IR→TT``, ``META→METV``, ``CR→CXT``, and ``BBT→TFC`` on
-2019-12-09, inside the development window). Carrying those would move a position
-into an unrelated issuer's price series without a trade — `IR` at roughly four
-times the price. If the old name still prints, the holder keeps holding it.
-*And the bound on the last close is "on or after", not "after":* if the vendor
-dates the change at the last day the old ticker traded rather than the first day
-it did not, the position's last close falls *on* the process date, and a strict
+All three conjuncts are load-bearing. *The old symbol must have stopped
+printing:* vendor histories are keyed by lineage — a ticker's bars are filed
+under whoever owns it now — while the action table is keyed by the ticker as it
+was, so on a recycled symbol the two describe different issuers. Of the table's
+2,864 renames, 100 have the old symbol printing both before and on or after its
+process date while the new symbol also has bars (75 on Alpaca alone, 37 on
+yfinance; ``IR→TT``, ``META→METV``, ``CR→CXT``, and ``BBT→TFC`` on 2019-12-09,
+inside the development window). Carrying those would move a position into an
+unrelated issuer's price series without a trade — `IR` at roughly four times the
+price. If the old name still prints, the holder keeps holding it.
+*The bound on the last close is "on or after", not "after":* if the vendor dates
+the change at the last day the old ticker traded rather than the first day it
+did not, the position's last close falls *on* the process date, and a strict
 bound would leave the rename permanently undue and gap the name out five days
 later. A rename dated strictly before the last close is one the position has
-already lived through, exactly as before. *And the target's series must not
-predate the rename:* the quote guard alone still mis-carries a recycled ticker
-on any day the old series happens to have a hole, and a hole is not rare (the
-quarantine rate is 2.4% of bars). The store is keyed by a symbol's current
-owner, so after a genuine rename the target's series starts at the rename;
-one that was already printing more than
-:data:`~tbot.warehouse.tickers.RELIST_DAYS` earlier is the renamed issuer's own
-lineage, and the name still printing under the old symbol is a later holder of
-it. Ruling 44's rule 2 gates the ticker map on exactly this evidence, with
-exactly this tolerance. *Cost if wrong:* a genuine rename whose target was
-backfilled by the vendor under the new name more than 30 days early is not
-carried, and the position exits as a gap after :data:`MAX_GAP_DAYS` at the last
-close — the same 30-day tolerance the map already accepted.
+already lived through.
+*And the two series must have been moving together:* the quote guard alone still
+mis-carries a recycled ticker on any day the old series happens to have a hole,
+and a hole is not rare — the quarantine rate is 2.4% of bars. So the last
+:data:`RENAME_OVERLAP` sessions on which both symbols printed, strictly before
+the process date, are compared on log returns and the rename is refused when any
+pair differs by more than :data:`RENAME_DRIFT` (:func:`_different_issuer`, which
+carries the measured separation and reads the untruncated warm-up frame so a
+rename in the run's opening sessions still has overlap to be judged on).
+
+The thing this test replaced, recorded because it was measured: a gate on the
+*age* of the new symbol's series — carry only when `S'` had not been printing
+long before the rename — reads plausibly and is wrong, because the nightly
+ingests a rename's target and the re-base job pulls its history whole, so a
+genuine rename's `S'` usually starts long before it. Measured over the 210
+warehouse renames the engine could be holding through, a 30-day age gate blocks
+45 of the 69 genuine ticker changes (``PPDF→FINV`` 2019-11-29 and ``DGSE→ELA``
+2019-12-18 inside the development window) to catch 66 of 75 fictitious ones. The
+returns test costs none of them.
+
+*Cost if wrong:* a recycled ticker whose new symbol never overlaps the old one
+has no evidence to judge and is carried on the quote guard alone, so a missing
+vetted close on the session the rename comes due moves the position into the
+other issuer's series. That is 66 of the 75 fictitious shapes, and at a 2.4%
+quarantine rate ≈1.6 expected occurrences warehouse-wide over 2016–2026 and ≈0
+in the development window, whose only such shape (``BBT→TFC``) the returns test
+separates anyway. Every one is visible as an ``engine.rename`` event.
 
 **A short gap is a hole, not a delisting.** A held symbol with no vetted close
 on `t` is held, marked at its last vetted close, for up to :data:`MAX_GAP_DAYS`
@@ -174,7 +188,6 @@ from tbot.backtest.metrics import DELIST_PRICE_FLOOR, DELIST_RETURN
 from tbot.backtest.strategy import Strategy
 from tbot.backtest.tax import TaxLots
 from tbot.warehouse import actions, reconcile, store
-from tbot.warehouse.tickers import RELIST_DAYS
 
 #: Trailing window, in *observations*, for the cost model's volatility and ADV
 #: inputs. Twenty trading days ~ one month: long enough to be an estimate,
@@ -185,6 +198,19 @@ VOL_WINDOW = 20
 #: are warm on the first trading day. Comfortably more than `VOL_WINDOW`
 #: trading days, holidays included.
 WARMUP_DAYS = 90
+
+#: Largest daily log-return difference two symbols may show over the sessions
+#: before a rename and still be taken for the same issuer. Measured on the
+#: canonical panel over the 210 renames the engine could be holding through:
+#: same-issuer pairs differ by at most 0.00064, every recycled ticker that
+#: overlaps its target by at least 0.0127. The line sits a factor of four from
+#: one population and five from the other, so nothing measured is near it.
+RENAME_DRIFT = 0.0025
+
+#: Common sessions before a rename the same-issuer test compares. Enough for the
+#: comparison to survive a stale print or two, short enough to stay inside the
+#: window where a recycled ticker's two issuers were both trading.
+RENAME_OVERLAP = 6
 
 #: Cost-model fallbacks for a symbol-day whose trailing window produced *no*
 #: estimate at all. Both are deliberately pessimistic: $1M of daily volume makes
@@ -276,7 +302,7 @@ def _rebalance_days(days: list[dt.date], frequency: str) -> set[dt.date]:
     return set(ends) | {days[0]}
 
 
-def _market_frame(start: dt.date, end: dt.date) -> pl.DataFrame:
+def _market_frame(start: dt.date, end: dt.date) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Canonical closes for ``[start, end]`` with trailing cost-model inputs.
 
     Closes come from :func:`reconcile.read_canonical` — the vetted series, the
@@ -293,20 +319,30 @@ def _market_frame(start: dt.date, end: dt.date) -> pl.DataFrame:
     applied with the whole run's hindsight — a 5x break confirmed late in the run
     removes that name's earlier rows from every day of it (gate report §12.6,
     decision D12; the per-day rule is the search branch's first task).
+
+    Returns the panel *and* the canonical ``(symbol, ts, close)`` slice as it was
+    before the panel is truncated at `start` — the whole
+    ``[start - WARMUP_DAYS, end]`` window. The rename comparison
+    (:func:`_different_issuer`) reads that second frame, because a rename dated
+    in the run's first sessions has no run-window overlap to be judged on.
     """
     warm_start = start - dt.timedelta(days=WARMUP_DAYS)
     can = reconcile.read_canonical(start=warm_start, end=end).filter(
         pl.col("close").is_not_null() & pl.col("close").is_finite() & (pl.col("close") > 0)
     )
+    warm_closes = can.select("symbol", "ts", "close")
     if can.height == 0:
-        return pl.DataFrame(
-            schema={
-                "symbol": pl.Utf8,
-                "ts": pl.Date,
-                "close": pl.Float64,
-                "adv": pl.Float64,
-                "sigma": pl.Float64,
-            }
+        return (
+            pl.DataFrame(
+                schema={
+                    "symbol": pl.Utf8,
+                    "ts": pl.Date,
+                    "close": pl.Float64,
+                    "adv": pl.Float64,
+                    "sigma": pl.Float64,
+                }
+            ),
+            warm_closes,
         )
 
     bars = store.read_bars(start=warm_start, end=end)
@@ -319,9 +355,8 @@ def _market_frame(start: dt.date, end: dt.date) -> pl.DataFrame:
         .group_by(["symbol", "ts"])
         .agg(volume=pl.col("volume").median())
     )
-    return (
-        can.select("symbol", "ts", "close")
-        .join(volume, on=["symbol", "ts"], how="left")
+    panel = (
+        warm_closes.join(volume, on=["symbol", "ts"], how="left")
         .sort(["symbol", "ts"])
         .with_columns(
             dollar_volume=pl.col("close") * pl.col("volume"),
@@ -338,6 +373,7 @@ def _market_frame(start: dt.date, end: dt.date) -> pl.DataFrame:
         .filter(pl.col("ts") >= start)
         .select("symbol", "ts", "close", "adv", "sigma")
     )
+    return panel, warm_closes
 
 
 class _Market:
@@ -396,28 +432,73 @@ class _Market:
         )
 
 
-def _new_series_starts_at(
-    new: str, on: dt.date, first_seen: dict[str, dt.date]
-) -> bool:
-    """Whether a rename into `new` dated `on` agrees with the store's series.
+def _closes_by_symbol(
+    frame: pl.DataFrame, symbols: set[str]
+) -> dict[str, dict[dt.date, float]]:
+    """``symbol -> {date: close}``, for `symbols` only, from a close frame.
 
-    The store is keyed by the symbol's *current* owner (ruling 44, decision
-    D13): after a genuine ``old -> new`` the re-base job pulls the renamed
-    company's history whole under the new name, so `new`'s series starts at the
-    rename. True — no series at all, or one that starts no earlier than
-    :data:`~tbot.warehouse.tickers.RELIST_DAYS` before `on` — is that regime.
-    False means `new` was already printing well before the rename, so `new`'s
-    series *is* the renamed issuer's lineage and whatever prints under `old`
-    belongs to a later holder of a recycled ticker; carrying the position would
-    move it into another issuer. Ruling 44's rule 2 uses exactly this gate and
-    tolerance on the same evidence.
-
-    Point-in-time: the question is only whether `new` printed *before* `on`, a
-    fact settled on `on` itself. A first bar in the future makes the gate
-    permissive, never restrictive, so no hindsight can suppress a rename.
+    Restricted to the symbols a name change actually names. A dense mapping of
+    the whole universe would be gigabytes for a handful of comparisons a run,
+    and the frame this reads is the untruncated warm-up panel, the widest one
+    the engine holds.
     """
-    first = first_seen.get(new)
-    return first is None or first >= on - dt.timedelta(days=RELIST_DAYS)
+    if not symbols:
+        return {}
+    out: dict[str, dict[dt.date, float]] = {}
+    for symbol, ts, close in (
+        frame.filter(pl.col("symbol").is_in(list(symbols)))
+        .select("symbol", "ts", "close")
+        .iter_rows()
+    ):
+        out.setdefault(symbol, {})[ts] = close
+    return out
+
+
+def _different_issuer(
+    old_closes: dict[dt.date, float], new_closes: dict[dt.date, float], on: dt.date
+) -> bool:
+    """Whether two symbols' series were moving as two companies before `on`.
+
+    Takes the last :data:`RENAME_OVERLAP` sessions **strictly before** `on` on
+    which both symbols have a vetted close, and compares the two series' log
+    returns across them: True — different issuers, do not carry — when any pair
+    of returns differs by more than :data:`RENAME_DRIFT`. Fewer than two common
+    sessions make no return to compare, which is *no evidence* rather than
+    evidence of difference, and the answer is False: the majority of genuine
+    renames have a target that starts at the rename and no overlap at all, and
+    refusing those would gap-exit every one of them.
+
+    Why this test at all: the store is keyed by a symbol's *current* owner, so
+    on a recycled ticker the bars filed under `old` belong to whoever holds the
+    symbol now and not to the company the action describes. Measured over the
+    210 warehouse renames the engine could be holding through, the two
+    populations do not overlap on the canonical panel — same-issuer pairs
+    differ by at most 0.00064, recycled tickers by at least 0.0127 — so
+    :data:`RENAME_DRIFT` at 0.0025 separates them with nothing near it.
+
+    Why *log returns* and not price levels: a split around the rename re-bases
+    the surviving series (``ECA -> OVV``), and the levels then differ by the
+    split ratio for two series that are the same company. Returns do not care.
+
+    Point-in-time by construction: only sessions strictly before `on` are read,
+    and `on` is a date the action table already carried on that day. The closes
+    come from the untruncated canonical frame (:func:`_market_frame`'s second
+    return value), which reaches :data:`WARMUP_DAYS` before the run's start, so
+    a rename in the run's opening sessions is judged on real overlap instead of
+    falling through to "no evidence".
+    """
+    common = sorted(d for d in old_closes.keys() & new_closes.keys() if d < on)
+    if len(common) < 2:
+        return False
+    common = common[-RENAME_OVERLAP:]
+    for earlier, later in zip(common, common[1:]):
+        drift = abs(
+            math.log(old_closes[later] / old_closes[earlier])
+            - math.log(new_closes[later] / new_closes[earlier])
+        )
+        if drift > RENAME_DRIFT:
+            return True
+    return False
 
 
 def _rank(strat: Strategy, asof: dt.date) -> list[str]:
@@ -569,17 +650,12 @@ def run(
         )
     cm = cost_model if cost_model is not None else costs_mod.current()
 
-    market_frame = _market_frame(start, end)
+    market_frame, warm_closes = _market_frame(start, end)
     days: list[dt.date] = sorted(market_frame["ts"].unique().to_list())
     if not days:
         return _finish(strat, start, end, capital, cm, [], [], {}, 0, 0.0)
 
     market = _Market(market_frame, days)
-    # ``symbol -> first vetted close in the panel``, the evidence a rename's
-    # target is judged on; see :func:`_new_series_starts_at`.
-    first_seen: dict[str, dt.date] = dict(
-        market_frame.group_by("symbol").agg(pl.col("ts").min()).iter_rows()
-    )
     rebalance_days = _rebalance_days(days, strat.rebalance)
 
     cash = capital
@@ -603,6 +679,12 @@ def run(
             # the gap counter.
             continue
         renames.setdefault(old, []).append((on, new))
+    # Closes for the same-issuer test, read from the *untruncated* warm-up frame
+    # and only for the symbols a name change names; see :func:`_different_issuer`.
+    rename_closes = _closes_by_symbol(
+        warm_closes,
+        set(renames) | {new for pairs in renames.values() for _, new in pairs},
+    )
     mergers: dict[str, list[tuple[dt.date, str, float | None]]] = {}
     for row in actions.read_mergers().iter_rows(named=True):
         mergers.setdefault(row["symbol"], []).append(
@@ -635,15 +717,18 @@ def run(
             # printed is one the position has already lived through, while one
             # dated *on* that day is the vendor's "last trading day" semantics
             # and is due the first session the name does not print.
-            # The third conjunct is the lineage gate: a target that was already
-            # printing long before the rename is the renamed issuer's own
-            # series, so the name still printing under `symbol` is somebody
-            # else's — the recycled-ticker case the quote guard alone misses
-            # whenever the old series happens to have a hole that day.
+            # The third conjunct is the same-issuer test: two series that were
+            # moving differently before the rename are two companies, so the one
+            # still printing under `symbol` is not the one the action describes.
+            # It is what catches a recycled ticker on a day the old series
+            # happens to have a hole, which the quote guard alone cannot.
             due = [
                 (on, new)
                 for on, new in renames.get(symbol, ())
-                if seen_on <= on <= day and _new_series_starts_at(new, on, first_seen)
+                if seen_on <= on <= day
+                and not _different_issuer(
+                    rename_closes.get(symbol, {}), rename_closes.get(new, {}), on
+                )
             ]
             if not due:
                 continue

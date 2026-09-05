@@ -606,13 +606,17 @@ def test_a_rename_is_not_applied_while_the_old_symbol_keeps_printing(tmp_path, m
     """
     days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
     on = days[40]
-    _seed(tmp_path, monkeypatch, {"OLD": {d: 10.0 for d in days}, "NEW": {d: 100.0 for d in days}})
+    # NEW is OLD's series ten times over: identical returns, so the same-issuer
+    # test permits the carry and the quote guard is the only thing refusing it.
+    old = {d: 10.0 * (1.001 ** i) for i, d in enumerate(days)}
+    _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": {d: 10.0 * px for d, px in old.items()}})
     _name_change(tmp_path, "OLD", "NEW", on)
     strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
     res = engine.run(strat, days[0], days[-1], cost_model=FREE)
 
-    # Still holding OLD at 10.0: flat prices, free costs, so equity cannot move.
-    assert res.daily["equity"][-1] == pytest.approx(100_000.0, rel=1e-12)
+    # Still riding OLD's own series, never marked ten times higher.
+    assert res.daily["equity"][-1] == pytest.approx(
+        100_000.0 * old[days[-1]] / old[days[1]], rel=1e-9)
     assert ledger.read_events("engine.rename").height == 0
     assert ledger.read_events("engine.forced_liquidation").height == 0
     assert res.trades == 1                                     # the entry, and nothing else
@@ -649,39 +653,123 @@ def test_a_rename_dated_on_the_last_printed_day_still_carries(tmp_path, monkeypa
     assert res.daily["equity"][-1] == pytest.approx(100_000.0 * 20.0 / 10.0, rel=1e-12)
 
 
-def test_a_rename_into_a_lineage_that_predates_it_is_never_applied(tmp_path, monkeypatch):
-    """`NEW`'s series starts long before the rename, so `NEW` *is* the lineage.
+def test_a_recycled_ticker_is_never_carried_even_across_a_hole(tmp_path, monkeypatch):
+    """`OLD` and `NEW` were moving differently before the rename: two issuers.
 
-    The store is keyed by the symbol's current owner (ruling 44, decision D13):
-    a genuine `old -> new` leaves `new` with a series that starts at the rename,
-    because the re-base job pulls the renamed company's history whole under the
-    new name. A `new` that was already printing well before the process date is
-    therefore the renamed issuer's own lineage, and whatever still prints under
-    `old` belongs to somebody else — `IR -> TT` with `TT`'s series running back
-    to the 1980s. That verdict does not depend on whether `old` happens to have
-    a hole on the day the rename comes due, which is the residual the "old has
-    stopped printing" half alone leaves open: one missing day right after the
-    process date and the position is carried into the wrong issuer anyway.
-
-    The gate is the ticker map's, tolerance included
-    (:data:`~tbot.warehouse.tickers.RELIST_DAYS`), and it is point-in-time: it
-    asks only whether `new` printed *before* `on`, which is knowable on `on`.
+    The store is keyed by a symbol's current owner, so on a recycled ticker the
+    bars under `old` belong to whoever holds the symbol now, not to the company
+    the action describes (`IR -> TT`). The "old has stopped printing" half alone
+    does not catch that: one missing vetted close on the day the rename comes
+    due — and holes are not rare, the quarantine rate is 2.4% of bars — and the
+    position is carried into the other issuer's series anyway. The two series'
+    own returns settle it: they disagree by about a point a day here, twenty
+    times :data:`~tbot.backtest.engine.RENAME_DRIFT`.
     """
     days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
     on = days[40]
-    old = {d: 10.0 for d in days if d != days[41]}     # one missing day, right after `on`
-    new = {d: 100.0 for d in days}                     # NEW's series predates the rename
+    old = {d: 10.0 for d in days if d != days[41]}      # one missing day, right after `on`
+    new = {d: 100.0 * (1.01 ** i) for i, d in enumerate(days)}   # a different series entirely
     _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": new})
     _name_change(tmp_path, "OLD", "NEW", on)
     strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
     res = engine.run(strat, days[0], days[-1], cost_model=FREE)
 
-    # Held in OLD throughout, the one hole marked at its last close: flat prices
-    # and free costs, so equity cannot move.
+    # Held in OLD throughout, the hole marked at its last close.
     assert res.daily["equity"][-1] == pytest.approx(100_000.0, rel=1e-12)
     assert ledger.read_events("engine.rename").height == 0
     assert ledger.read_events("engine.forced_liquidation").height == 0
     assert res.trades == 1
+
+
+def test_a_genuine_rename_whose_new_history_was_backfilled_is_carried(tmp_path, monkeypatch):
+    """`NEW` already carries the company's history, on a re-based price basis.
+
+    This is the common shape and the one a 30-day "new series must start at the
+    rename" gate got wrong on 45 of the warehouse's 69 genuine ticker changes
+    (`PPDF -> FINV`, `DGSE -> ELA`, both inside the development window): the
+    nightly ingests the rename target and the re-base job pulls its history
+    whole, so `NEW` prints from long before the rename. It is still the same
+    company, and the returns say so.
+
+    `NEW` is seeded at twice `OLD`'s level with identical returns, which is why
+    the test is on *log returns* and not on price levels: a split around the
+    rename re-bases the surviving series (`ECA -> OVV`), so the levels differ by
+    the split ratio while the returns still agree to the last decimal.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    on = days[40]
+    series = {d: 10.0 * (1.001 ** i) for i, d in enumerate(days)}
+    old = {d: px for d, px in series.items() if d < on}          # OLD stops at the rename
+    new = {d: 2.0 * px for d, px in series.items()}              # the same company, re-based
+    _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": new})
+    _name_change(tmp_path, "OLD", "NEW", on)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    events = ledger.read_events("engine.rename")
+    assert events.height == 1
+    payload = json.loads(events["payload"][0])
+    assert payload["symbol"] == "OLD" and payload["new_symbol"] == "NEW"
+    assert payload["ts"] == on.isoformat()
+    assert res.trades == 1                                       # carried, not traded
+    assert res.daily["equity"][-1] == pytest.approx(
+        100_000.0 * new[days[-1]] / old[days[1]], rel=1e-9)
+
+
+def test_a_rename_early_in_the_run_is_judged_on_the_warm_up_window(tmp_path, monkeypatch):
+    """The comparison reads the warm-up window, not the run window.
+
+    The panel `_market_frame` hands the engine is truncated at `start`, so a
+    rename dated in the run's first sessions has almost no run-window overlap to
+    judge — one session here — and would fall through to "no evidence, carry",
+    which is precisely the wrong answer for a recycled ticker. The closes for
+    the comparison therefore come from the canonical frame *before* that
+    truncation, which reaches :data:`~tbot.backtest.engine.WARMUP_DAYS` further
+    back and holds three months of overlap in which these two series move
+    opposite ways.
+    """
+    history = _weekdays(dt.date(2019, 10, 1), dt.date(2019, 12, 31))
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    on = days[1]                                       # the run's second session
+    old_days = history + [d for d in days if d <= on]
+    old = {d: 10.0 * (1.002 ** i) for i, d in enumerate(old_days)}
+    new = {d: 50.0 * (0.998 ** i) for i, d in enumerate(history + days)}
+    _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": new})
+    _name_change(tmp_path, "OLD", "NEW", on)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
+    engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    assert ledger.read_events("engine.rename").height == 0
+    payload = json.loads(ledger.read_events("engine.forced_liquidation")["payload"][0])
+    assert payload["reason"] == "gap_exceeded"         # not carried into the other issuer
+
+
+def test_a_rename_with_too_little_overlap_to_judge_is_carried(tmp_path, monkeypatch):
+    """One common session is no evidence, and no evidence carries the position.
+
+    Two closes are the fewest that make one return apiece, so a single
+    overlapping session cannot say whether the two series agree. The default
+    then has to be the one that keeps a genuine ticker change working, because
+    the alternative silently gap-exits every rename whose target starts at it —
+    the majority of them. `test_a_rename_carries_the_position_without_a_trade`
+    and `test_a_rename_dated_on_the_last_printed_day_still_carries` pin the
+    zero-overlap case; this one pins the boundary at one.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    on = days[40]
+    old = {d: 10.0 for d in days[:40]}                            # last print days[39]
+    new = {d: 20.0 for i, d in enumerate(days) if i >= 39}        # overlaps on days[39] only
+    _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": new})
+    _name_change(tmp_path, "OLD", "NEW", on)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    events = ledger.read_events("engine.rename")
+    assert events.height == 1
+    assert json.loads(events["payload"][0])["ts"] == on.isoformat()
+    assert res.daily["equity"][-1] == pytest.approx(100_000.0 * 20.0 / 10.0, rel=1e-12)
 
 
 # --- tax year attribution -----------------------------------------------------------
