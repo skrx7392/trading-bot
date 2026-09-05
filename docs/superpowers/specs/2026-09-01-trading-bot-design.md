@@ -201,3 +201,24 @@ Written after the phase-0 backfills ran against real vendor data. Sections 1–9
 **A5. Ticker reuse is real; the PIT ticker map is promoted to a phase-1 requirement** (amends §4.1 universe builder, §8 deferred decisions). Alpaca's `BBBY` history splices **Bed Bath & Beyond** and **Beyond Inc.** — two unrelated companies under one symbol. The `cik`→`symbol` bridge (SEC `company_tickers.json`) is a *current* mapping, so any reused ticker maps to its new owner and silently backdates that company's prices onto the dead one's filings. This was carried as a deferred minor through phase 0; it is now a phase-1 requirement, not a nicety.
 
 **A6. Extraction: golden set seeded, prompt v2 promoted, qwen3.8:27b-nvfp4 chosen** (resolves the §8 deferred decision "Quasar nightly extraction model — phase-0 bake-off result"). Golden set: **98 XBRL-verified cases**, split 53 dev / 45 holdout. Prompt v2 promoted (the units iteration flagged at T14). Bake-off: **qwen3.8:27b-nvfp4** dev 53/53, holdout **43/45**; muse-glimmer 41/45; nemotron 25/53; Claude Opus ceiling 52/53 — i.e. the local model is at the frontier model's measured ceiling on this task, at $0. Holdout independence was spent to promote v2 and is not available again without new cases. Separately: **Ollama 0.32.13's MLX runner ignores the `format` grammar entirely**, so JSON shape depends on the prompt rather than being enforced by the runtime; `parsed_fallback` is tracked per response so a prompt regression shows up as a rising fallback rate instead of hiding inside a passing score.
+
+**A7. Gate 0→1 replication criterion, power-aware (pre-registered 2026-09-05; awaiting user approval before the fix-round re-run).**
+The original G1 ("ρ > 0.9 on ≥ 3 of 4 anomalies vs OSAP") assumed decades of overlap. The two-source window is 2016-01..2019-12 (36–47 months), over which OSAP's own `EarningsSurprise` (t = −2.07, inverted) and `Accruals` (t = +0.11) carry no signal, so ρ there measures panel composition, not correctness. G1 is replaced by:
+
+- **G1a (live anomalies: `Mom12m`, `ShareIss1Y`)** — Pearson ρ ≥ **0.85** against OSAP `deciles_ew` LS over the maximal two-source window, **and** `mean_ours` within **[0.5×, 1.5×]** of `mean_osap`. Both must pass.
+- **G1b (dormant anomalies: `EarningsSurprise`, `Accruals`)** — `|mean_ours − mean_osap|` ≤ **0.5%/month** over the same window, ρ reported but not gated.
+- A dormant/live classification is made from OSAP's own series **before** looking at ours; it is recorded here so it cannot move. The classifier is `docs/gate-0-1-report.md` §10 (b1)'s: **live ⇔ |mean_osap| > 0.5%/month** over 2016-01..2019-12.
+- The panel is the universe-screened one (`universe.build`), which is the like-for-like comparison with CRSP common shares (ruling 31 — the fix-round plan's draft cited 32, which is the nightly-memory ruling).
+
+**The classification, computed once, from `data/raw/osap/<signal>.csv` over 2016-01-29..2019-12-31 (n = 48 monthly decimal returns each; t = mean / (sd/√n), sd with ddof = 1):**
+
+| OSAP series | mean/mo | sd/mo | t-stat | \|mean\| > 0.5%/mo? | Class |
+|---|---:|---:|---:|---|---|
+| `Mom12m` | +0.840% | 5.685% | +1.02 | yes | **live** |
+| `ShareIss1Y` | +1.310% | 3.901% | +2.33 | yes | **live** |
+| `EarningsSurprise` | −0.395% | 1.324% | −2.07 | no | **dormant** |
+| `Accruals` | +0.026% | 1.622% | +0.11 | no | **dormant** |
+
+These reproduce §4.4 of the gate report exactly. Note the classifier is the **mean-magnitude** rule, not a significance rule: the fix-round plan's draft of this amendment phrased it as "|t| ≥ 2 ⇒ live", which does **not** yield the classification it then names — on these numbers |t| ≥ 2 would make `EarningsSurprise` (−2.07) live and `Mom12m` (+1.02) dormant. That phrasing is recorded here as superseded, and the reason the mean rule is the right one is substantive rather than convenient: G1a asks whether we reproduce a spread that is actually *there*, and `EarningsSurprise`'s significance in this window is **inverted versus the literature**, so gating ρ on it would be gating on reproducing a sign flip. `Mom12m` pays +0.84%/month here with a t of 1.02 — a real spread the window is too short to certify — and it is exactly the anomaly the fix round's dividend and delisting work should move, so it must stay inside the gate rather than be excused out of it by low power.
+
+This is a harder bar than "3 of 4": it requires both live anomalies to reproduce in level as well as shape. Thresholds were set from the fix-round *plan*, not from its results; the first re-run's numbers (this document's companion `docs/gate-0-1-report.md` §11) are the test. Status: **pre-registered 2026-09-05; awaiting user approval before the fix-round re-run** — it does not amend §3's gate 0→1 line until the user approves the wording, and it must not be re-tuned after the re-run's numbers are seen.
