@@ -12,8 +12,10 @@ honest audit trail, so that is what these tests pin:
   empty" from "a normal run that found nothing", and a missing ticker map
   fails the pod rather than quietly ingesting nothing;
 * after the vote, in this order: the trailing week of corporate actions, the
-  split re-base of every name that split in it, then ledger compaction — each
-  a collaborator with its own tests, faked here.
+  split re-base of every name that split in it, the point-in-time ticker map
+  rebuild (SEC's current map refreshed first only when ``SEC_USER_AGENT`` is
+  set), then ledger compaction — each a collaborator with its own tests, faked
+  here.
 
 Every vendor call is monkeypatched at the *module attribute*, which is what the
 job looks up at call time. Nothing here touches the network.
@@ -38,6 +40,7 @@ ACTIONS = {"dividends": 3, "splits": 1, "name_changes": 0, "mergers": 0}
 REBASE = {"symbols": ["NVDA"], "alpaca_rows": 2500, "yf_rows": 9000,
           "recon": {"ok": 9000, "majority": 0, "quarantined": 0}}
 COMPACT = {"days_compacted": 1, "files_removed": 40, "events_written": 40}
+TICKERS = {"current": 100, "rename": 0, "asset": 0, "override": 0, "intervals": 100}
 
 
 # --- the contract, verbatim from the brief ------------------------------------------
@@ -45,7 +48,9 @@ COMPACT = {"days_compacted": 1, "files_removed": 40, "events_written": 40}
 
 def test_nightly_summary(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     calls = []
+    monkeypatch.setattr("tbot.warehouse.tickers.build", lambda: dict(TICKERS))
     monkeypatch.setattr("tbot.warehouse.alpaca.ingest",
                         lambda syms, s, e: calls.append(("alpaca", len(syms))) or 5)
     monkeypatch.setattr("tbot.warehouse.yf.ingest",
@@ -92,6 +97,9 @@ def _wire(monkeypatch, calls, *, alpaca_rows=5, yf_rows=7, recon=None, universe_
     monkeypatch.setattr("tbot.jobs.rebase.symbols_to_rebase", lambda day, lookback_days=7: ["NVDA"])
     monkeypatch.setattr("tbot.jobs.rebase.rebase",
                         lambda syms, end: calls.append(("rebase", list(syms), end, end)) or dict(REBASE))
+    monkeypatch.setattr("tbot.warehouse.tickers.refresh_current", lambda client=None: 100)
+    monkeypatch.setattr("tbot.warehouse.tickers.build",
+                        lambda: calls.append(("tickers", None, None, None)) or dict(TICKERS))
     monkeypatch.setattr("tbot.ledger.compact",
                         lambda before=None: calls.append(("compact", None, None, None)) or dict(COMPACT))
     if universe_df is not None:
@@ -118,14 +126,33 @@ def test_reconcile_runs_after_both_ingests(tmp_path, monkeypatch):
 
 def test_actions_rebase_and_compaction_follow_the_vote(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
     calls = _wire(monkeypatch, [])
     out = nightly.run(asof=ASOF, symbols=["AAPL"])
-    assert [c[0] for c in calls] == ["alpaca", "yf", "reconcile", "actions", "rebase", "compact"]
+    assert [c[0] for c in calls] == ["alpaca", "yf", "reconcile", "actions", "rebase",
+                                     "tickers", "compact"]
     actions_call = calls[3]
     assert actions_call[2] == DAY - dt.timedelta(days=7) and actions_call[3] == DAY
     assert calls[4][1:] == (["NVDA"], DAY, DAY)
     assert out["actions"] == ACTIONS and out["rebase"] == REBASE and out["ledger_compacted"] == COMPACT
+    assert out["tickers"] == {"refreshed": True, **TICKERS}
     assert json.loads(json.dumps(out)) == out
+
+
+def test_tickers_are_rebuilt_without_a_refresh_when_no_user_agent_is_set(tmp_path, monkeypatch):
+    """SEC fair access needs a contact ``User-Agent``; without one the fetch is
+    skipped, the summary says so, and the map is still rebuilt from what is on disk."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    calls = _wire(monkeypatch, [])
+    refreshes = []
+    monkeypatch.setattr("tbot.warehouse.tickers.refresh_current",
+                        lambda client=None: refreshes.append(client) or 100)
+    out = nightly.run(asof=ASOF, symbols=["AAPL"])
+    assert out["tickers"]["refreshed"] is False
+    assert out["tickers"] == {"refreshed": False, **TICKERS}
+    assert refreshes == []
+    assert "tickers" in [c[0] for c in calls]
 
 
 def test_every_call_covers_the_single_day_before_asof(tmp_path, monkeypatch):
@@ -202,7 +229,7 @@ def test_an_empty_universe_is_flagged_distinctly(tmp_path, monkeypatch):
     assert out["symbol_source"] == "universe"
     # The vendors are still called, with nothing: they no-op without a request.
     assert [c[0] for c in calls] == ["universe", "alpaca", "yf", "reconcile",
-                                     "actions", "rebase", "compact"]
+                                     "actions", "rebase", "tickers", "compact"]
     assert [syms for _, syms, _, _ in calls[1:3]] == [[], []]
 
 

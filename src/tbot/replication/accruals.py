@@ -41,8 +41,7 @@ import polars as pl
 
 from tbot._dates import as_date
 from tbot.replication import _empty, _finalise
-from tbot.warehouse import edgar
-from tbot.warehouse.universe import _ticker_map
+from tbot.warehouse import edgar, tickers
 
 #: The four balance-sheet lines, keyed by their role in the formula.
 #:
@@ -94,7 +93,7 @@ def signal(asof: dt.date) -> pl.DataFrame:
     Raises `FileNotFoundError` if the SEC ticker map has not been fetched.
     """
     asof = as_date(asof, "asof")
-    tickers = _ticker_map()  # fail on a missing map before doing any work
+    mapped = tickers.ticker_map(asof)  # fail on a missing map before doing any work
 
     tags = list(TAGS.values())
     facts = edgar.read_facts(tags).filter(
@@ -152,4 +151,4 @@ def signal(asof: dt.date) -> pl.DataFrame:
         .filter(pl.col("base").is_not_null() & pl.col("base").is_finite() & (pl.col("base") > 0))
         .with_columns(score=-accrual)
     )
-    return _finalise(scored.join(tickers, on="cik", how="inner"))
+    return _finalise(scored.join(mapped, on="cik", how="inner"))

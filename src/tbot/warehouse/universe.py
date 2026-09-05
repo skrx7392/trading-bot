@@ -36,37 +36,40 @@ Both halves are strictly bounded by `asof`: ``filed <= asof`` for filings and
 print can change what :func:`build` returns for a past date, which is what makes
 a backtest over a sequence of `asof` dates honest.
 
-The `cik` to `symbol` bridge is SEC's ``company_tickers.json``, cached under
-``<data_root>/raw/``. It is a *current* mapping, not a point-in-time one — a
-ticker that has been reused since `asof` will map to its new owner — which is
-the one known PIT hole here. Reuse is not hypothetical: Alpaca's ``BBBY``
-history splices Bed Bath & Beyond with Beyond Inc., two unrelated companies
-under one symbol. A point-in-time ticker map is therefore a phase-1
-requirement, not a nicety. A filer missing from the map drops out of
-the universe rather than failing the build; a missing map *file* is a loud
-error, because an empty universe is indistinguishable from "nothing qualified".
+The `cik` to `symbol` bridge is :func:`tbot.warehouse.tickers.ticker_map`: the
+point-in-time interval map, asked for the pairs valid on `asof`. A ticker that
+has been reused since `asof` therefore maps to the filer that held it *then*,
+not to its newest owner — reuse is not hypothetical: Alpaca's ``BBBY`` history
+splices Bed Bath & Beyond with the company that took the symbol in 2025, and
+SEC's current ``company_tickers.json`` would hand the dead retailer's prices
+to the living filer. Until :func:`tbot.warehouse.tickers.build` has run, the
+map is that current file as open intervals, which is the phase-0 behaviour. A
+filer missing from the map drops out of the universe rather than failing the
+build; a missing map *file* is a loud error, because an empty universe is
+indistinguishable from "nothing qualified".
 
 Nothing here writes: :func:`build` is a pure read over the warehouse.
 """
 
 import datetime as dt
-import json
 import math
 
 import polars as pl
 
-from tbot import config
 from tbot._dates import as_date
-from tbot.warehouse import edgar, reconcile, store
+from tbot.warehouse import edgar, reconcile, store, tickers
 
 #: The universe frame: the tradable symbol and the filer behind it. Two columns,
 #: no more — every consumer (metrics, the nightly job, the replications) reads
 #: exactly this.
 SCHEMA = pl.Schema({"symbol": pl.Utf8, "cik": pl.Int64})
 
-#: The `cik` <-> `symbol` bridge. Fundamental signals import :func:`_ticker_map`
-#: and join on ``cik``, so the Int64 is load-bearing.
-TICKER_MAP_SCHEMA = pl.Schema({"cik": pl.Int64, "symbol": pl.Utf8})
+#: The current-map loader and its shape and path now live in
+#: :mod:`tbot.warehouse.tickers`; these names stay as aliases because the tests
+#: and the build tool still call them.
+_ticker_map = tickers.current_map
+TICKER_MAP_SCHEMA = tickers.PAIR_SCHEMA
+TICKER_MAP_PATH = tickers.TICKER_MAP_PATH
 
 #: Periodic reports, and only those. An 8-K is a press release and an amendment
 #: restates a filing that is already in the index, so neither is independent
@@ -75,9 +78,6 @@ ALIVE_FORMS = ("10-K", "10-Q")
 
 #: ~15 months. See the module docstring for why the window is this wide.
 ALIVE_WINDOW_DAYS = 456
-
-#: SEC's ticker map, relative to :func:`tbot.config.data_root`.
-TICKER_MAP_PATH = ("raw", "company_tickers.json")
 
 
 # --- input coercion -----------------------------------------------------------------
@@ -107,76 +107,6 @@ def _lookback(value) -> int:
     if value < 1:
         raise ValueError(f"lookback_days must be at least 1, got {value}")
     return value
-
-
-def _opt_cik(value) -> int | None:
-    """A positive CIK from a ticker-map entry, or ``None`` if it cannot supply one.
-
-    Accepts ``320193``, ``"320193"`` and ``"CIK0000320193"``. Unlike the ingest
-    path this never raises: the map is a third-party file listing every filer,
-    and one malformed row must not cost us the whole universe.
-    """
-    if value is None or isinstance(value, bool):  # bool is an int; a flag is no CIK
-        return None
-    if isinstance(value, int):
-        number = value
-    elif isinstance(value, float):
-        if not math.isfinite(value) or not value.is_integer():
-            return None
-        number = int(value)
-    elif isinstance(value, str):
-        text = value.strip().upper().removeprefix("CIK").lstrip("0")
-        if not text.isdigit():
-            return None
-        number = int(text)
-    else:
-        return None
-    return number if number > 0 else None
-
-
-# --- the ticker map -----------------------------------------------------------------
-
-
-def _ticker_map() -> pl.DataFrame:
-    """SEC's ``company_tickers.json`` as a `cik, symbol` frame.
-
-    Tickers are upper-cased to match the store's convention (every fetcher
-    normalises symbols on the way in), and ``(cik, symbol)`` pairs are deduped —
-    the pair, not the cik, because one filer legitimately lists several share
-    classes (GOOG and GOOGL share a CIK) and both are tradable.
-
-    Entries that cannot yield both a positive CIK and a non-empty ticker are
-    skipped. A missing or malformed *file* raises: it is a backfill failure, and
-    the alternative is a silently empty universe.
-    """
-    path = config.data_root().joinpath(*TICKER_MAP_PATH)
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"ticker map not found at {path}; fetch "
-            "https://www.sec.gov/files/company_tickers.json into <data_root>/raw/"
-        )
-    raw = json.loads(path.read_text())  # JSONDecodeError is a ValueError
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"{path} must hold a JSON object of ticker entries, got {type(raw).__name__}"
-        )
-
-    rows: list[dict] = []
-    for entry in raw.values():
-        if not isinstance(entry, dict):
-            continue
-        cik = _opt_cik(entry.get("cik_str"))
-        ticker = entry.get("ticker")
-        symbol = ticker.strip().upper() if isinstance(ticker, str) else ""
-        if cik is None or not symbol:
-            continue
-        rows.append({"cik": cik, "symbol": symbol})
-
-    return (
-        pl.DataFrame(rows, schema=TICKER_MAP_SCHEMA)
-        .unique(maintain_order=True)
-        .sort(["cik", "symbol"])
-    )
 
 
 # --- the universe -------------------------------------------------------------------
@@ -210,8 +140,8 @@ def build(
     lookback_days = _lookback(lookback_days)
 
     # Fail on a missing map before doing any work, and before it can be mistaken
-    # for an empty universe.
-    tickers = _ticker_map()
+    # for an empty universe. The pairs are the ones valid *on* `asof`.
+    mapped = tickers.ticker_map(asof)
 
     cutoff = asof - dt.timedelta(days=ALIVE_WINDOW_DAYS)
     # Predicates go into the parquet scan: the filings table is millions of
@@ -267,7 +197,7 @@ def build(
     )
 
     return (
-        liquid.join(tickers, on="symbol", how="inner")
+        liquid.join(mapped, on="symbol", how="inner")
         .join(alive, on="cik", how="inner")
         .select(list(SCHEMA))
         .cast(dict(SCHEMA))

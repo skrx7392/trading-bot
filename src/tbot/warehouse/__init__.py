@@ -23,6 +23,12 @@ distinguish from a bad vendor.
     Dividends, splits, name changes and mergers: Alpaca corporate actions,
     ``actions.py`` — the dividend income the price basis leaves out, adjusted
     onto it on read, and the renames and delistings the bar store cannot see.
+``tickers``
+    The point-in-time ticker map, ``tickers.py`` — which SEC filer a symbol
+    belonged to on a given day, built from SEC's current map, the renames and
+    mergers above, dead filers matched to inactive Alpaca assets by name, and
+    ``ticker_overrides.csv``. ``universe`` and every fundamental signal join
+    through it; until it is built it is the current map, unchanged.
 """
 
-__all__ = ["actions", "alpaca", "edgar", "reconcile", "stooq", "store", "universe", "yf"]
+__all__ = ["actions", "alpaca", "edgar", "reconcile", "stooq", "store", "tickers", "universe", "yf"]

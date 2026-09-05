@@ -531,3 +531,14 @@ def test_build_pushes_the_alive_predicates_into_the_filings_read(tmp_path, monke
     assert seen == {"forms": universe.ALIVE_FORMS,
                     "filed_from": ASOF - dt.timedelta(days=universe.ALIVE_WINDOW_DAYS),
                     "filed_to": ASOF}
+
+
+# --- the point-in-time ticker map ---------------------------------------------------
+
+def test_build_uses_the_point_in_time_ticker_map(tmp_path, monkeypatch):
+    _liquid(tmp_path, monkeypatch)                      # X <-> cik 1, alive, liquid
+    from tbot.warehouse import tickers
+    pl.DataFrame([{"cik": 1, "symbol": "X", "valid_from": ASOF + dt.timedelta(days=1),
+                   "valid_to": None, "source": "override"}], schema=tickers.MAP_SCHEMA
+                 ).write_parquet(tickers._map_path(create=True))
+    assert universe.build(ASOF).height == 0             # X was not cik 1's symbol yet on ASOF

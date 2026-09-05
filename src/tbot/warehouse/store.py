@@ -260,3 +260,31 @@ def read_bars(
         .drop(_FILE_COL)
     )
     return df.sort(["symbol", "ts", "source"]).select(list(SCHEMA))
+
+
+#: What :func:`symbol_spans` returns: one row per symbol with its first and last bar.
+SPAN_SCHEMA = pl.Schema({"symbol": pl.Utf8, "first_ts": pl.Date, "last_ts": pl.Date})
+
+
+def symbol_spans(source: str | None = None, resolution: str = "1d") -> pl.DataFrame:
+    """First and last bar date per symbol: ``symbol, first_ts, last_ts``.
+
+    A lazy aggregate over the batch files with no dedupe — a correction never
+    moves a symbol's first or last date, so the min and max over every batch
+    are the answer. `source` of ``None`` spans every source. Sorted by symbol;
+    typed and empty when nothing matches.
+    """
+    resolution = _safe_component(resolution, "resolution")
+    if source is not None:
+        source = _safe_component(source, "source")
+    files = _batch_files(resolution, source)
+    if not files:
+        return pl.DataFrame(schema=SPAN_SCHEMA)
+    return (
+        pl.scan_parquet(files)
+        .group_by("symbol")
+        .agg(first_ts=pl.col("ts").min(), last_ts=pl.col("ts").max())
+        .sort("symbol")
+        .collect()
+        .select(list(SPAN_SCHEMA))
+    )

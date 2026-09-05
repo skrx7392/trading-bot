@@ -497,3 +497,20 @@ def test_issuance_staleness_bound_is_inclusive(tmp_path, monkeypatch):
     sig = issuance.signal(asof)
     assert sig["symbol"].to_list() == ["EDGE"]
     assert sig["score"][0] == pytest.approx(0.0)
+
+
+# --- issuance: the point-in-time ticker map -----------------------------------------
+
+def test_issuance_uses_the_point_in_time_ticker_map(tmp_path, monkeypatch):
+    """A built map is honoured: a symbol that starts after `asof` is not the filer's yet."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "A")])
+    _shares_facts(1, [("2019-06-30", "2019-08-01", 100.0),
+                      ("2020-06-30", "2020-08-01", 200.0)])
+    asof = dt.date(2020, 9, 1)
+    from tbot.warehouse import tickers
+    pl.DataFrame([{"cik": 1, "symbol": "A", "valid_from": asof + dt.timedelta(days=1),
+                   "valid_to": None, "source": "override"}], schema=tickers.MAP_SCHEMA
+                 ).write_parquet(tickers._map_path(create=True))
+    assert issuance.signal(asof).height == 0
+    assert issuance.signal(asof + dt.timedelta(days=1))["symbol"].to_list() == ["A"]

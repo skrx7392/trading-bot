@@ -29,9 +29,12 @@ history does, where yf is the only source there is.
 
 After the vote the run ingests the trailing week of corporate actions,
 re-bases every symbol that split in it (both vendors re-adjust history on the
-ex-date; the store does not — `tbot.jobs.rebase`), and compacts yesterday's
-ledger files. Each is a collaborator with its own tests; the nightly owns their
-order.
+ex-date; the store does not — `tbot.jobs.rebase`), rebuilds the point-in-time
+ticker map from the actions just ingested (`tbot.warehouse.tickers`; SEC's
+current map is refreshed first only when ``SEC_USER_AGENT`` names a contact,
+since SEC fair access requires one — the summary says whether it was), and
+compacts yesterday's ledger files. Each is a collaborator with its own tests;
+the nightly owns their order.
 
 Three things are deliberately *not* special-cased:
 
@@ -61,13 +64,14 @@ newest reconciliation verdict wins.
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 from collections.abc import Iterable
 
 from tbot import ledger
 from tbot._dates import as_date
 from tbot.jobs import rebase
-from tbot.warehouse import actions, alpaca, reconcile, universe, yf
+from tbot.warehouse import actions, alpaca, reconcile, tickers, universe, yf
 
 #: Ledger event kind for the run summary.
 EVENT_KIND = "job.nightly"
@@ -117,6 +121,13 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
     # then re-base every name that split in it — see tbot.jobs.rebase.
     acts = actions.ingest(day - dt.timedelta(days=rebase.LOOKBACK_DAYS), day)
     rebased = rebase.rebase(rebase.symbols_to_rebase(day), day)
+    # The point-in-time ticker map, from the renames and mergers just ingested.
+    # SEC's current map is refreshed first only with a contact User-Agent to
+    # send; without one the rebuild runs on the file already on disk.
+    refreshed = bool(os.environ.get(tickers.USER_AGENT_ENV, "").strip())
+    if refreshed:
+        tickers.refresh_current()
+    rebuilt = {"refreshed": refreshed, **tickers.build()}
     # Yesterday's per-event files into one (ruling 27); today's are left alone.
     compacted = ledger.compact()
 
@@ -131,6 +142,7 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
         "recon": recon,
         "actions": acts,
         "rebase": rebased,
+        "tickers": rebuilt,
         "ledger_compacted": compacted,
     }
     ledger.log_event(EVENT_KIND, out)

@@ -48,8 +48,7 @@ import polars as pl
 
 from tbot._dates import as_date
 from tbot.replication import _finalise
-from tbot.warehouse import edgar
-from tbot.warehouse.universe import _ticker_map
+from tbot.warehouse import edgar, tickers
 
 #: Preference order. The dei cover-page count is the fallback because it is a
 #: cover-page disclosure (as-of the filing date, not the period end) and the
@@ -135,18 +134,20 @@ def signal(asof: dt.date) -> pl.DataFrame:
     denominator and one that has stopped filing has no current count, and both
     drop out rather than scoring.
 
-    Every ticker mapped to a filer carries the filer's score, because a company
-    with two listed share classes has two tradable names and one share count.
+    Every ticker mapped to a filer *on `asof`* carries the filer's score,
+    because a company with two listed share classes has two tradable names and
+    one share count; the map is point-in-time, so a symbol the filer picked up
+    later is not yet its name.
 
     Raises `FileNotFoundError` if the SEC ticker map has not been fetched. That
     is deliberate: an unmappable warehouse would otherwise be indistinguishable
     from a month in which nothing scored.
     """
     asof = as_date(asof, "asof")
-    tickers = _ticker_map()  # fail on a missing map before doing any work
+    mapped = tickers.ticker_map(asof)  # fail on a missing map before doing any work
 
     scored = _pairs(asof).with_columns(
         score=-(pl.col("val") / pl.col("val_then")).log()
     )
     # Inner join: a filer missing from the ticker map has no tradable name.
-    return _finalise(scored.join(tickers, on="cik", how="inner"))
+    return _finalise(scored.join(mapped, on="cik", how="inner"))
