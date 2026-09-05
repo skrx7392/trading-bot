@@ -649,6 +649,41 @@ def test_a_rename_dated_on_the_last_printed_day_still_carries(tmp_path, monkeypa
     assert res.daily["equity"][-1] == pytest.approx(100_000.0 * 20.0 / 10.0, rel=1e-12)
 
 
+def test_a_rename_into_a_lineage_that_predates_it_is_never_applied(tmp_path, monkeypatch):
+    """`NEW`'s series starts long before the rename, so `NEW` *is* the lineage.
+
+    The store is keyed by the symbol's current owner (ruling 44, decision D13):
+    a genuine `old -> new` leaves `new` with a series that starts at the rename,
+    because the re-base job pulls the renamed company's history whole under the
+    new name. A `new` that was already printing well before the process date is
+    therefore the renamed issuer's own lineage, and whatever still prints under
+    `old` belongs to somebody else — `IR -> TT` with `TT`'s series running back
+    to the 1980s. That verdict does not depend on whether `old` happens to have
+    a hole on the day the rename comes due, which is the residual the "old has
+    stopped printing" half alone leaves open: one missing day right after the
+    process date and the position is carried into the wrong issuer anyway.
+
+    The gate is the ticker map's, tolerance included
+    (:data:`~tbot.warehouse.tickers.RELIST_DAYS`), and it is point-in-time: it
+    asks only whether `new` printed *before* `on`, which is knowable on `on`.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    on = days[40]
+    old = {d: 10.0 for d in days if d != days[41]}     # one missing day, right after `on`
+    new = {d: 100.0 for d in days}                     # NEW's series predates the rename
+    _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": new})
+    _name_change(tmp_path, "OLD", "NEW", on)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    # Held in OLD throughout, the one hole marked at its last close: flat prices
+    # and free costs, so equity cannot move.
+    assert res.daily["equity"][-1] == pytest.approx(100_000.0, rel=1e-12)
+    assert ledger.read_events("engine.rename").height == 0
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    assert res.trades == 1
+
+
 # --- tax year attribution -----------------------------------------------------------
 
 def _switch_signal(first, second, switch_on):

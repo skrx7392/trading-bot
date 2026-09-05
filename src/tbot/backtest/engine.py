@@ -13,10 +13,12 @@ Each trading day is processed in four steps, in this order:
 
 1. **Renames, gaps and exits.** A held symbol with *no vetted close today* and
    a name change (from :func:`~tbot.warehouse.actions.read_name_changes`) whose
-   process date falls on or after its last vetted close and on or before today
-   is carried into the new symbol — shares, tax lots, pending target and last
-   mark move unchanged, nothing is traded — and an ``engine.rename`` event is
-   written. A symbol that is still printing is never carried. Then every
+   process date falls on or after its last vetted close and on or before today,
+   and whose target's series does not predate that process date, is carried into
+   the new symbol — shares, tax lots, pending target and last mark move
+   unchanged, nothing is traded — and an ``engine.rename`` event is written. A
+   symbol that is still printing, or one whose target was already printing
+   before the rename, is never carried. Then every
    held symbol with no vetted close today is either *held* through the hole,
    marked at its last vetted close, for up to :data:`MAX_GAP_DAYS` consecutive
    trading days, or *exited* — on a merger for it (from
@@ -47,9 +49,11 @@ rebalance and would not be for a daily one. Upgrade this to true opens before
 trusting a high-turnover result.
 
 **Renames carry the position; they do not trade it — but only once the old
-series has stopped printing.** On the first trading day `t` at which a held
+series has stopped printing, and only into a symbol whose series does not
+predate the rename.** On the first trading day `t` at which a held
 symbol `S` has *no vetted close*, and a name change ``(old=S, new=S')`` whose
-process date lies on or after `S`'s last vetted close and on or before `t`, the
+process date lies on or after `S`'s last vetted close and on or before `t` and
+whose target `S'` passes :func:`_new_series_starts_at`, the
 shares, the open tax lots (merged FIFO by purchase date with any `S'` already
 holds), the pending target and the last mark move to `S'` unchanged: nothing is
 traded, charged or realised, and the holding period runs through the rename as
@@ -57,8 +61,8 @@ it does for tax purposes. This runs before the gap check, so a rename day is
 not a gap. A name-change row whose two symbols are equal (Alpaca files a
 company-name change that way) is not a rename and is ignored.
 
-Both halves of "not yet applied" are load-bearing. *The old symbol must have
-stopped printing:* vendor histories are keyed by lineage — a ticker's bars are
+All three halves of "not yet applied" are load-bearing. *The old symbol must
+have stopped printing:* vendor histories are keyed by lineage — a ticker's bars are
 filed under whoever owns it now — while the action table is keyed by the ticker
 as it was, so on a recycled symbol the two describe different issuers. Of the
 table's 2,864 renames, 100 have the old symbol printing both before and on or
@@ -72,7 +76,19 @@ dates the change at the last day the old ticker traded rather than the first day
 it did not, the position's last close falls *on* the process date, and a strict
 bound would leave the rename permanently undue and gap the name out five days
 later. A rename dated strictly before the last close is one the position has
-already lived through, exactly as before.
+already lived through, exactly as before. *And the target's series must not
+predate the rename:* the quote guard alone still mis-carries a recycled ticker
+on any day the old series happens to have a hole, and a hole is not rare (the
+quarantine rate is 2.4% of bars). The store is keyed by a symbol's current
+owner, so after a genuine rename the target's series starts at the rename;
+one that was already printing more than
+:data:`~tbot.warehouse.tickers.RELIST_DAYS` earlier is the renamed issuer's own
+lineage, and the name still printing under the old symbol is a later holder of
+it. Ruling 44's rule 2 gates the ticker map on exactly this evidence, with
+exactly this tolerance. *Cost if wrong:* a genuine rename whose target was
+backfilled by the vendor under the new name more than 30 days early is not
+carried, and the position exits as a gap after :data:`MAX_GAP_DAYS` at the last
+close — the same 30-day tolerance the map already accepted.
 
 **A short gap is a hole, not a delisting.** A held symbol with no vetted close
 on `t` is held, marked at its last vetted close, for up to :data:`MAX_GAP_DAYS`
@@ -158,6 +174,7 @@ from tbot.backtest.metrics import DELIST_PRICE_FLOOR, DELIST_RETURN
 from tbot.backtest.strategy import Strategy
 from tbot.backtest.tax import TaxLots
 from tbot.warehouse import actions, reconcile, store
+from tbot.warehouse.tickers import RELIST_DAYS
 
 #: Trailing window, in *observations*, for the cost model's volatility and ADV
 #: inputs. Twenty trading days ~ one month: long enough to be an estimate,
@@ -379,6 +396,30 @@ class _Market:
         )
 
 
+def _new_series_starts_at(
+    new: str, on: dt.date, first_seen: dict[str, dt.date]
+) -> bool:
+    """Whether a rename into `new` dated `on` agrees with the store's series.
+
+    The store is keyed by the symbol's *current* owner (ruling 44, decision
+    D13): after a genuine ``old -> new`` the re-base job pulls the renamed
+    company's history whole under the new name, so `new`'s series starts at the
+    rename. True — no series at all, or one that starts no earlier than
+    :data:`~tbot.warehouse.tickers.RELIST_DAYS` before `on` — is that regime.
+    False means `new` was already printing well before the rename, so `new`'s
+    series *is* the renamed issuer's lineage and whatever prints under `old`
+    belongs to a later holder of a recycled ticker; carrying the position would
+    move it into another issuer. Ruling 44's rule 2 uses exactly this gate and
+    tolerance on the same evidence.
+
+    Point-in-time: the question is only whether `new` printed *before* `on`, a
+    fact settled on `on` itself. A first bar in the future makes the gate
+    permissive, never restrictive, so no hindsight can suppress a rename.
+    """
+    first = first_seen.get(new)
+    return first is None or first >= on - dt.timedelta(days=RELIST_DAYS)
+
+
 def _rank(strat: Strategy, asof: dt.date) -> list[str]:
     """The strategy's symbols, best first, with unusable rows dropped.
 
@@ -534,6 +575,11 @@ def run(
         return _finish(strat, start, end, capital, cm, [], [], {}, 0, 0.0)
 
     market = _Market(market_frame, days)
+    # ``symbol -> first vetted close in the panel``, the evidence a rename's
+    # target is judged on; see :func:`_new_series_starts_at`.
+    first_seen: dict[str, dt.date] = dict(
+        market_frame.group_by("symbol").agg(pl.col("ts").min()).iter_rows()
+    )
     rebalance_days = _rebalance_days(days, strat.rebalance)
 
     cash = capital
@@ -589,7 +635,16 @@ def run(
             # printed is one the position has already lived through, while one
             # dated *on* that day is the vendor's "last trading day" semantics
             # and is due the first session the name does not print.
-            due = [(on, new) for on, new in renames.get(symbol, ()) if seen_on <= on <= day]
+            # The third conjunct is the lineage gate: a target that was already
+            # printing long before the rename is the renamed issuer's own
+            # series, so the name still printing under `symbol` is somebody
+            # else's — the recycled-ticker case the quote guard alone misses
+            # whenever the old series happens to have a hole that day.
+            due = [
+                (on, new)
+                for on, new in renames.get(symbol, ())
+                if seen_on <= on <= day and _new_series_starts_at(new, on, first_seen)
+            ]
             if not due:
                 continue
             on, new = min(due)
