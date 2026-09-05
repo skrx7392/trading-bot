@@ -509,3 +509,73 @@ G4 **pass**. G3 **met under amendment** (ruling 29). G1 **not fully met**, momen
 shape at ρ 0.94 and short in level; G2 is subsumed by G1's level condition. Nightly green runs:
 **1 of 5**. Direction: **proceed with phase-1 planning while runs 2–5 accrue**, carrying the G1 items
 as registered calibration limits, and revisit with paper-trading results.
+
+---
+
+## 12. Phase-1 hardening measurements (2026-09-05)
+
+Plan: `docs/superpowers/plans/2026-09-05-phase1-hardening.md`, branch `phase1-hardening`. Decisions taken
+without sign-off are listed in `docs/phase1/decisions-taken.md`; rulings 42–47 are in the SDD ledger. Every
+number below is reproducible from the ledger event named beside it. None of them re-scores the gate: G1 stays
+"not fully met" exactly as §11.4 left it, and the holdout was not touched (every run is 2016-01..2019-12).
+
+### 12.1 Point-in-time ticker map (ruling 44)
+
+**What the store actually holds.** Before the map was built, a read-only probe of the warehouse showed that
+both vendors key the backfilled history by the company's *current* symbol: `NXH` (Neighborhood Intelligence,
+CIK 1130713) carries one continuous series from 2016-01-04 (Alpaca; 2002 in yfinance) at Overstock-lineage
+prices straight across the `OSTK → BYON` (2023-11-06), `BYON → BBBY` (2025-08-29) and `BBBY → NXH`
+(2026-08-17) renames, and there is no `BBBY`, `BYON` or `OSTK` series in any source. Of the 1,556
+rename-target symbols in the store, 1,473 have bars before their rename date. Spec A5's "Alpaca's `BBBY`
+history splices two companies" is therefore not what this store holds: the dead retailer's history is
+*absent* (a survivorship hole), not misattributed. The plan's rule — a rename bounds the new symbol at the
+rename date — would have removed the pre-rename history of every renamed company from the universe and the
+fundamental signals. Rulings D9/D10 made the store's own spans the arbiter: a rename bounds a holder only
+where the symbol's stored series actually begins at the rename; where the series predates it, the vendor
+served the lineage and the interval stays open; a merged symbol that keeps printing past the merger is a
+re-listing whichever source its row came from.
+
+**Build** (`tickers.build`, event `ea745c38b0844defba74b7c124f8b3c5`):
+
+| Source | Intervals | What it is |
+|---|---:|---|
+| `current` | 10,412 | SEC `company_tickers.json`, open intervals |
+| `rename` | 1,491 | Alpaca name changes walked newest-first, evidence-gated |
+| `asset` | 657 | dead filers (no current ticker, not in the current map) matched exactly by name to an inactive Alpaca asset |
+| `override` | 1 | `ticker_overrides.csv`: Bed Bath & Beyond (CIK 886158) as `BBBY` to 2023-05-02 — inert today, since no `BBBY` series exists |
+| **total** | **12,552** | |
+
+**Coverage** over the development window (`tickers.coverage`, event `acd044c89df04c3a86049b78163a6ab0`),
+canonical two-source symbol-days 2016-01-01..2019-12-31:
+
+| | symbol-days | share |
+|---|---:|---:|
+| panel | 4,337,515 | |
+| mapped by the current map | 3,080,952 | 71.03% |
+| mapped by the point-in-time map | 3,040,564 | 70.10% |
+
+The 0.93 pp the PIT map gives up is the evidence-gated bounding of symbols whose series genuinely began at a
+rename; the unmapped remainder under both maps is dominated by ETFs (`AAXJ`, `ACWI`, `AGG`, `AGZ`, `AOA`,
+`AOM`, …), which are not SEC filers and were never in the universe.
+
+**The two live calibrations, re-run on the PIT map** (same panel, `ex_price5` reference, series cut to
+`month <= 2019-12`):
+
+| Anomaly | Map | ρ | n | mean ours | mean ref | level | Ledger event |
+|---|---|---:|---:|---:|---:|---:|---|
+| `Mom12m` | current (§11.3) | 0.9366 | 36 | +0.171% | +0.595% | 0.29× | `12faae3a141349228aee2cc0ae654993` |
+| `Mom12m` | **point-in-time** | **0.9358** | 36 | **+0.148%** | +0.595% | **0.25×** | `b0d2302d859a4330aef992c1afd35f22` |
+| `ShareIss1Y` | current (§11.3) | 0.7851 | 47 | +0.392% | +0.132% | 2.97× | `f31eab1601f74d3689ca3db8f3a7fc4f` |
+| `ShareIss1Y` | **point-in-time** | **0.7849** | 47 | **+0.387%** | +0.132% | 2.93× | `185f03ef17254b19980a2efa5f53636e` |
+
+**Verdict.** The map moves neither ρ by more than 0.001 and neither level by more than 2 bp/month; the
+verdicts in §11.4 stand unchanged. That is the expected outcome of the evidence gates — on a lineage-keyed
+backfill the current map was already attributing almost every stored series to the right filer — and it is
+also ruling 37's prediction (the diagnosis variant that dropped every symbol in both asset lists moved ρ by
+0.001) confirmed on the full panel.
+
+**Registered limit.** The map cannot tell a genuine lineage from a symbol-string splice of two companies:
+if a vendor ever serves two companies under one symbol, that series is attributed to the current owner for
+its whole length. The controls are the override list (hand-verified rows win over every inferred interval),
+the break detector (ruling 43), and this coverage measurement, which is re-run whenever the map's sources
+change.
