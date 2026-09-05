@@ -14,9 +14,11 @@ correctness of the arithmetic:
 
 import datetime as dt
 import json
+import math
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 import tbot.replication as replication
 from tbot.replication import issuance, momentum
@@ -514,3 +516,85 @@ def test_issuance_uses_the_point_in_time_ticker_map(tmp_path, monkeypatch):
                  ).write_parquet(tickers._map_path(create=True))
     assert issuance.signal(asof).height == 0
     assert issuance.signal(asof + dt.timedelta(days=1))["symbol"].to_list() == ["A"]
+
+
+# --- issuance: the lag knob (OSAP's ShareIss1Y lags both endpoints six months) ------
+# OSAP forms `(temp[t-6m] - temp[t-18m]) / temp[t-18m]`: a twelve-month change whose
+# endpoints both sit six months behind the formation date. `lag_days` reproduces that
+# alignment. The two things it must get right: both counts move back *together* (the
+# horizon stays one year), and the ticker map is still read on `asof` (today's names
+# carry yesterday's counts — the symbol that trades on the formation date is the one
+# that gets the score).
+
+def _three_annual_counts(cik: int, counts: tuple[float, float, float]) -> None:
+    """Counts filed 2018-08-01, 2019-08-01 and 2020-08-01, so that a read on
+    2020-09-01 sees the last year and a read 180 days earlier sees the one before."""
+    _shares_facts(cik, [("2018-06-30", "2018-08-01", counts[0]),
+                        ("2019-06-30", "2019-08-01", counts[1]),
+                        ("2020-06-30", "2020-08-01", counts[2])])
+
+
+def test_issuance_lag_moves_both_endpoints_together(tmp_path, monkeypatch):
+    """`signal(asof, lag_days=k)` is `signal(asof - k)` on the same filings.
+
+    GROWER's lagged year is 100 -> 150 and its unlagged year 150 -> 300, so a
+    knob that moved only one endpoint would score a two-year change (100 ->
+    300) or the unlagged year, and neither equals the read taken `k` days
+    earlier.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "GROWER"), (2, "STEADY")])
+    _three_annual_counts(1, (100.0, 150.0, 300.0))
+    _three_annual_counts(2, (100.0, 100.0, 100.0))
+    asof = dt.date(2020, 9, 1)
+    lagged = issuance.signal(asof, lag_days=180)
+    assert_frame_equal(lagged, issuance.signal(asof - dt.timedelta(days=180)))
+    assert lagged["symbol"].to_list() == ["GROWER", "STEADY"]
+    assert lagged["score"].to_list() == pytest.approx([-math.log(1.5), 0.0])
+    # And that is not the unlagged answer, which sees the 150 -> 300 year.
+    assert issuance.signal(asof)["score"][0] == pytest.approx(-math.log(2.0))
+
+
+def test_issuance_lag_defaults_to_zero(tmp_path, monkeypatch):
+    """Ruling 40's calibration was made on the unlagged read; it stays the default."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "GROWER")])
+    _three_annual_counts(1, (100.0, 150.0, 300.0))
+    asof = dt.date(2020, 9, 1)
+    assert issuance.LAG_DAYS == 0
+    assert_frame_equal(issuance.signal(asof), issuance.signal(asof, lag_days=0))
+    assert issuance.signal(asof)["score"][0] == pytest.approx(-math.log(2.0))
+
+
+def test_issuance_lag_reads_the_ticker_map_at_asof_not_at_the_lagged_date(
+        tmp_path, monkeypatch):
+    """The counts move back `k` days; the names are still today's.
+
+    The filer renamed OLD -> NEW inside the lag window. On `asof` its tradable
+    name is NEW, so NEW carries the lagged score; an unlagged read on the lagged
+    date would have called it OLD.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "OLD")])
+    _three_annual_counts(1, (100.0, 150.0, 300.0))
+    asof = dt.date(2020, 9, 1)
+    renamed = asof - dt.timedelta(days=30)  # inside the 180-day lag window
+    from tbot.warehouse import tickers
+    pl.DataFrame([
+        {"cik": 1, "symbol": "OLD", "valid_from": None,
+         "valid_to": renamed - dt.timedelta(days=1), "source": "override"},
+        {"cik": 1, "symbol": "NEW", "valid_from": renamed, "valid_to": None,
+         "source": "override"},
+    ], schema=tickers.MAP_SCHEMA).write_parquet(tickers._map_path(create=True))
+    lagged = issuance.signal(asof, lag_days=180)
+    assert lagged["symbol"].to_list() == ["NEW"]
+    assert lagged["score"][0] == pytest.approx(-math.log(1.5))
+    assert issuance.signal(asof - dt.timedelta(days=180))["symbol"].to_list() == ["OLD"]
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "180"])
+def test_issuance_rejects_a_negative_or_non_int_lag(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "A")])
+    with pytest.raises(ValueError, match="lag_days"):
+        issuance.signal(dt.date(2020, 9, 1), lag_days=bad)

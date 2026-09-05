@@ -40,6 +40,20 @@ divides to exactly 1.0 and scores a confident ``0.0``, planting "unknown" in the
 middle of the cross-section dressed as "issued nothing". Both counts must
 therefore be filed within :data:`MAX_FACT_AGE_DAYS` of the endpoint they stand
 for, so a delinquent filer drops out instead of scoring.
+
+**The reference lags its endpoints; this signal does not, by default.** OSAP's
+``ShareIss1Y`` (Pontiff & Woodgate 2008, Table 3A) is
+``(temp[t-6m] - temp[t-18m]) / temp[t-18m]`` with ``temp = shrout * cfacshr`` on
+CRSP monthly data: the same twelve-month horizon, but *both* endpoints six
+months behind the formation date, and a percentage change rather than a log
+(a monotone transform of the same ratio, so decile membership is identical).
+The `lag_days` argument to :func:`signal` reproduces that alignment. It moves
+both counts back together, so the horizon stays one year, while the ticker map
+is still read on `asof` — today's names carry yesterday's counts, because the
+symbol that trades on the formation date is the one that gets the score.
+:data:`LAG_DAYS` stays ``0``: the calibration that established ruling 40 was
+run unlagged and must stay reproducible, so the lagged read is a registered
+sensitivity cell (``docs/phase1/calibration-limits.md``), not the default.
 """
 
 import datetime as dt
@@ -65,6 +79,14 @@ LOOKBACK_DAYS = 365
 #: annual-only filer and drops the one that has gone quiet. Without the bound a
 #: delinquent filer's stale count is read at both endpoints and scores 0.0.
 MAX_FACT_AGE_DAYS = 400
+
+#: How far, in calendar days, both endpoints sit behind `asof`. OSAP's
+#: ``ShareIss1Y`` lags both of its endpoints six months (``l6.temp`` against
+#: ``l18.temp``; see the module docstring), so ``180`` is the like-for-like
+#: setting. The default is ``0`` because ruling 40's calibration was made on the
+#: unlagged read and must stay reproducible; the lagged read is run as a
+#: sensitivity cell (``tools/t17/calib_one.py --lag-days 180``).
+LAG_DAYS = 0
 
 #: The frame `_pairs` returns: one row per filer with both ends of the year.
 _PAIR_SCHEMA = pl.Schema({"cik": pl.Int64, "val": pl.Float64, "val_then": pl.Float64})
@@ -123,30 +145,39 @@ def _pairs(asof: dt.date) -> pl.DataFrame:
     return pl.concat(frames)
 
 
-def signal(asof: dt.date) -> pl.DataFrame:
-    """Net share issuance over the year ending at `asof`.
+def signal(asof: dt.date, lag_days: int = LAG_DAYS) -> pl.DataFrame:
+    """Net share issuance over the year ending at ``asof - lag_days``.
 
     Returns :data:`tbot.replication.SCHEMA` sorted by symbol, and a typed empty
     frame when no filer has a usable count at both ends of the year. A filer
-    needs a count from the *same* tag filed by `asof` *and* by
-    ``asof - 365 days``, each no more than :data:`MAX_FACT_AGE_DAYS` old at the
-    endpoint it stands for; a company that listed inside the year has no
-    denominator and one that has stopped filing has no current count, and both
-    drop out rather than scoring.
+    needs a count from the *same* tag filed by ``asof - lag_days`` *and* by
+    ``asof - lag_days - 365 days``, each no more than :data:`MAX_FACT_AGE_DAYS`
+    old at the endpoint it stands for; a company that listed inside the year
+    has no denominator and one that has stopped filing has no current count,
+    and both drop out rather than scoring.
 
-    Every ticker mapped to a filer *on `asof`* carries the filer's score,
-    because a company with two listed share classes has two tradable names and
-    one share count; the map is point-in-time, so a symbol the filer picked up
-    later is not yet its name.
+    `lag_days` (calendar days, default :data:`LAG_DAYS`) moves *both* endpoints
+    back together, so the horizon is always one year and the scores are exactly
+    those of an unlagged read on ``asof - lag_days``. It exists to match OSAP's
+    six-month-lagged construction; see the module docstring. A negative or
+    non-integer lag raises `ValueError`.
+
+    Every ticker mapped to a filer *on `asof`* — not on the lagged date —
+    carries the filer's score, because a company with two listed share classes
+    has two tradable names and one share count; the map is point-in-time, so a
+    symbol the filer picked up later is not yet its name, and one it picked up
+    inside the lag window already is.
 
     Raises `FileNotFoundError` if the SEC ticker map has not been fetched. That
     is deliberate: an unmappable warehouse would otherwise be indistinguishable
     from a month in which nothing scored.
     """
     asof = as_date(asof, "asof")
+    if isinstance(lag_days, bool) or not isinstance(lag_days, int) or lag_days < 0:
+        raise ValueError(f"lag_days must be a non-negative int, got {lag_days!r}")
     mapped = tickers.ticker_map(asof)  # fail on a missing map before doing any work
 
-    scored = _pairs(asof).with_columns(
+    scored = _pairs(asof - dt.timedelta(days=lag_days)).with_columns(
         score=-(pl.col("val") / pl.col("val_then")).log()
     )
     # Inner join: a filer missing from the ticker map has no tradable name.
