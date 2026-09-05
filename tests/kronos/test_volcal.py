@@ -82,20 +82,32 @@ class _StubPredictor:
     returning a pandas frame of OHLCV indexed by ``y_timestamp`` — so that what
     the adapter is tested against is the real contract rather than a convenient
     one.
+
+    `bad_first` makes the first N draws pathological — a non-positive close, the
+    real failure mode from the 99-symbol run (``min -8.2258``) — and every draw
+    after them good, which is exactly the schedule the resample-then-drop policy
+    is defined over. ``bad_first=math.inf`` is a predictor that never recovers.
     """
 
-    def __init__(self, paths=None, drift=0.0, sigma=0.01):
+    def __init__(self, paths=None, drift=0.0, sigma=0.01, bad_first=0, bad_close=-8.2258):
         self.calls = []
         self._paths = list(paths) if paths is not None else None
         self._drift, self._sigma = drift, sigma
+        self._bad_first, self._bad_close = bad_first, bad_close
 
     def predict(self, **kwargs):
         import pandas as pd
 
         self.calls.append(kwargs)
         pred_len = kwargs["pred_len"]
-        if self._paths is not None:
-            closes = list(self._paths[(len(self.calls) - 1) % len(self._paths)])
+        if len(self.calls) <= self._bad_first:
+            # A wild sample after denormalisation: finite, and negative.
+            closes = [100.0] * (pred_len - 1) + [self._bad_close]
+        elif self._paths is not None:
+            # The replay starts at paths[0] on the first *good* draw, so a
+            # `bad_first` prefix does not rotate the schedule under a test.
+            good = len(self.calls) - 1 - int(self._bad_first)
+            closes = list(self._paths[good % len(self._paths)])
         else:  # a deterministic wiggle, distinct per call
             rng = random.Random(len(self.calls))
             price, closes = 100.0, []
@@ -615,6 +627,171 @@ def test_adapter_rejects_a_predictor_without_predict():
         volcal.kronos_forecaster_from_predictor(object())
 
 
+# --- the pathological-path guard: resample, then drop, then raise ---------------------------
+#
+# A wild sample can denormalise to a non-positive close, whose logarithm is not a
+# number. T15 shipped that as a raise, and on the first real 99-symbol run it
+# aborted the calibration minutes in. The policy below is the T15 report's own
+# prescription — "a documented resample-with-limit, not a clamp" — because
+# clamping a negative price to something positive invents a path the model never
+# drew and reports its volatility as if the model had.
+
+
+_GOOD = [100.0 * math.exp(0.01 * (i % 3)) for i in range(21)]
+_GOOD_VOL = volcal.realized_vol(pl.Series(_GOOD))
+
+
+class _SeedRecorder:
+    """A stand-in for the torch module that only records `manual_seed`."""
+
+    def __init__(self):
+        self.seeds = []
+
+    def manual_seed(self, value):
+        self.seeds.append(value)
+
+
+def test_adapter_resamples_a_pathological_first_draw():
+    """One bad draw costs one extra call, not the whole calibration run."""
+    stub = _StubPredictor(paths=[_GOOD], bad_first=1)
+    forecast = volcal.kronos_forecaster_from_predictor(stub)
+
+    assert forecast(_bars(0.02, n=252)) == pytest.approx(_GOOD_VOL)
+    assert len(stub.calls) == 2, "the bad draw was redrawn once"
+    assert forecast.resamples == 1
+    assert forecast.dropped_paths == 0
+
+
+def test_adapter_counters_accumulate_across_calls():
+    """The counter is a run-level record, so a driver can report it once at the end."""
+    stub = _StubPredictor(paths=[_GOOD], bad_first=1)
+    forecast = volcal.kronos_forecaster_from_predictor(stub)
+    ctx = _bars(0.02, n=252)
+    forecast(ctx)
+    forecast(ctx)  # the stub has recovered by now: no second resample
+    assert (forecast.resamples, forecast.dropped_paths) == (1, 0)
+
+
+def test_adapter_drops_a_path_that_stays_pathological_and_averages_the_rest():
+    """max_resamples=3 buys four draws for path 0; path 1 is the only survivor."""
+    stub = _StubPredictor(paths=[_GOOD], bad_first=4)
+    forecast = volcal.kronos_forecaster_from_predictor(stub, paths=2, max_resamples=3)
+
+    assert forecast(_bars(0.02, n=252)) == pytest.approx(_GOOD_VOL)
+    assert len(stub.calls) == 5, "4 draws for the dropped path, 1 for the good one"
+    assert forecast.resamples == 3
+    assert forecast.dropped_paths == 1
+
+
+def test_adapter_raises_when_every_path_is_dropped():
+    """Loud, and with T15's exact message: the model cannot forecast this context."""
+    stub = _StubPredictor(bad_first=math.inf)
+    forecast = volcal.kronos_forecaster_from_predictor(stub, paths=2, max_resamples=3)
+
+    with pytest.raises(
+        ValueError,
+        match=r"KronosPredictor\.predict returned a non-finite or non-positive close price "
+        r"\(min -8\.2258\); lower the sampling temperature or drop the path",
+    ):
+        forecast(_bars(0.02, n=252))
+    assert len(stub.calls) == 8, "(1 + 3) draws for each of the 2 paths"
+    assert forecast.resamples == 6 and forecast.dropped_paths == 2
+
+
+def test_max_resamples_zero_drops_immediately():
+    stub = _StubPredictor(paths=[_GOOD], bad_first=1)
+    forecast = volcal.kronos_forecaster_from_predictor(stub, paths=2, max_resamples=0)
+
+    assert forecast(_bars(0.02, n=252)) == pytest.approx(_GOOD_VOL)
+    assert len(stub.calls) == 2, "no retry was drawn"
+    assert forecast.resamples == 0 and forecast.dropped_paths == 1
+
+
+def test_max_resamples_zero_still_raises_when_nothing_survives():
+    stub = _StubPredictor(bad_first=math.inf)
+    forecast = volcal.kronos_forecaster_from_predictor(stub, max_resamples=0)
+    with pytest.raises(ValueError, match="non-finite or non-positive"):
+        forecast(_bars(0.02, n=252))
+    assert len(stub.calls) == 1
+
+
+def test_a_structurally_wrong_prediction_is_not_resampled():
+    """A missing column or a wrong row count is a bug, not a wild sample.
+
+    Redrawing it would turn one clear error into `max_resamples + 1` identical
+    ones and then report it as a dropped path. Only the pathological-price case
+    is retryable.
+    """
+    stub = _StubPredictor(paths=[[100.0] * 20])
+    forecast = volcal.kronos_forecaster_from_predictor(stub, max_resamples=3)
+    with pytest.raises(ValueError, match="expected pred_len=21"):
+        forecast(_bars(0.02, n=252))
+    assert len(stub.calls) == 1
+    assert forecast.resamples == 0 and forecast.dropped_paths == 0
+
+
+def test_retry_seeds_are_derived_from_the_seed_the_path_and_the_attempt(monkeypatch):
+    """A retry must draw a *different* sample, and the same one on every run.
+
+    Reseeding the retry with the base seed would redraw the identical
+    pathological path forever; not reseeding at all is fine for a live model but
+    leaves a seeded run irreproducible the moment the guard fires. So the retry
+    seed is a pure function of (seed, path index, attempt).
+    """
+    runs = []
+    for _ in range(2):
+        recorder = _SeedRecorder()
+        monkeypatch.setattr(volcal, "_torch", lambda r=recorder: r)
+        stub = _StubPredictor(paths=[_GOOD], bad_first=2)
+        forecast = volcal.kronos_forecaster_from_predictor(stub, seed=11, max_resamples=3)
+        assert forecast(_bars(0.02, n=252)) == pytest.approx(_GOOD_VOL)
+        runs.append(recorder.seeds)
+
+    seeds = runs[0]
+    assert len(seeds) == 3, "one seed for the call, one for each of the two retries"
+    assert seeds[0] == 11
+    assert len(set(seeds)) == 3, "a retry that reuses a seed redraws the same bad path"
+    assert runs[0] == runs[1], "the retry schedule must reproduce exactly"
+    assert all(isinstance(s, int) and 0 <= s < 2**63 for s in seeds[1:])
+
+
+def test_retry_seeds_differ_between_base_seeds(monkeypatch):
+    def seeds_for(seed):
+        recorder = _SeedRecorder()
+        monkeypatch.setattr(volcal, "_torch", lambda r=recorder: r)
+        forecast = volcal.kronos_forecaster_from_predictor(
+            _StubPredictor(paths=[_GOOD], bad_first=2), seed=seed, max_resamples=3
+        )
+        forecast(_bars(0.02, n=252))
+        return recorder.seeds[1:]
+
+    assert seeds_for(11) != seeds_for(12)
+
+
+def test_retry_seeds_differ_between_paths(monkeypatch):
+    """Path 1's retry must not replay path 0's retry draw."""
+    recorder = _SeedRecorder()
+    monkeypatch.setattr(volcal, "_torch", lambda: recorder)
+    forecast = volcal.kronos_forecaster_from_predictor(
+        _StubPredictor(bad_first=math.inf), seed=11, paths=2, max_resamples=2
+    )
+    with pytest.raises(ValueError, match="non-finite or non-positive"):
+        forecast(_bars(0.02, n=252))
+    assert len(recorder.seeds) == 5, "1 call seed + 2 retries for each of 2 paths"
+    assert len(set(recorder.seeds)) == 5
+
+
+def test_an_unseeded_adapter_never_touches_torch(monkeypatch):
+    """The adapter stays usable — and testable — on a machine with no torch."""
+
+    def boom():
+        raise AssertionError("an unseeded forecaster must not import torch")
+
+    monkeypatch.setattr(volcal, "_torch", boom)
+    forecast = volcal.kronos_forecaster_from_predictor(_StubPredictor(paths=[_GOOD], bad_first=1))
+    assert forecast(_bars(0.02, n=252)) == pytest.approx(_GOOD_VOL)
+
+
 @pytest.mark.parametrize(
     "kwargs, exc",
     [
@@ -624,6 +801,11 @@ def test_adapter_rejects_a_predictor_without_predict():
         ({"temperature": 0.0}, ValueError),
         ({"temperature": "hot"}, TypeError),
         ({"top_p": 1.0}, ValueError),
+        ({"max_resamples": -1}, ValueError),
+        ({"max_resamples": 1.0}, TypeError),
+        ({"max_resamples": True}, TypeError),  # a bool is a caller bug, not a 1
+        ({"seed": 1.5}, TypeError),
+        ({"seed": True}, TypeError),
     ],
 )
 def test_adapter_rejects_malformed_sampling_arguments(kwargs, exc):
@@ -686,6 +868,9 @@ def test_variant_registry_pins_the_published_checkpoints():
         ({"variant": "mini", "device": 0}, TypeError),
         ({"variant": "mini", "seed": 1.5}, TypeError),
         ({"variant": "mini", "seed": True}, TypeError),
+        ({"variant": "mini", "max_resamples": -1}, ValueError),
+        ({"variant": "mini", "max_resamples": 1.0}, TypeError),
+        ({"variant": "mini", "max_resamples": True}, TypeError),
     ],
 )
 def test_kronos_forecaster_validates_before_it_downloads_anything(kwargs, exc, monkeypatch):
@@ -693,7 +878,7 @@ def test_kronos_forecaster_validates_before_it_downloads_anything(kwargs, exc, m
         raise AssertionError("a typo must not cost a checkpoint download")
 
     monkeypatch.setattr(volcal, "_import_kronos", boom)
-    with pytest.raises(exc, match="mini|variant|horizon|paths|device|seed"):
+    with pytest.raises(exc, match="mini|variant|horizon|paths|device|seed|max_resamples"):
         volcal.kronos_forecaster(**kwargs)
 
 
