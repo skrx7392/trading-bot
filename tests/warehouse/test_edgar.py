@@ -78,6 +78,7 @@ def test_filings_schema_is_exactly_the_documented_columns(tmp_path, monkeypatch)
     assert dict(edgar.FILINGS_SCHEMA) == {
         "cik": pl.Int64, "accn": pl.Utf8, "form": pl.Utf8,
         "filed": pl.Date, "primary_doc": pl.Utf8,
+        "accepted": pl.Datetime("us", "UTC"), "items": pl.Utf8,
     }
 
 
@@ -98,6 +99,7 @@ def test_reads_do_not_create_directories(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     edgar.read_facts()
     edgar.read_filings()
+    edgar.read_entities()
     assert not (tmp_path / "edgar").exists()
 
 
@@ -297,6 +299,7 @@ def test_ingest_submissions_maps_every_field(tmp_path, monkeypatch):
     assert edgar.read_filings().row(0, named=True) == {
         "cik": 320193, "accn": "0000320193-20-000010", "form": "10-Q",
         "filed": dt.date(2020, 1, 29), "primary_doc": "a10-q.htm",
+        "accepted": None, "items": "",
     }
 
 
@@ -790,3 +793,103 @@ def test_read_facts_returns_a_copy_the_caller_cannot_poison(tmp_path, monkeypatc
     df = edgar.read_facts(["Assets"])
     df.with_columns(pl.lit(0.0).alias("val"))  # polars frames are immutable; this pins that
     assert edgar.read_facts(["Assets"])["val"].to_list() == [10.0, 20.0]
+
+
+# --- acceptance instants, 8-K items and entity identity -----------------------------
+
+SUBS_FULL = {
+    "cik": "886158", "name": "20230930-DK-Butterfly-1, Inc.", "tickers": [], "exchanges": [],
+    "formerNames": [{"name": "BED BATH & BEYOND INC", "from": "1995-03-08T00:00:00.000Z",
+                     "to": "2023-09-20T00:00:00.000Z"}],
+    "filings": {"recent": {
+        "accessionNumber": ["0001193125-23-247428", "0001193125-23-100000"],
+        "form": ["8-K", "10-Q"],
+        "filingDate": ["2023-09-29", "2023-04-15"],
+        "acceptanceDateTime": ["2023-09-29T16:23:06.000Z", None],
+        "items": ["1.03,3.03,5.02,5.03,7.01,9.01", None],
+        "primaryDocument": ["d579010d8k.htm", "q.htm"]}}}
+
+
+def test_filings_carry_acceptance_timestamp_and_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps(SUBS_FULL).encode(), cik=886158)
+    f = edgar.read_filings(forms=["8-K"])
+    assert f.columns == list(edgar.FILINGS_SCHEMA)
+    assert f.schema["accepted"] == pl.Datetime("us", "UTC")
+    assert f["accepted"][0] == dt.datetime(2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    assert f["items"][0] == "1.03,3.03,5.02,5.03,7.01,9.01"
+    q = edgar.read_filings(forms=["10-Q"])
+    assert q["accepted"][0] is None and q["items"][0] == ""
+
+
+def test_filings_schema_lists_the_two_new_columns_last():
+    assert list(edgar.FILINGS_SCHEMA)[-2:] == ["accepted", "items"]
+
+
+def test_an_unparseable_acceptance_time_is_null_not_a_skip(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    n = edgar.ingest_submissions(_subs(1, accessionNumber=["a"], form=["8-K"],
+                                       filingDate=["2020-01-02"], acceptanceDateTime=["garbage"]), cik=1)
+    assert n == 1 and edgar.read_filings()["accepted"][0] is None
+
+
+def test_entities_are_written_from_the_main_document(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps(SUBS_FULL).encode(), cik=886158)
+    e = edgar.read_entities()
+    assert e.columns == list(edgar.ENTITIES_SCHEMA) and dict(e.schema) == dict(edgar.ENTITIES_SCHEMA)
+    row = e.row(0, named=True)
+    assert row["cik"] == 886158 and row["name"] == "20230930-DK-Butterfly-1, Inc."
+    assert row["tickers"] == [] and row["exchanges"] == []
+    assert row["former_names"] == [{"name": "BED BATH & BEYOND INC",
+                                    "from": dt.date(1995, 3, 8), "to": dt.date(2023, 9, 20)}]
+
+
+def test_a_shard_does_not_blank_the_entity(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps(SUBS_FULL).encode(), cik=886158)
+    edgar.ingest_submissions(_subs(886158, accessionNumber=["old"], form=["10-K"],
+                                   filingDate=["2001-03-01"]), cik=886158)   # no `name`
+    assert edgar.read_entities().height == 1
+    assert edgar.read_entities()["name"][0] == "20230930-DK-Butterfly-1, Inc."
+    assert edgar.read_filings().height == 3
+
+
+def test_entities_read_is_typed_when_empty_and_lists_tickers(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    assert edgar.read_entities().schema == edgar.ENTITIES_SCHEMA
+    doc = {"cik": 320193, "name": "Apple Inc.", "tickers": ["AAPL"], "exchanges": ["Nasdaq"],
+           "formerNames": [], "filings": {"recent": {}}}
+    edgar.ingest_submissions(json.dumps(doc), cik=320193)
+    assert edgar.read_entities()["tickers"][0].to_list() == ["AAPL"]
+    payload = json.loads(ledger.read_events(edgar.FILINGS_EVENT)["payload"][0])
+    assert payload["entity"] is True
+
+
+def test_opt_datetime_handles_z_naive_offsets_and_junk():
+    """The `Z` is a real UTC marker, not decoration: dropping it would shift
+    Apple's 20:30Z 8-K into the trading day it was filed after."""
+    assert edgar._opt_datetime("2023-09-29T16:23:06.000Z") == dt.datetime(
+        2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    # a naive stamp is read as UTC, an offset one is converted to it
+    assert edgar._opt_datetime("2023-09-29T16:23:06") == dt.datetime(
+        2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    assert edgar._opt_datetime("2023-09-29T12:23:06-04:00") == dt.datetime(
+        2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    for junk in ("garbage", "", "   ", None, 20230929, ["2023-09-29T16:23:06Z"]):
+        assert edgar._opt_datetime(junk) is None
+
+
+def test_a_former_name_with_no_end_is_an_open_window(tmp_path, monkeypatch):
+    """EDGAR leaves `to` empty while a name is still in force; that is an open
+    window, not a reason to drop the name."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps({
+        "cik": 1, "name": "Now Inc.", "tickers": ["now"], "exchanges": ["NYSE"],
+        "formerNames": [{"name": "Then Inc.", "from": "1999-01-04T00:00:00.000Z", "to": ""},
+                        "not a dict", {"from": "2000-01-01T00:00:00.000Z"}],
+        "filings": {"recent": {}}}), cik=1)
+    row = edgar.read_entities().row(0, named=True)
+    assert row["tickers"] == ["NOW"]  # normalised the way symbols are held elsewhere
+    assert row["former_names"] == [
+        {"name": "Then Inc.", "from": dt.date(1999, 1, 4), "to": None}]
