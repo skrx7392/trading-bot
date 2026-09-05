@@ -76,18 +76,33 @@ retroactive.
     different company or a different scale wearing the same ticker.
     ``max_jump=None`` disables the detector.
 
-    Breaks are found on the symbol's **whole** history up to ``end``, never on
-    the ``start..end`` slice alone. ``start`` narrows what is returned, not what
-    the detector may look at, so a splice earlier than ``start`` still truncates
-    and the window is applied after the truncation. ``end`` is the one boundary
-    the detector honours, because ``end`` is a *point-in-time horizon* and not a
-    display filter: every consumer here passes ``end=asof``, and letting a break
-    the caller could not yet have known about retract history it could
-    legitimately have traded would put look-ahead — and survivorship bias, in
-    the direction that flatters a backtest — into every result. A name that
+    ``end`` bounds the detector, because ``end`` is a *point-in-time horizon*
+    and not a display filter: every consumer here passes ``end=asof``, and
+    letting a break the caller could not yet have known about retract history it
+    could legitimately have traded would put look-ahead — and survivorship bias,
+    in the direction that flatters a backtest — into every result. A name that
     collapses 100x in 2021 would otherwise vanish from the 2020 universe. The
     contamination is still reached, one horizon later: the moment ``asof`` moves
     past the splice, the dead issuer's history stops being returned.
+
+    ``start`` bounds it too, and — unlike ``end`` — bounding it there changes
+    nothing about the answer. Under "keep the tail at and after the *last* break
+    through ``end``", a break older than ``start`` cannot move a single row of
+    ``start..end``: every one of them already sits on that break's post-break
+    side, so truncating to it and not truncating at all name the same rows. Nor
+    can a break inside the window be missed for want of history, because a break
+    whose preceding close is older than ``start`` *is* the window's first row,
+    and truncating to the first row is again a no-op. The one thing the window
+    must not lose is the *ratio* at ``start``, which is measured against a close
+    that lies just before it — hence :data:`_BREAK_LOOKBACK`, a calendar margin
+    wide enough to contain that close across a weekend or a holiday run. With it
+    the detector sees every ratio in ``start..end`` exactly as the full history
+    would give it, which is what makes the equivalence an invariant rather than
+    a coincidence.
+
+    That is a memory bound, not a nicety. The store is 37M rows of 1962-onward
+    closes and a caller asking for 63 days used to load all of them; windowing
+    the scan took the nightly's peak from 25.0 GB to what fits in a pod.
 
 Requiring two sources alone took a 2016-2019 12-2 momentum replication from a
 long-short mean of -5.2%/month (rho 0.13 against OSAP) to rho 0.84 with a sane
@@ -148,6 +163,15 @@ DEFAULT_MIN_SOURCES = 2
 #: 5x moves happen (a biotech readout, a takeover bid on a $0.40 shell); 10x
 #: overnight on a name that then keeps trading at the new level does not.
 DEFAULT_MAX_JUMP = 5.0
+
+#: How far *before* ``start`` :func:`read_canonical` reads, so the break
+#: detector is handed the close the window's first row is measured against. It
+#: is a calendar margin because the gap to the previous session is a calendar
+#: question: a weekend is three days, a weekend with a Monday holiday is four,
+#: and the Christmas-to-New-Year stretch and the 2012 Sandy shutdown are longer
+#: still. Ten days clears all of them with room to spare, and costs a sixth of a
+#: row for every row of a 63-day window — against reading 37M.
+_BREAK_LOOKBACK = dt.timedelta(days=10)
 
 # Floor for the relative comparison, so two zero closes compare equal instead of
 # dividing by nothing.
@@ -219,9 +243,10 @@ def _drop_pre_break(df: pl.DataFrame, max_jump: float) -> pl.DataFrame:
     """Per symbol, keep only the rows at and after the *last* level break.
 
     A break is a consecutive-row close ratio outside ``[1/max_jump, max_jump]``,
-    measured on `df` exactly as given — which is why the caller must pass the
-    symbol's whole surviving history and apply the date window afterwards. The
-    break row itself is the first row of the new regime, so it is kept.
+    measured on `df` exactly as given — so the caller owes this function every
+    row whose ratio matters, including the one close before the window it means
+    to return, and applies the window afterwards. The break row itself is the
+    first row of the new regime, so it is kept.
 
     Non-positive and non-finite closes cannot form a meaningful ratio. They
     never reach a canonical row today (a quarantine, or the vote's usability
@@ -439,28 +464,39 @@ def read_canonical(
     `max_jump`
         Drop, per symbol, everything before its last level break — a
         consecutive-close ratio above `max_jump` or below ``1 / max_jump``.
-        Defaults to :data:`DEFAULT_MAX_JUMP` (5.0); ``None`` disables it. Breaks
-        are found on the symbol's whole surviving history through `end`, and
-        `start` is applied *afterwards*: a splice before `start` still truncates,
-        while one after `end` is invisible, because `end` is a point-in-time
-        horizon. See the module docstring for why that asymmetry is deliberate.
+        Defaults to :data:`DEFAULT_MAX_JUMP` (5.0); ``None`` disables it. A
+        break after `end` is invisible, because `end` is a point-in-time
+        horizon; one before `start` is *irrelevant*, because every row of the
+        window already lies after it. See the module docstring for why the two
+        boundaries differ and why the second one lets the scan be windowed.
 
-    Order matters and is fixed: dedupe to the newest verdict, drop quarantines,
-    apply `min_sources`, cut to `end`, find breaks on what is left, then apply
-    `start`.
+    Order matters and is fixed: window the scan, dedupe to the newest verdict,
+    drop quarantines, apply `min_sources`, find breaks on what is left, then cut
+    to `start`.
     """
     min_sources = _check_min_sources(min_sources)
     max_jump = _check_max_jump(max_jump)
+    # Coerced up here, with the other arguments, so an empty warehouse cannot
+    # swallow a malformed date by returning before it is ever looked at.
+    start = None if start is None else as_date(start, "start")
+    end = None if end is None else as_date(end, "end")
 
     files = sorted(_canon_dir().glob("*.parquet"))
     if not files:
         return pl.DataFrame(schema=SCHEMA)
 
-    # `symbols` is per-row and independent of every filter below, so it is pushed
-    # into the scan: reading one symbol should not materialise the whole panel.
+    # Every filter that can be decided one row at a time goes into the scan, so
+    # the collect materialises the window and not the store. `symbols` and `end`
+    # are per-row by construction; `start` needs the lookback margin, and the
+    # module docstring carries the argument for why that is enough. The three
+    # together are the difference between reading 63 days and reading 37M rows.
     scan = pl.scan_parquet(files, include_file_paths=_FILE_COL)
     if symbols is not None:
         scan = scan.filter(pl.col("symbol").is_in(pl.lit(list(symbols), dtype=pl.List(pl.Utf8))))
+    if end is not None:
+        scan = scan.filter(pl.col("ts") <= end)
+    if start is not None:
+        scan = scan.filter(pl.col("ts") >= start - _BREAK_LOOKBACK)
 
     df = (
         scan.collect()
@@ -476,16 +512,14 @@ def read_canonical(
         .filter(pl.col("n_sources") >= min_sources)
     )
 
-    # `end` first: it is the point-in-time horizon, so nothing after it may
-    # influence the answer — least of all a break that retracts tradable history.
-    if end is not None:
-        df = df.filter(pl.col("ts") <= as_date(end, "end"))
-
+    # The detector runs on the lookback margin as well as the window, so the
+    # ratio at `start` is the one the full history would give.
     if max_jump is not None:
         df = _drop_pre_break(df, max_jump)
 
-    # `start` last: truncation is a property of the symbol's history at the
-    # horizon, not of the earliest date the caller happened to ask for.
+    # `start` last, which is what trims the margin back off. Doing it here rather
+    # than in the scan is not cosmetic: a break *inside* the window truncates
+    # rows the caller asked for, and that can only happen after the detector.
     if start is not None:
-        df = df.filter(pl.col("ts") >= as_date(start, "start"))
+        df = df.filter(pl.col("ts") >= start)
     return df.sort(["symbol", "ts"]).select(list(SCHEMA))

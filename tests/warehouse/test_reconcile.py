@@ -337,6 +337,22 @@ def _seed_series(closes, sym="AAPL", first=D, sources=("stooq", "alpaca")):
     return days
 
 
+def _seed_days(pairs, sym="AAPL", sources=("stooq", "alpaca")):
+    """Like :func:`_seed_series`, but the caller picks the dates.
+
+    Consecutive calendar days cannot express a gap, and a gap is exactly what a
+    real close series is made of — weekends and holidays — so the tests that
+    care about the *calendar* distance between one close and the next need to
+    place the days themselves.
+    """
+    for day, close in pairs:
+        for src in sources:
+            _write(src, close, sym=sym, day=day)
+    days = [day for day, _ in pairs]
+    reconcile.run(min(days), max(days))
+    return days
+
+
 def test_single_source_rows_are_excluded_by_default(tmp_path, monkeypatch):
     """A lone source trivially agrees with itself; that is not confirmation."""
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
@@ -422,17 +438,75 @@ def test_breaks_are_detected_per_symbol(tmp_path, monkeypatch):
     assert can.filter(pl.col("symbol") == "CLEAN")["ts"].to_list() == days
 
 
-def test_a_break_before_start_still_truncates(tmp_path, monkeypatch):
-    """`start` narrows the answer, never what the detector may look at.
+def test_a_break_inside_the_window_truncates_the_window(tmp_path, monkeypatch):
+    """`start` narrows the answer; the truncation still eats into it.
 
-    The break at ``days[2]`` is found from ``days[1]``, a row outside the
-    requested window, and the truncation is applied before the window is — so
-    the pre-break rows the caller asked for are gone rather than returned.
+    The break at ``days[2]`` is measured against ``days[1]``, which is `start`
+    itself, and the pre-break row the caller explicitly asked for is dropped
+    rather than returned — the second assertion is the same read with the
+    detector off, and it is the row that goes missing.
     """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     days = _seed_series([1.0, 1.0, 10.0, 10.0, 10.0])
     assert reconcile.read_canonical(start=days[1])["ts"].to_list() == days[2:]
     assert reconcile.read_canonical(start=days[1], max_jump=None)["ts"].to_list() == days[1:]
+
+
+def test_a_break_strictly_before_start_leaves_the_window_intact(tmp_path, monkeypatch):
+    """Truncating to a break older than `start` is a no-op on the window.
+
+    Every row in ``start..end`` already sits on the post-break side, so "keep
+    the tail after the last break" and "keep the window" name the same rows.
+    This is what lets the scan be windowed instead of reading the symbol's whole
+    history: a break the window cannot see could not have changed the answer.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 10.0, 10.0, 10.0])  # break at days[2]
+    assert reconcile.read_canonical(start=days[3])["ts"].to_list() == days[3:]
+    assert reconcile.read_canonical(start=days[3], max_jump=None)["ts"].to_list() == days[3:]
+
+
+def test_a_break_whose_ratio_row_is_exactly_start_keeps_that_row(tmp_path, monkeypatch):
+    """The boundary case: the break lands on `start`, across a weekend.
+
+    ``mon``'s ratio is measured against ``fri`` — three calendar days back, and
+    outside any window that began at `start`. The break row is the first row of
+    the new regime, so it is kept: truncation and the window coincide here, and
+    the row the caller asked for on `start` must survive both.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    fri, mon, tue = dt.date(2024, 1, 5), dt.date(2024, 1, 8), dt.date(2024, 1, 9)
+    _seed_days([(fri, 1.0), (mon, 10.0), (tue, 10.0)])
+    assert reconcile.read_canonical(start=mon)["ts"].to_list() == [mon, tue]
+    assert reconcile.read_canonical(start=fri)["ts"].to_list() == [mon, tue]
+
+
+def test_the_break_detector_is_handed_the_close_before_start(tmp_path, monkeypatch):
+    """The window the scan reads is narrow, but never so narrow it blinds the detector.
+
+    Two properties in one frame, and both are load-bearing. The detector must
+    see the last close *before* `start` — otherwise the ratio at `start` is not
+    the ratio it would have on the full history, and the equivalence the
+    windowing rests on is an accident rather than an invariant. And it must not
+    see the symbol's whole history: reading it is the 36.6M-row load this
+    windowing exists to avoid.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    old = D - dt.timedelta(days=400)
+    fri, mon = dt.date(2024, 1, 5), dt.date(2024, 1, 8)
+    _seed_days([(old, 1.0), (fri, 1.0), (mon, 10.0)])
+
+    seen = {}
+    real = reconcile._drop_pre_break
+
+    def spy(df, max_jump):
+        seen["ts"] = df["ts"].to_list()
+        return real(df, max_jump)
+
+    monkeypatch.setattr(reconcile, "_drop_pre_break", spy)
+    reconcile.read_canonical(start=mon)
+    assert fri in seen["ts"], "the close before `start` must reach the detector"
+    assert old not in seen["ts"], "history older than the lookback must not be read"
 
 
 def test_a_break_after_end_does_not_truncate(tmp_path, monkeypatch):
