@@ -580,6 +580,68 @@ its whole length. The controls are the override list (hand-verified rows win ove
 the break detector (ruling 43), and this coverage measurement, which is re-run whenever the map's sources
 change.
 
+### 12.2 Sensitivity grid — universe composition and the two-source requirement (ruling 46)
+
+Report §11.7 named four hypotheses for the two open calibration limits. Each became one bounded experiment
+on the development window, all against `ex_price5`, all on the point-in-time map; the full record with
+95% confidence intervals is `docs/phase1/calibration-limits.md`, and every number below is a
+`replication.calibration` ledger event. The registered limits are the `base` rows.
+
+| Anomaly | Cell | `--min-adv` | `--min-sources` | ρ | n | mean ours | mean ref | level | Ledger event |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `Mom12m` | base | 1e6 | 2 | **0.9358** | 36 | +0.148% | +0.595% | **0.25×** | `ee541aa560e2464badc0771c066a171a` |
+| `Mom12m` | price-only screen | 0 | 2 | 0.8677 | 36 | **+0.541%** | +0.595% | **0.91×** | `4ee9c762671841f0a4618a1decbff107` |
+| `Mom12m` | single-source | 1e6 | 1 | 0.9430 | 47 | −0.460% | +0.052% | — | `2ca2576ca3874be78212470a61ad6347` |
+| `Mom12m` | price-only, single-source | 0 | 1 | 0.8444 | 47 | +0.462% | +0.052% | — | `3735d25380de4f94900bfbb370c98c55` |
+| `ShareIss1Y` | base | 1e6 | 2 | **0.7849** | 47 | +0.387% | +0.132% | **2.93×** | `54f25b2b487b4196a306eb480ee619db` |
+| `ShareIss1Y` | price-only screen | 0 | 2 | 0.6403 | 47 | +0.285% | +0.132% | 2.16× | `d931bfbd4e544fefa13f04dd170da731` |
+| `ShareIss1Y` | single-source | 1e6 | 1 | 0.8171 | 47 | +0.330% | +0.132% | 2.50× | `edaaa524429e4755990588c2c61c0069` |
+| `ShareIss1Y` | price-only, single-source | 0 | 1 | 0.6833 | 47 | +0.238% | +0.132% | 1.80× | `94cd39c14d2f42549719bf2675e5258e` |
+
+**Universe composition explains the momentum level.** Removing the ADV screen — which leaves the $5 price
+screen OSAP's `ex_price5` set uses — lifts `Mom12m`'s level from 0.25× to **0.91×** of the reference, inside
+the [0.5×, 1.5×] band, at ρ 0.868 [0.752, 0.932]. The illiquid tail our `ADV > $1M` screen drops is where
+the screened reference's momentum spread lives. It does the opposite for issuance (ρ falls to 0.640).
+**The gate is not re-scored on this.** Ruling 40's verdict stands; changing the screen to fit the reference is
+the failure mode §10 named, and whether the ADV screen belongs in the calibration panel is a decision for the
+user with both rows in front of them.
+
+**The two-source requirement is a sensitivity, not a limit.** `min_sources=1` re-admits the contamination
+ruling 30 removed and extends the overlap to 47 months (the single-source months of 2016 re-enter, and the
+reference mean over those months is +0.05%, not +0.60%); `Mom12m`'s ρ of 0.943 there comes with a **negative**
+mean. These rows describe a dirtier panel and stay under §10 b2's caveat: never a headline.
+
+### 12.3 Formation dates — closed
+
+`tools/t17/formation_dates.py` compares the month-ends `metrics._month_ends` forms on (the canonical union of
+dates, 2016-01..2020-01) with SPY's Alpaca sessions: **0 of 49 mismatched** (event
+`17354d8bfc4e4633bf88eae14a60781e`). Hypothesis 2 is closed; the residual difference from CRSP is the
+month-end *price*, which ρ 0.94 already bounds.
+
+### 12.4 The `ShareIss1Y` definition — audited, lagged, split-adjusted
+
+OSAP's `ShareIss1Y` (`Signals/pyCode/Predictors/ShareIss1Y.py`, copied to `data/raw/osap/`) is
+`(shrout·cfacshr)[t − 6 months] / (shrout·cfacshr)[t − 18 months] − 1` — Pontiff & Woodgate 2008, Table 3A:
+split-adjusted CRSP shares, both endpoints lagged six months, twelve months apart. Ours was the zero-lag
+twelve-month log change of as-filed `CommonStockSharesOutstanding` / `EntityCommonStockSharesOutstanding`.
+Log versus percentage change is rank-neutral; the two material differences were the lag and the split
+basis (977 splits on 829 symbols fall inside the development window, each reading as issuance under
+as-filed counts). Both are now in `issuance.signal` (`lag_days`, default 0; `split_adjust`, default on —
+decision D11) with `--no-split-adjust` reproducing ruling 40's definition exactly.
+
+| Cell | lag | split-adjusted | ρ | 95% CI | n | mean ours | level | Ledger event |
+|---|---:|---|---:|---|---:|---:|---:|---|
+| base (ruling 40's definition) | 0 | no | 0.7849 | [0.643, 0.875] | 47 | +0.387% | 2.93× | `54f25b2b487b4196a306eb480ee619db` |
+| lag 180 d | 180 | no | 0.7881 | [0.648, 0.877] | 47 | +0.247% | 1.87× | `10d69e9faadb406babd5657d83f56835` |
+| split-adjusted | 0 | yes | 0.7954 | [0.658, 0.881] | 47 | +0.672% | 5.10× | `fef23b3f836f4373a6263794527829c9` |
+| lag 180 d, split-adjusted (OSAP's definition) | 180 | yes | 0.7867 | [0.646, 0.876] | 47 | +0.301% | 2.28× | `f5d5865f74a148c1b8abcfff7266e152` |
+
+The lag moves the level toward the reference and leaves the shape alone; split adjustment lifts ρ by 0.011
+and widens our spread (the as-filed counts had put names that had just split — momentum winners — spuriously
+in the short leg). **With OSAP's own definition the shape gap survives (ρ 0.787).** It stays registered with no
+named cause; the remaining suspects are the ones the grid does not reach — the two-source panel's composition
+inside the $5 screen (§12.2's single-source row lifts ρ to 0.817) and CRSP's own share-count timing.
+
 ### 12.5 The 2019–2020 quarantine spike (ruling 47)
 
 §9 gap 6 held that no result may lean on 2019–2020 until §5's quarantine spike — 7.02% of bars in 2019 and
