@@ -97,3 +97,48 @@ def test_empty_frames_are_typed(root):
 def test_window_validates_days(root):
     with pytest.raises(ValueError):
         events.window(dt.date(2024, 1, 31), days=0)
+
+
+# NYSE's three standing 1:00 pm closes, 2016→. Ad-hoc full closures are not early closes.
+EARLY = [dt.date(2016, 11, 25), dt.date(2017, 7, 3), dt.date(2017, 11, 24), dt.date(2018, 7, 3), dt.date(2018, 11, 23),
+         dt.date(2018, 12, 24), dt.date(2019, 7, 3), dt.date(2019, 11, 29), dt.date(2019, 12, 24), dt.date(2020, 11, 27),
+         dt.date(2020, 12, 24), dt.date(2021, 11, 26), dt.date(2022, 11, 25), dt.date(2023, 7, 3), dt.date(2023, 11, 24),
+         dt.date(2024, 7, 3), dt.date(2024, 11, 29), dt.date(2024, 12, 24), dt.date(2025, 7, 3), dt.date(2025, 11, 28),
+         dt.date(2025, 12, 24)]
+NOT_EARLY = [dt.date(2020, 7, 3),    # Friday: observed Independence Day, closed
+             dt.date(2021, 12, 24),  # Friday: observed Christmas, closed
+             dt.date(2026, 7, 3),    # Friday: observed holiday, closed
+             dt.date(2016, 7, 3), dt.date(2022, 12, 24), dt.date(2016, 12, 24),   # weekends
+             dt.date(2024, 11, 22),  # the Friday BEFORE Thanksgiving week
+             dt.date(2024, 7, 2), dt.date(2024, 12, 23), dt.date(2024, 11, 28)]   # ordinary days / Thanksgiving itself
+
+
+@pytest.mark.parametrize("day", EARLY)
+def test_scheduled_early_closes(day):
+    assert events.early_close(day) is True
+
+
+@pytest.mark.parametrize("day", NOT_EARLY)
+def test_full_sessions_and_closures_are_not_early_closes(day):
+    assert events.early_close(day) is False
+
+
+def test_the_expression_and_the_predicate_agree_over_a_decade():
+    days = pl.date_range(dt.date(2016, 1, 1), dt.date(2026, 12, 31), "1d", eager=True)
+    vec = pl.DataFrame({"d": days}).select(events.early_close_expr(pl.col("d"))).to_series().to_list()
+    assert vec == [events.early_close(d) for d in days]
+    # 2016–2026 inclusive: one Friday-after-Thanksgiving a year = 11; July 3 on Mon–Thu in
+    # 2017, 2018, 2019, 2023, 2024, 2025 = 6; Dec 24 on Mon–Thu in 2018, 2019, 2020, 2024,
+    # 2025, 2026 (a Thursday) = 6. 11 + 6 + 6 = 23.
+    assert sum(vec) == 23
+
+
+def test_an_early_close_session_ends_the_knowable_day_at_one(root):
+    _subs(1, [("e1", "8-K", "2024-07-03", "2024-07-03T18:00:00.000Z", "8.01", "x.htm"),   # 14:00 EDT, an early close
+              ("e2", "8-K", "2024-07-03", "2024-07-03T16:59:00.000Z", "8.01", "y.htm"),   # 12:59 EDT, before that close
+              ("e3", "8-K", "2024-07-02", "2024-07-02T18:00:00.000Z", "8.01", "z.htm")])  # 14:00 EDT, a full session
+    f = events.eightk(dt.date(2024, 7, 2), dt.date(2024, 7, 3))
+    got = {r["accn"]: (r["after_close"], r["knowable_on"]) for r in f.iter_rows(named=True)}
+    assert got == {"e1": (True, dt.date(2024, 7, 4)),
+                   "e2": (False, dt.date(2024, 7, 3)),
+                   "e3": (False, dt.date(2024, 7, 2))}
