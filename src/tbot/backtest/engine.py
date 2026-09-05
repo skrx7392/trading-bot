@@ -82,9 +82,10 @@ mis-carries a recycled ticker on any day the old series happens to have a hole,
 and a hole is not rare — the quarantine rate is 2.4% of bars. So the last
 :data:`RENAME_OVERLAP` sessions on which both symbols printed, strictly before
 the process date, are compared on log returns and the rename is refused when any
-pair differs by more than :data:`RENAME_DRIFT` (:func:`_different_issuer`, which
-carries the measured separation and reads the untruncated warm-up frame so a
-rename in the run's opening sessions still has overlap to be judged on).
+pair differs by more than :data:`RENAME_DRIFT`. The measured separation between
+the two populations is in :data:`RENAME_DRIFT`'s own comment and in
+:func:`_different_issuer`, which reads the untruncated warm-up frame so a rename
+in the run's opening sessions still has overlap to be judged on.
 
 The thing this test replaced, recorded because it was measured: a gate on the
 *age* of the new symbol's series — carry only when `S'` had not been printing
@@ -432,25 +433,86 @@ class _Market:
         )
 
 
-def _closes_by_symbol(
-    frame: pl.DataFrame, symbols: set[str]
-) -> dict[str, dict[dt.date, float]]:
-    """``symbol -> {date: close}``, for `symbols` only, from a close frame.
+def _rename_closes(
+    frame: pl.DataFrame, renames: dict[str, list[tuple[dt.date, str]]]
+) -> dict[tuple[str, dt.date], dict[dt.date, float]]:
+    """``(symbol, process_date) -> {date: close}`` for what a rename is judged on.
 
-    Restricted to the symbols a name change actually names. A dense mapping of
-    the whole universe would be gigabytes for a handful of comparisons a run,
-    and the frame this reads is the untruncated warm-up panel, the widest one
-    the engine holds.
+    For each name change ``old -> new`` dated `on`, the last
+    :data:`RENAME_OVERLAP` sessions **strictly before** `on` on which *both*
+    symbols have a vetted close, and their closes under each name — exactly what
+    :func:`_different_issuer` reads and nothing else. Common sessions, not the
+    last sessions of each symbol: two names that trade on different days would
+    otherwise be compared over a smaller intersection than the rule specifies.
+
+    Bounded on purpose. `frame` is the untruncated warm-up slice — the whole
+    universe over the whole window, 37.8M rows and 562 MB on the real warehouse
+    — and a mapping of all 1,623 symbols the name-change table names costs 3.85M
+    Python dictionary entries and ~191 MB of resident memory for the life of a
+    run, to answer a handful of questions about six sessions each. What comes
+    back is a few dozen closes per rename; the frame is dropped on return.
+
+    The walk backwards from `on` stops at the later of the two series' first
+    bars, because no common session can precede it — so a pair that never
+    overlapped (`old` delisted years before `new` listed) costs O(1), not a walk
+    through both histories.
     """
-    if not symbols:
+    pairs = sorted(
+        {(old, new, on) for old, entries in renames.items() for on, new in entries}
+    )
+    if not pairs:
         return {}
-    out: dict[str, dict[dt.date, float]] = {}
-    for symbol, ts, close in (
+    symbols = {symbol for old, new, _ in pairs for symbol in (old, new)}
+    sub = (
         frame.filter(pl.col("symbol").is_in(list(symbols)))
         .select("symbol", "ts", "close")
-        .iter_rows()
-    ):
-        out.setdefault(symbol, {})[ts] = close
+        .sort(["symbol", "ts"])
+    )
+    if sub.height == 0:
+        return {}
+    # numpy, not python lists: 3.85M `datetime.date` objects are the very cost
+    # this function exists to avoid.
+    days = sub["ts"].to_numpy()
+    closes = sub["close"].to_numpy()
+    span: dict[str, tuple[int, int]] = {}
+    offset = 0
+    for symbol, length in sub.group_by("symbol", maintain_order=True).len().iter_rows():
+        span[symbol] = (offset, offset + length)
+        offset += length
+
+    out: dict[tuple[str, dt.date], dict[dt.date, float]] = {}
+    for old, new, on in pairs:
+        left, right = span.get(old), span.get(new)
+        if left is None or right is None:
+            continue  # one of the two has no vetted close at all: no evidence
+        lo_old, hi_old = left
+        lo_new, hi_new = right
+        cut = np.datetime64(on)
+        # The last row strictly before `on` in each span, then walk back in step.
+        i = lo_old + int(np.searchsorted(days[lo_old:hi_old], cut)) - 1
+        j = lo_new + int(np.searchsorted(days[lo_new:hi_new], cut)) - 1
+        floor = max(days[lo_old], days[lo_new])
+        old_seen: dict[dt.date, float] = {}
+        new_seen: dict[dt.date, float] = {}
+        while (
+            i >= lo_old
+            and j >= lo_new
+            and days[i] >= floor
+            and days[j] >= floor
+            and len(old_seen) < RENAME_OVERLAP
+        ):
+            if days[i] == days[j]:
+                when = days[i].astype("datetime64[D]").item()
+                old_seen[when] = float(closes[i])
+                new_seen[when] = float(closes[j])
+                i -= 1
+                j -= 1
+            elif days[i] > days[j]:
+                i -= 1
+            else:
+                j -= 1
+        out[(old, on)] = old_seen
+        out[(new, on)] = new_seen
     return out
 
 
@@ -479,6 +541,10 @@ def _different_issuer(
     Why *log returns* and not price levels: a split around the rename re-bases
     the surviving series (``ECA -> OVV``), and the levels then differ by the
     split ratio for two series that are the same company. Returns do not care.
+
+    Precondition: every close is finite and strictly positive, which
+    :func:`_market_frame` guarantees by filtering the canonical frame before
+    anything downstream sees it — so the logarithms below cannot fail.
 
     Point-in-time by construction: only sessions strictly before `on` are read,
     and `on` is a date the action table already carried on that day. The closes
@@ -680,11 +746,11 @@ def run(
             continue
         renames.setdefault(old, []).append((on, new))
     # Closes for the same-issuer test, read from the *untruncated* warm-up frame
-    # and only for the symbols a name change names; see :func:`_different_issuer`.
-    rename_closes = _closes_by_symbol(
-        warm_closes,
-        set(renames) | {new for pairs in renames.values() for _, new in pairs},
-    )
+    # and bounded to the sessions it compares; see :func:`_rename_closes`. The
+    # frame itself is dropped here: it is the whole universe over the whole
+    # window and nothing after this line reads it.
+    rename_closes = _rename_closes(warm_closes, renames)
+    del warm_closes
     mergers: dict[str, list[tuple[dt.date, str, float | None]]] = {}
     for row in actions.read_mergers().iter_rows(named=True):
         mergers.setdefault(row["symbol"], []).append(
@@ -727,7 +793,9 @@ def run(
                 for on, new in renames.get(symbol, ())
                 if seen_on <= on <= day
                 and not _different_issuer(
-                    rename_closes.get(symbol, {}), rename_closes.get(new, {}), on
+                    rename_closes.get((symbol, on), {}),
+                    rename_closes.get((new, on), {}),
+                    on,
                 )
             ]
             if not due:

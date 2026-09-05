@@ -771,6 +771,54 @@ def test_a_rename_with_too_little_overlap_to_judge_is_carried(tmp_path, monkeypa
     assert json.loads(events["payload"][0])["ts"] == on.isoformat()
     assert res.daily["equity"][-1] == pytest.approx(100_000.0 * 20.0 / 10.0, rel=1e-12)
 
+def test_the_rename_close_map_keeps_only_the_sessions_the_same_issuer_test_reads():
+    """The map the run carries is bounded; the frame it is built from is not.
+
+    The warm-up close slice is the whole universe over the whole window — 37.8M
+    rows on the real warehouse — and the same-issuer test reads at most
+    :data:`~tbot.backtest.engine.RENAME_OVERLAP` sessions per symbol per rename
+    out of it. Keeping any more than that in Python dictionaries costs hundreds
+    of megabytes for the lifetime of a run and buys nothing.
+
+    The *last common* sessions, not the last sessions of each: two series that
+    trade on different days would otherwise be compared over an intersection
+    smaller than the window, which is the one way a bounded map could change a
+    verdict.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    on = days[40]
+    every_day = pl.DataFrame(
+        {
+            "symbol": ["OLD"] * len(days) + ["NEW"] * len(days) + ["OTHER"] * len(days),
+            "ts": days * 3,
+            "close": [10.0 + i for i in range(len(days))] * 3,
+        },
+        schema={"symbol": pl.Utf8, "ts": pl.Date, "close": pl.Float64},
+    )
+    bounded = engine._rename_closes(every_day, {"OLD": [(on, "NEW")]})
+
+    assert set(bounded) == {("OLD", on), ("NEW", on)}          # OTHER is never touched
+    for (_, at), closes in bounded.items():
+        assert len(closes) <= engine.RENAME_OVERLAP
+        assert all(d < at for d in closes)                     # nothing on or after `on`
+    window = days[40 - engine.RENAME_OVERLAP:40]
+    assert sorted(bounded[("OLD", on)]) == window
+    assert sorted(bounded[("NEW", on)]) == window
+    # Twelve closes kept out of the frame's 3 x 130: the map does not grow with
+    # the panel, only with the number of renames.
+    assert sum(len(c) for c in bounded.values()) == 2 * engine.RENAME_OVERLAP
+
+    # NEW trades every other day: the window is the last six *common* sessions.
+    sparse = every_day.filter(
+        (pl.col("symbol") != "NEW") | pl.col("ts").is_in(days[::2])
+    )
+    bounded = engine._rename_closes(sparse, {"OLD": [(on, "NEW")]})
+    common = [d for d in days[:40] if d in set(days[::2])][-engine.RENAME_OVERLAP:]
+    assert sorted(bounded[("OLD", on)]) == common
+    assert sorted(bounded[("NEW", on)]) == common
+
+
+
 
 # --- tax year attribution -----------------------------------------------------------
 
