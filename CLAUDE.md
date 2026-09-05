@@ -69,6 +69,31 @@ holdouts, live trading (phase 3). "No edge found" is an accepted outcome. Read, 
   Manifests in `deploy/`. Nightly peak ≈ 2 GB; limit 4Gi.
 - Operator drivers for the gate runbook are in `tools/t17/` (see its README).
 
+## Where to start next (decided 2026-09-05)
+
+Phase 0 is merged; gate 0→1 is **open** until nightly runs 2–5 are green (Tue–Sat
+02:30 UTC, check `kubectl -n tbot get jobs` or the `job.nightly` ledger events on the
+PVC) and the user signs off on `docs/gate-0-1-report.md`. Do **not** wait for that to
+plan. Sequence:
+
+1. **Write the phase-1 plan now** (`docs/superpowers/plans/`, writing-plans skill). It
+   depends only on decisions already recorded (spec §10, rulings 26–41, report §11).
+2. **Execute the phase-1 hardening tasks while the runs accrue** — none depends on
+   search results, and the first one the nightly path would only reveal slowly:
+   - **Split re-basing.** The backfill is on one split-adjusted basis; after a new split
+     Alpaca re-adjusts history and the store does not, so the canonical series gets a
+     discontinuity at the split date (a 2:1 split is under the 5× break threshold and
+     reads as a −50% return). Fix: after each nightly run, re-pull history for every
+     symbol with a new row in `data/actions/splits`.
+   - Point-in-time ticker map (ruling 26; BBBY-style splices).
+   - `universe.build`: push `forms`/`filed_from`/`filed_to` into `edgar.read_filings`.
+   - 8-K event feature scaffolding (registered phase-1 hypothesis, ruling 41).
+   - Open calibration gaps to carry as registered limits, with the four hypotheses in
+     report §11: `ShareIss1Y` shape (ρ 0.785) and `Mom12m` level (0.29× of reference).
+3. **Start the edge search only after the gate closes** — registering hypotheses and
+   spending one-shot holdouts before the agreed checkpoint would make the ledger
+   dishonest. News-feed ingestion is a phase-2 (paper trading) item, not phase 1.
+
 ## Tracking
 
 - Notion: project page "Trading Bot" under Dev Projects; tasks in the shared Tasks DB
