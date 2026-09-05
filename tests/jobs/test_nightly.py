@@ -10,7 +10,10 @@ honest audit trail, so that is what these tests pin:
   the session it is ingesting);
 * the summary the operator reads at 02:30 distinguishes "the universe was
   empty" from "a normal run that found nothing", and a missing ticker map
-  fails the pod rather than quietly ingesting nothing.
+  fails the pod rather than quietly ingesting nothing;
+* after the vote, in this order: the trailing week of corporate actions, the
+  split re-base of every name that split in it, then ledger compaction — each
+  a collaborator with its own tests, faked here.
 
 Every vendor call is monkeypatched at the *module attribute*, which is what the
 job looks up at call time. Nothing here touches the network.
@@ -31,6 +34,10 @@ from tbot.jobs import nightly
 ASOF = dt.date(2026, 9, 1)
 DAY = dt.date(2026, 8, 31)
 RECON = {"ok": 5, "majority": 0, "quarantined": 0}
+ACTIONS = {"dividends": 3, "splits": 1, "name_changes": 0, "mergers": 0}
+REBASE = {"symbols": ["NVDA"], "alpaca_rows": 2500, "yf_rows": 9000,
+          "recon": {"ok": 9000, "majority": 0, "quarantined": 0}}
+COMPACT = {"days_compacted": 1, "files_removed": 40, "events_written": 40}
 
 
 # --- the contract, verbatim from the brief ------------------------------------------
@@ -45,6 +52,11 @@ def test_nightly_summary(tmp_path, monkeypatch):
                         lambda syms, s, e: calls.append(("yf", len(syms))) or 5)
     monkeypatch.setattr("tbot.warehouse.reconcile.run",
                         lambda s, e: {"ok": 5, "majority": 0, "quarantined": 0})
+    monkeypatch.setattr("tbot.warehouse.actions.ingest",
+                        lambda s, e, client=None, types=None: dict(ACTIONS))
+    monkeypatch.setattr("tbot.jobs.rebase.symbols_to_rebase", lambda day, lookback_days=7: ["NVDA"])
+    monkeypatch.setattr("tbot.jobs.rebase.rebase", lambda syms, end: dict(REBASE))
+    monkeypatch.setattr("tbot.ledger.compact", lambda before=None: dict(COMPACT))
     out = nightly.run(asof=dt.date(2026, 9, 1), symbols=["AAPL", "MSFT"])
     assert out["alpaca_rows"] == 5 and out["recon"]["ok"] == 5
     assert [c[0] for c in calls] == ["alpaca", "yf"]
@@ -75,6 +87,13 @@ def _wire(monkeypatch, calls, *, alpaca_rows=5, yf_rows=7, recon=None, universe_
     monkeypatch.setattr("tbot.warehouse.alpaca.ingest", _ingest("alpaca", alpaca_rows))
     monkeypatch.setattr("tbot.warehouse.yf.ingest", _ingest("yf", yf_rows))
     monkeypatch.setattr("tbot.warehouse.reconcile.run", _recon)
+    monkeypatch.setattr("tbot.warehouse.actions.ingest",
+                        lambda s, e, client=None, types=None: calls.append(("actions", None, s, e)) or dict(ACTIONS))
+    monkeypatch.setattr("tbot.jobs.rebase.symbols_to_rebase", lambda day, lookback_days=7: ["NVDA"])
+    monkeypatch.setattr("tbot.jobs.rebase.rebase",
+                        lambda syms, end: calls.append(("rebase", list(syms), end, end)) or dict(REBASE))
+    monkeypatch.setattr("tbot.ledger.compact",
+                        lambda before=None: calls.append(("compact", None, None, None)) or dict(COMPACT))
     if universe_df is not None:
         monkeypatch.setattr("tbot.warehouse.universe.build", _build)
     return calls
@@ -94,14 +113,26 @@ def test_reconcile_runs_after_both_ingests(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     calls = _wire(monkeypatch, [])
     nightly.run(asof=ASOF, symbols=["AAPL"])
-    assert [c[0] for c in calls] == ["alpaca", "yf", "reconcile"]
+    assert [c[0] for c in calls][:3] == ["alpaca", "yf", "reconcile"]
+
+
+def test_actions_rebase_and_compaction_follow_the_vote(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    calls = _wire(monkeypatch, [])
+    out = nightly.run(asof=ASOF, symbols=["AAPL"])
+    assert [c[0] for c in calls] == ["alpaca", "yf", "reconcile", "actions", "rebase", "compact"]
+    actions_call = calls[3]
+    assert actions_call[2] == DAY - dt.timedelta(days=7) and actions_call[3] == DAY
+    assert calls[4][1:] == (["NVDA"], DAY, DAY)
+    assert out["actions"] == ACTIONS and out["rebase"] == REBASE and out["ledger_compacted"] == COMPACT
+    assert json.loads(json.dumps(out)) == out
 
 
 def test_every_call_covers_the_single_day_before_asof(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     calls = _wire(monkeypatch, [])
     out = nightly.run(asof=ASOF, symbols=["AAPL"])
-    assert all((start, end) == (DAY, DAY) for _, _, start, end in calls)
+    assert all((start, end) == (DAY, DAY) for _, _, start, end in calls[:3])
     assert out["day"] == DAY.isoformat() and out["asof"] == ASOF.isoformat()
 
 
@@ -121,7 +152,7 @@ def test_asof_defaults_to_today(tmp_path, monkeypatch):
     # must not fail the suite.
     today = {before, dt.date.today()}
     assert out["asof"] in {d.isoformat() for d in today}
-    assert all(end in {d - dt.timedelta(days=1) for d in today} for _, _, _, end in calls)
+    assert all(end in {d - dt.timedelta(days=1) for d in today} for _, _, _, end in calls[:3])
 
 
 def test_summary_reports_each_vendors_row_count(tmp_path, monkeypatch):
@@ -170,7 +201,8 @@ def test_an_empty_universe_is_flagged_distinctly(tmp_path, monkeypatch):
     assert out["symbols"] == 0 and out["empty_universe"] is True
     assert out["symbol_source"] == "universe"
     # The vendors are still called, with nothing: they no-op without a request.
-    assert [c[0] for c in calls] == ["universe", "alpaca", "yf", "reconcile"]
+    assert [c[0] for c in calls] == ["universe", "alpaca", "yf", "reconcile",
+                                     "actions", "rebase", "compact"]
     assert [syms for _, syms, _, _ in calls[1:3]] == [[], []]
 
 
