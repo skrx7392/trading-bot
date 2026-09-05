@@ -245,3 +245,114 @@ def test_refresh_current_requires_a_user_agent(root, monkeypatch):
     monkeypatch.delenv("SEC_USER_AGENT", raising=False)
     with pytest.raises(RuntimeError):
         tickers.refresh_current(client=_Client({}))
+
+
+# --- build: the store's lineage as arbiter (fix round 1) ---------------------------
+# Both vendors key backfilled history by the company's *current* symbol, so a
+# rename into a series that predates the rename must not cut that series; a
+# series that starts at the rename is the after-the-fact regime, where the
+# inferred boundaries are exactly right. `_bars` writes alpaca bars, which is
+# the series `build` consults.
+
+CHAIN = [
+    {"old_symbol": "OSTK", "new_symbol": "BYON", "process_date": D(2023, 11, 6)},
+    {"old_symbol": "BYON", "new_symbol": "BBBY", "process_date": D(2025, 8, 29)},
+    {"old_symbol": "BBBY", "new_symbol": "NXH", "process_date": D(2026, 8, 17)},
+]
+
+
+def test_a_rename_into_a_lineage_keyed_series_keeps_the_open_start(root):
+    _current(root, [(1130713, "NXH")])
+    _renames(root, CHAIN)
+    _bars("NXH", [D(2016, 1, 4), D(2026, 9, 3)])          # the lineage, keyed under NXH
+    tickers.build()
+    # OSTK's inferred interval (open start .. 2023-11-05) is present as well: no
+    # other filer holds OSTK, so it is added — inert, since the store has no OSTK series.
+    assert tickers.ticker_map(D(2020, 1, 1)).rows() == [(1130713, "NXH"), (1130713, "OSTK")]
+    assert tickers.ticker_map(D(2026, 9, 1)).rows() == [(1130713, "NXH")]
+    bbby = tickers.intervals().filter(pl.col("symbol") == "BBBY")
+    assert bbby.select("cik", "valid_from", "valid_to").rows() == [
+        (1130713, D(2025, 8, 29), D(2026, 8, 16))]
+
+
+def test_a_rename_into_a_series_that_starts_at_the_rename_is_bounded(root):
+    _current(root, [(1130713, "NXH")])
+    _renames(root, CHAIN)
+    _bars("NXH", [D(2026, 8, 17), D(2026, 9, 3)])         # a fresh series at the rename
+    tickers.build()
+    assert tickers.ticker_map(D(2026, 1, 1)).filter(pl.col("symbol") == "NXH").height == 0
+    assert tickers.ticker_map(D(2026, 8, 17)).rows() == [(1130713, "NXH")]
+
+
+def test_the_other_holder_of_old_is_bounded_when_its_series_starts_at_the_rename(root):
+    _current(root, [(1, "X"), (2, "B")])
+    _renames(root, [{"old_symbol": "X", "new_symbol": "B", "process_date": D(2020, 1, 1)}])
+    _bars("X", [D(2020, 6, 1), D(2021, 1, 4)])            # cik 1's X begins after the rename
+    tickers.build()
+    assert tickers.ticker_map(D(2019, 6, 1)).rows() == [(2, "X")]
+    assert tickers.ticker_map(D(2020, 6, 1)).rows() == [(1, "X"), (2, "B")]
+    for day in (D(2019, 12, 31), D(2020, 1, 1)):          # never two holders of X on one day
+        assert tickers.ticker_map(day).filter(pl.col("symbol") == "X").height == 1
+
+
+def test_the_store_lineage_wins_over_an_inferred_old_interval(root):
+    _current(root, [(1, "X"), (2, "B")])
+    _renames(root, [{"old_symbol": "X", "new_symbol": "B", "process_date": D(2020, 1, 1)}])
+    _bars("X", [D(2016, 1, 4), D(2021, 1, 4)])            # X from 2016 is cik 1's lineage
+    tickers.build()
+    assert tickers.ticker_map(D(2019, 6, 1)).rows() == [(1, "X")]
+    assert tickers.ticker_map(D(2021, 1, 1)).rows() == [(1, "X"), (2, "B")]
+
+
+def test_a_rename_into_an_unowned_symbol_leaves_the_current_holder_of_old_alone_when_lineage(root):
+    _current(root, [(3, "OLD")])
+    _renames(root, [{"old_symbol": "OLD", "new_symbol": "NEW", "process_date": D(2018, 1, 1)}])
+    _bars("OLD", [D(2016, 1, 4), D(2019, 1, 4)])
+    tickers.build()
+    assert tickers.ticker_map(D(2017, 1, 1)).rows() == [(3, "OLD")]
+
+
+def test_a_rename_into_an_unowned_symbol_bounds_the_holder_of_old_when_its_series_starts_after(root):
+    _current(root, [(3, "OLD")])
+    _renames(root, [{"old_symbol": "OLD", "new_symbol": "NEW", "process_date": D(2018, 1, 1)}])
+    _bars("OLD", [D(2018, 6, 1), D(2019, 1, 4)])
+    tickers.build()
+    assert tickers.ticker_map(D(2017, 1, 1)).rows() == []
+    assert tickers.ticker_map(D(2018, 6, 1)).rows() == [(3, "OLD")]
+
+
+def test_a_relisted_merged_symbol_is_judged_by_its_bars_not_its_source(root):
+    _current(root, [(7, "T")])
+    _renames(root, [{"old_symbol": "S", "new_symbol": "T", "process_date": D(2022, 1, 1)}])
+    _mergers(root, [{"symbol": "S", "process_date": D(2018, 5, 1), "kind": "cash",
+                     "acquirer": None, "cash_rate": 10.0, "stock_rate": None}])
+    _bars("S", [D(2016, 1, 4), D(2021, 12, 31)])          # S prints for years after the deal
+    tickers.build()
+    assert tickers.ticker_map(D(2017, 1, 1)).rows() == []
+    assert tickers.ticker_map(D(2020, 1, 1)).rows() == [(7, "S")]
+    assert tickers.ticker_map(D(2022, 1, 1)).rows() == [(7, "T")]
+
+
+def test_a_dead_filer_in_the_current_map_is_not_matched_by_name(root):
+    _current(root, [(1, "LIVE")])
+    _entity(1, "Live Co")                                  # EDGAR: no tickers; the current map: LIVE
+    _assets(root, [("OLDL", "Live Co Common Stock")])
+    _bars("OLDL", [D(2018, 1, 2)])
+    assert tickers.build()["asset"] == 0
+
+
+def test_a_self_rename_is_ignored(root):
+    _current(root, [(1, "SAME")])
+    _renames(root, [{"old_symbol": "SAME", "new_symbol": "SAME", "process_date": D(2020, 1, 1)}])
+    counts = tickers.build()
+    assert counts["rename"] == 0 and counts["intervals"] == 1
+    assert tickers.ticker_map(D(2019, 1, 1)).rows() == [(1, "SAME")]
+
+
+def test_override_dates_must_be_iso(root, monkeypatch):
+    _current(root, [(2, "S")])
+    path = root / "overrides.csv"
+    path.write_text("cik,symbol,valid_from,valid_to,note\n1,S,,05/02/2023,us-style date\n")
+    monkeypatch.setattr(tickers, "OVERRIDES_PATH", path)
+    with pytest.raises(ValueError, match="unusable"):
+        tickers.build()

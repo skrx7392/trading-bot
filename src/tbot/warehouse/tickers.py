@@ -21,19 +21,39 @@ valid_to)``, inclusive, with a null end open. :func:`ticker_map` answers "on
     what makes chains resolve: by the time an older event is reached, the
     interval it must attach to has already been created by the newer one. The
     ``old`` interval has an open start — nothing in the data bounds it.
+    *Evidence gate:* the store decides which regime a rename is in. Both
+    vendors key *backfilled* history by the company's current symbol — its
+    lineage: ``NXH`` runs from 2016 at Overstock prices across three renames
+    and the store holds no ``OSTK``/``BYON``/``BBBY`` series at all — whereas
+    history the nightly ingests *after* a rename stops under ``old`` at
+    ``D - 1`` and starts under ``new`` at ``D``. So a boundary at ``D`` is
+    applied to a symbol only when its alpaca series is absent or begins within
+    :data:`RELIST_DAYS` before ``D``; a series that predates that is a lineage
+    and keeps its open start, and no ``old`` interval is inferred for the owner
+    when another filer holds ``old`` on ``D - 1`` and the ``old`` series is
+    that filer's lineage.
 ``merger``
     A merger of ``S`` on ``D`` (:func:`~tbot.warehouse.actions.read_mergers`)
-    closes the acquiree's interval at ``D - 1``. If ``S`` is still in the
-    current map *and* still printing bars more than :data:`RELIST_DAYS` after
-    ``D``, the current owner is a later re-listing and starts at ``D + 1``.
+    closes every interval of ``S`` covering ``D`` at ``D - 1``. *Evidence
+    gate:* judged by the bars, not by the interval's source — if ``S`` is still
+    printing more than :data:`RELIST_DAYS` after ``D`` the holder is a later
+    re-listing and starts at ``D + 1`` instead.
 ``asset``
     A filer with no current ticker whose name or former name, normalised,
     equals exactly one inactive Alpaca asset's name, normalised, owns that
     symbol from the start until its last Alpaca bar — provided no other
     interval covers that day. Exact match only; ambiguity is skipped.
+    *Evidence gate:* "no current ticker" means both an empty EDGAR ``tickers``
+    list and no entry in the current map.
 ``override``
     ``ticker_overrides.csv`` beside this module: hand-verified intervals that
-    win over everything they overlap (derived intervals are clipped).
+    win over everything they overlap (derived intervals are clipped). ISO
+    dates only; a row that cannot be an interval raises rather than parses.
+
+**Where the store's lineage and an inferred interval conflict, the lineage
+wins.** The map exists to attribute the series the store actually holds; a
+boundary the bars contradict would strip a renamed company's own history from
+the universe and every signal.
 
 **A symbol-day no interval covers has no CIK.** It leaves the universe and
 every fundamental signal. That is the deliberate direction: a missing
@@ -217,11 +237,13 @@ def refresh_current(client=None) -> int:
             client.close()
     if not isinstance(body, dict) or not body:
         raise ValueError("company_tickers.json must be a non-empty JSON object")
+    # The same skip rule as `current_map`: a blank ticker is not an entry.
     good = [
         e for e in body.values()
         if isinstance(e, dict)
         and _opt_cik(e.get("cik_str")) is not None
         and isinstance(e.get("ticker"), str)
+        and e["ticker"].strip()
     ]
     if not good:
         raise ValueError("company_tickers.json holds no usable (cik_str, ticker) entries")
@@ -290,47 +312,89 @@ def _covers(row: dict, day: dt.date) -> bool:
     )
 
 
-def _apply_renames(rows: list[dict], renames: pl.DataFrame) -> int:
+#: ``symbol -> (first_ts, last_ts)`` of its alpaca bars: the store's evidence.
+Spans = dict[str, tuple[dt.date, dt.date]]
+
+
+def _series_starts_at(symbol: str, on: dt.date, spans: Spans) -> bool:
+    """Whether a boundary at `on` agrees with the store's series for `symbol`.
+
+    True when the symbol has no alpaca series or its series begins no earlier
+    than :data:`RELIST_DAYS` before `on` — the after-the-fact regime, where the
+    vendor started a fresh series at the event. False means the series predates
+    the event: a lineage the vendor keyed under this symbol, which an inferred
+    boundary must not cut.
+    """
+    span = spans.get(symbol)
+    return span is None or span[0] >= on - dt.timedelta(days=RELIST_DAYS)
+
+
+def _apply_renames(rows: list[dict], renames: pl.DataFrame, spans: Spans) -> int:
     """Walk the renames newest first; returns the ``old``-symbol rows added.
 
-    Only a ``current`` or ``rename`` row can be the owner of ``new`` — an
-    ``asset`` or ``override`` row is never in play here because those sources
-    are applied afterwards. The secondary sort keys only make the walk
-    deterministic when two renames share a day.
+    For ``old -> new`` on ``D``, with the store as arbiter (see the module
+    docstring's evidence gate):
+
+    1. every interval holding ``new`` on ``D`` starts at ``D`` — unless the
+       ``new`` series is a lineage that predates the rename, in which case its
+       start is left alone;
+    2. each such owner gets ``(cik, old, .., D - 1)`` — unless another filer
+       holds ``old`` on ``D - 1`` and the ``old`` series is that filer's
+       lineage, in which case no interval is inferred for the owner;
+    3. any other filer holding ``old`` on ``D - 1`` starts at ``D`` — again only
+       when the ``old`` series is not a lineage.
+
+    A row covering ``D - 1`` necessarily starts before ``D``, so "start at
+    ``D``" is the ``max`` the rules describe. A self-rename is skipped. The
+    secondary sort keys only make the walk deterministic when two renames share
+    a day.
     """
     added = 0
     ordered = renames.sort(
         ["process_date", "old_symbol", "new_symbol"], descending=[True, False, False]
     )
     for old, new, on in ordered.select("old_symbol", "new_symbol", "process_date").iter_rows():
-        owners = [
+        if old == new:
+            continue
+        before = on - _ONE_DAY
+        owners = [r for r in rows if r["symbol"] == new and _covers(r, on)]
+        owner_ciks = {r["cik"] for r in owners}
+        others = [
             r for r in rows
-            if r["symbol"] == new and _covers(r, on) and r["source"] in ("current", "rename")
+            if r["symbol"] == old and r["cik"] not in owner_ciks and _covers(r, before)
         ]
+        new_bounded = _series_starts_at(new, on, spans)
+        old_bounded = _series_starts_at(old, on, spans)
         for owner in owners:
-            owner["valid_from"] = on
+            if new_bounded:
+                owner["valid_from"] = on
+            if others and not old_bounded:
+                continue  # the `old` series is the other holder's lineage
             rows.append({"cik": owner["cik"], "symbol": old, "valid_from": None,
-                         "valid_to": on - _ONE_DAY, "source": "rename"})
+                         "valid_to": before, "source": "rename"})
             added += 1
+        if old_bounded:
+            for r in others:
+                r["valid_from"] = on
     return added
 
 
-def _apply_mergers(rows: list[dict], mergers: pl.DataFrame, spans: dict[str, dt.date]) -> int:
-    """Close the acquiree at ``D - 1``, or start a re-listed current owner at ``D + 1``.
+def _apply_mergers(rows: list[dict], mergers: pl.DataFrame, spans: Spans) -> int:
+    """Close the acquiree at ``D - 1``, or start a re-listed holder at ``D + 1``.
 
+    Judged by the bars alone: an interval of ``S`` covering ``D`` whose series
+    still prints more than :data:`RELIST_DAYS` after ``D`` belongs to a
+    re-listing, whatever source produced the interval. A row covering ``D``
+    starts no later than ``D``, so ``D + 1`` is the ``max`` the rule describes.
     Returns the rows touched. A deal Alpaca reports in two merger buckets
     arrives twice; the second pass finds the interval already closed (or
     started) and no longer covering ``D``, so it is a no-op.
     """
     touched = 0
     for symbol, on in mergers.select("symbol", "process_date").iter_rows():
+        span = spans.get(symbol)
+        relisted = span is not None and span[1] > on + dt.timedelta(days=RELIST_DAYS)
         for r in [r for r in rows if r["symbol"] == symbol and _covers(r, on)]:
-            last = spans.get(symbol)
-            relisted = (
-                r["source"] == "current"
-                and last is not None
-                and last > on + dt.timedelta(days=RELIST_DAYS)
-            )
             if relisted:
                 r["valid_from"] = on + _ONE_DAY
             else:
@@ -362,17 +426,23 @@ def _apply_assets(
     rows: list[dict],
     entities: pl.DataFrame,
     assets: list[tuple[str, str]],
-    spans: dict[str, dt.date],
+    spans: Spans,
+    current_ciks: set[int],
 ) -> int:
     """Attribute inactive assets to dead filers by exact normalised name.
 
-    The index is built from filers with no current ticker only; a live filer
-    is already in the current map and must never pick up a second symbol by
-    name. A name that maps to more than one filer is ambiguous and skipped —
-    the wrong attribution is the failure this module exists to prevent.
+    The index is built from filers with no current ticker only — an empty
+    EDGAR ``tickers`` list *and* no entry in the current map, since the two
+    sources disagree about who is listed and either one saying "listed" is
+    enough. A live filer must never pick up a second symbol by name. A name
+    that maps to more than one filer is ambiguous and skipped — the wrong
+    attribution is the failure this module exists to prevent.
     """
     index: dict[str, set[int]] = {}
-    dead = entities.filter(pl.col("tickers").list.len().fill_null(0) == 0)
+    dead = entities.filter(
+        (pl.col("tickers").list.len().fill_null(0) == 0)
+        & ~pl.col("cik").is_in(pl.lit(sorted(current_ciks), dtype=pl.List(pl.Int64)))
+    )
     for row in dead.iter_rows(named=True):
         names = [row["name"], *[f["name"] for f in (row["former_names"] or [])]]
         for name in names:
@@ -384,7 +454,7 @@ def _apply_assets(
     added = 0
     for symbol, name in assets:
         ciks = index.get(normalise_name(name), set())
-        last = spans.get(symbol)
+        last = spans[symbol][1] if symbol in spans else None
         if len(ciks) != 1 or last is None:
             continue
         if any(r["symbol"] == symbol and _covers(r, last) for r in rows):
@@ -399,26 +469,37 @@ def _overrides() -> pl.DataFrame:
     """``ticker_overrides.csv`` in :data:`MAP_SCHEMA`; typed and empty without the file.
 
     The file is hand-written source, so a row that cannot be an interval — no
-    cik, no symbol, or an end before its start — is a bug and raises here
-    rather than becoming a silent gap in the map.
+    cik, no symbol, a date that is not ``YYYY-MM-DD``, or an end before its
+    start — is a bug and raises here rather than becoming a silent gap in the
+    map. An empty date cell is an open bound.
     """
     if not OVERRIDES_PATH.is_file():
         return pl.DataFrame(schema=MAP_SCHEMA)
-    df = pl.read_csv(
+
+    def day(col: str) -> pl.Expr:
+        return pl.col(col).str.strip_chars().str.to_date(format="%Y-%m-%d", strict=False)
+
+    def unparsed(col: str) -> pl.Expr:
+        text = pl.col(col).str.strip_chars()
+        return text.is_not_null() & (text != "") & day(col).is_null()
+
+    raw = pl.read_csv(
         OVERRIDES_PATH,
         schema_overrides={"cik": pl.Int64, "symbol": pl.Utf8,
                           "valid_from": pl.Utf8, "valid_to": pl.Utf8},
-    ).select(
+    )
+    df = raw.select(
         pl.col("cik"),
         pl.col("symbol").str.strip_chars().str.to_uppercase(),
-        pl.col("valid_from").str.strip_chars().str.to_date(strict=False),
-        pl.col("valid_to").str.strip_chars().str.to_date(strict=False),
+        day("valid_from").alias("valid_from"),
+        day("valid_to").alias("valid_to"),
         source=pl.lit("override", dtype=pl.Utf8),
     )
-    bad = df.filter(
+    bad = raw.filter(
         pl.col("cik").is_null() | (pl.col("cik") <= 0)
-        | pl.col("symbol").is_null() | (pl.col("symbol") == "")
-        | (pl.col("valid_from") > pl.col("valid_to")).fill_null(False)
+        | pl.col("symbol").is_null() | (pl.col("symbol").str.strip_chars() == "")
+        | unparsed("valid_from") | unparsed("valid_to")
+        | (day("valid_from") > day("valid_to")).fill_null(False)
     )
     if bad.height:
         raise ValueError(f"{OVERRIDES_PATH} holds {bad.height} unusable row(s): {bad.rows()}")
@@ -473,16 +554,23 @@ def build() -> dict:
     """
     rows = [{"cik": c, "symbol": s, "valid_from": None, "valid_to": None, "source": "current"}
             for c, s in current_map().iter_rows()]
-    spans = dict(store.symbol_spans(source="alpaca").select("symbol", "last_ts").iter_rows())
+    current_ciks = {r["cik"] for r in rows}
+    spans: Spans = {
+        sym: (first, last) for sym, first, last in store.symbol_spans(source="alpaca").iter_rows()
+    }
     counts = {"current": len(rows)}
-    counts["rename"] = _apply_renames(rows, actions.read_name_changes())
+    counts["rename"] = _apply_renames(rows, actions.read_name_changes(), spans)
     _apply_mergers(rows, actions.read_mergers(), spans)
-    counts["asset"] = _apply_assets(rows, edgar.read_entities(), _inactive_assets(), spans)
+    counts["asset"] = _apply_assets(
+        rows, edgar.read_entities(), _inactive_assets(), spans, current_ciks
+    )
     counts["override"] = _apply_overrides(rows)
     df = (
         pl.DataFrame(rows, schema=MAP_SCHEMA)
+        # A clip never empties an interval; a rename and a merger on the same
+        # day can, by starting a row at D and closing it at D - 1.
         .filter(pl.col("valid_from").is_null() | pl.col("valid_to").is_null()
-                | (pl.col("valid_from") <= pl.col("valid_to")))   # a clip can empty an interval
+                | (pl.col("valid_from") <= pl.col("valid_to")))
         .unique(maintain_order=True)
         .sort(["symbol", "valid_from", "cik"], nulls_last=False)
     )

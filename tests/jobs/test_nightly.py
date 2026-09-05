@@ -14,8 +14,8 @@ honest audit trail, so that is what these tests pin:
 * after the vote, in this order: the trailing week of corporate actions, the
   split re-base of every name that split in it, the point-in-time ticker map
   rebuild (SEC's current map refreshed first only when ``SEC_USER_AGENT`` is
-  set), then ledger compaction — each a collaborator with its own tests, faked
-  here.
+  set; a refresh that fails is logged and the night goes on), then ledger
+  compaction — each a collaborator with its own tests, faked here.
 
 Every vendor call is monkeypatched at the *module attribute*, which is what the
 job looks up at call time. Nothing here touches the network.
@@ -153,6 +153,27 @@ def test_tickers_are_rebuilt_without_a_refresh_when_no_user_agent_is_set(tmp_pat
     assert out["tickers"] == {"refreshed": False, **TICKERS}
     assert refreshes == []
     assert "tickers" in [c[0] for c in calls]
+
+
+def test_a_failed_refresh_does_not_fail_the_night(tmp_path, monkeypatch):
+    """SEC being down is a vendor outage, not a reason to lose the rebuild and the
+    compaction: the failure is logged, the summary says ``refreshed`` is False, and
+    the map is rebuilt from the file already on disk."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
+    calls = _wire(monkeypatch, [])
+
+    def _boom(client=None):
+        raise RuntimeError("sec is down")
+
+    monkeypatch.setattr("tbot.warehouse.tickers.refresh_current", _boom)
+    out = nightly.run(asof=ASOF, symbols=["AAPL"])
+    assert out["tickers"] == {"refreshed": False, **TICKERS}
+    assert [c[0] for c in calls][-2:] == ["tickers", "compact"]
+    assert ledger.read_events(nightly.EVENT_KIND).height == 1
+    failed = ledger.read_events(nightly.REFRESH_FAILED_KIND)
+    assert failed.height == 1
+    assert json.loads(failed["payload"][0]) == {"error": "RuntimeError: sec is down"}
 
 
 def test_every_call_covers_the_single_day_before_asof(tmp_path, monkeypatch):

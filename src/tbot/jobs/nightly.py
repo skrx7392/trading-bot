@@ -36,6 +36,12 @@ since SEC fair access requires one — the summary says whether it was), and
 compacts yesterday's ledger files. Each is a collaborator with its own tests;
 the nightly owns their order.
 
+A refresh of SEC's map that fails is the one collaborator error the run
+survives: it is logged as :data:`REFRESH_FAILED_KIND`, the summary reports
+``refreshed: false``, and the rebuild runs on the file already on disk — which
+is intact, because the refresh validates before it writes. Unlike a vendor
+price failure, an SEC outage costs the night nothing it needs.
+
 Three things are deliberately *not* special-cased:
 
 *A non-trading day.* ``asof - 1`` is often a holiday or a Saturday. The fetchers
@@ -75,6 +81,9 @@ from tbot.warehouse import actions, alpaca, reconcile, tickers, universe, yf
 
 #: Ledger event kind for the run summary.
 EVENT_KIND = "job.nightly"
+
+#: Logged, with the exception, when the SEC current-map refresh fails.
+REFRESH_FAILED_KIND = "fetch.sec.company_tickers.failed"
 
 
 def _as_symbols(value) -> list[str]:
@@ -123,10 +132,16 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
     rebased = rebase.rebase(rebase.symbols_to_rebase(day), day)
     # The point-in-time ticker map, from the renames and mergers just ingested.
     # SEC's current map is refreshed first only with a contact User-Agent to
-    # send; without one the rebuild runs on the file already on disk.
+    # send. A refresh that fails is logged and reported, not fatal: the rebuild
+    # and the compaction behind it run on the file already on disk, which the
+    # refresh cannot have damaged (it validates before it writes).
     refreshed = bool(os.environ.get(tickers.USER_AGENT_ENV, "").strip())
     if refreshed:
-        tickers.refresh_current()
+        try:
+            tickers.refresh_current()
+        except Exception as exc:
+            ledger.log_event(REFRESH_FAILED_KIND, {"error": f"{type(exc).__name__}: {exc}"})
+            refreshed = False
     rebuilt = {"refreshed": refreshed, **tickers.build()}
     # Yesterday's per-event files into one (ruling 27); today's are left alone.
     compacted = ledger.compact()
