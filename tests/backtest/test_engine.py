@@ -541,6 +541,56 @@ def test_a_rename_carries_the_position_without_a_trade(tmp_path, monkeypatch):
     assert res.daily["equity"][-1] == pytest.approx(100_000.0 * new[days[-1]] / old[days[1]], rel=1e-9)
 
 
+def test_a_self_rename_row_changes_nothing(tmp_path, monkeypatch):
+    """Alpaca files a company-name change with the ticker unchanged as a rename row.
+
+    The real table holds 211 rows with `old_symbol == new_symbol`. Carried as a
+    rename, such a row on a fill day would double the name's pending target —
+    here A/B is rebalanced into A/C, and a doubled A target sells B and buys A
+    to 100% instead of C — besides logging a spurious `engine.rename` event.
+    The run with the row must be identical to the run without it.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    _seed(tmp_path, monkeypatch, {
+        "A": {d: 50.0 for d in days},
+        "B": {d: 30.0 for d in days},
+        "C": {d: 20.0 * (1.003 ** i) for i, d in enumerate(days)},   # moves, so the book shows
+    })
+    switch = dt.date(2020, 3, 1)
+
+    def sig(asof):
+        order = ["A", "B", "C"] if asof < switch else ["A", "C", "B"]
+        return pl.DataFrame({"symbol": order, "score": [3.0, 2.0, 1.0]})
+
+    # A wide band: C's drift must not trim the book monthly, so the clean run is
+    # exactly four fills; the doubled target's 50-point moves would still trade.
+    strat = strategy.Strategy(name="swap", n_long=2, signal=sig, drift_band=0.3)
+    decision = max(d for d in days if (d.year, d.month) == (2020, 3))
+    fill = days[days.index(decision) + 1]
+
+    clean = engine.run(strat, days[0], days[-1], cost_model=FREE)
+    assert clean.trades == 4                                  # buy A, buy B; sell B, buy C
+    _name_change(tmp_path, "A", "A", fill)                    # the self-rename, dated on the fill day
+    with_row = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    assert ledger.read_events("engine.rename").height == 0
+    assert with_row.trades == clean.trades
+    assert with_row.daily["equity"].to_list() == clean.daily["equity"].to_list()
+
+
+def test_a_cash_merger_with_no_usable_rate_exits_at_the_last_close(tmp_path, monkeypatch):
+    """A vendor `cash_rate` of 0.0 is no rate: the exit falls back to the last close."""
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    a = {d: 20.0 for d in days[:40]}
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}})
+    _merger(tmp_path, "A", days[41], cash_rate=0.0)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
+    engine.run(strat, days[0], days[-1], cost_model=FREE)
+    payload = json.loads(ledger.read_events("engine.forced_liquidation")["payload"][0])
+    assert payload["reason"] == "merger_cash"
+    assert payload["price"] == 20.0 and payload["last_close"] == 20.0
+
+
 # --- tax year attribution -----------------------------------------------------------
 
 def _switch_signal(first, second, switch_on):

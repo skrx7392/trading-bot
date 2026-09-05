@@ -52,7 +52,8 @@ shares, the open tax lots (merged FIFO by purchase date with any `S'` already
 holds), the pending target and the last mark move to `S'` unchanged: nothing is
 traded, charged or realised, and the holding period runs through the rename as
 it does for tax purposes. This runs before the gap check, so a rename day is
-not a gap.
+not a gap. A name-change row whose two symbols are equal (Alpaca files a
+company-name change that way) is not a rename and is ignored.
 
 **A short gap is a hole, not a delisting.** A held symbol with no vetted close
 on `t` is held, marked at its last vetted close, for up to :data:`MAX_GAP_DAYS`
@@ -65,8 +66,9 @@ weights are measured against, but it cannot be traded until it prints again.
 
 **Exits.** The position is exited when (a) a merger event for `S` with a process
 date after the last vetted close and on or before `t` exists — at ``cash_rate``
-per share for a cash merger, else at the last vetted close (share conversion
-into the acquirer is not modelled; the event records the deal's kind) — or (b)
+per share for a cash merger with a positive rate, else at the last vetted close
+(share conversion into the acquirer is not modelled; the event records the
+deal's kind) — or (b)
 the gap exceeds :data:`MAX_GAP_DAYS`, at the last vetted close, multiplied by
 ``1 + DELIST_RETURN`` when that close is below ``DELIST_PRICE_FLOOR`` (the
 Shumway rule :mod:`~tbot.backtest.metrics` adopted under ruling 39), because a
@@ -525,6 +527,12 @@ def run(
     # readers return a typed empty frame when nothing has been ingested.
     renames: dict[str, list[tuple[dt.date, str]]] = {}
     for old, new, on in actions.read_name_changes().iter_rows():
+        if old == new:
+            # Alpaca files a company-name change with the ticker unchanged as a
+            # name_change row too (211 of them in the table). There is nothing
+            # to carry, and carrying it would double a pending target and reset
+            # the gap counter.
+            continue
         renames.setdefault(old, []).append((on, new))
     mergers: dict[str, list[tuple[dt.date, str, float | None]]] = {}
     for row in actions.read_mergers().iter_rows(named=True):
@@ -562,7 +570,8 @@ def run(
                 last[new] = mark
             gap_days.pop(symbol, None)
             if pending is not None and symbol in pending:
-                pending[new] = pending.get(new, 0.0) + pending.pop(symbol)
+                moved = pending.pop(symbol)
+                pending[new] = pending.get(new, 0.0) + moved
             ledger.log_event(
                 "engine.rename",
                 {
@@ -591,7 +600,10 @@ def run(
             if deal:
                 _, kind, cash_rate = min(deal, key=lambda m: (m[0], m[1]))
                 reason = f"merger_{kind}"
-                price = cash_rate if kind == "cash" and cash_rate is not None else close
+                # A missing or non-positive vendor rate is no rate: a cash exit
+                # at 0.0 would be a silent write-off, not a measurement.
+                priced = kind == "cash" and cash_rate is not None and cash_rate > 0.0
+                price = cash_rate if priced else close
             else:
                 reason = "gap_exceeded"
                 price = close * (1.0 + DELIST_RETURN) if close < DELIST_PRICE_FLOOR else close
