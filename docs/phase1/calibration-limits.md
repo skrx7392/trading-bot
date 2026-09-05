@@ -70,8 +70,9 @@ stays inside the registered limit.
 the same date."
 
 **Experiment.** `tools/t17/formation_dates.py` (read-only on the warehouse; one ledger event). It takes the
-union of dates in the two-source canonical panel over 2016-01-01..2020-01-31 — the exact panel
-`metrics.monthly_longshort` forms on — and runs `metrics._month_ends` over it, then does the same over SPY's
+union of dates in the two-source canonical panel over 2016-01-01..2020-01-31 — `reconcile.read_canonical`
+as `metrics.monthly_longshort` reads it, but without the harness's close-finiteness filter, which only
+drops rows and so cannot move a month-end — and runs `metrics._month_ends` over it, then does the same over SPY's
 Alpaca bars (1,027 sessions, 2016-01-04..2020-01-31) as the exchange calendar, and reports the symmetric
 difference. If any name in the panel prints on the true last session of a month, the two agree for that
 month.
@@ -100,7 +101,9 @@ small-cap tail both live anomalies live in."
 module attribute for the whole process, so the panel (`metrics.monthly_longshort`), momentum's price window
 (`momentum.signal`) and the universe screen (`universe.build`) all see the same setting — every canonical
 read in `src/` and `tools/` goes through that attribute; none from-imports it. The `src1` cells reintroduce
-exactly the single-source contamination ruling 30 removed, so report §10 b2's caveat applies verbatim:
+the single-source-prices half of what ruling 30 removed — not the vanished-delistings half, which describes
+the pre-2016 yfinance-only window b2 proposed; this 2016–2019 panel keeps Alpaca's delisted names — so
+report §10 b2's caveat applies to them in that half:
 
 > it reintroduces exactly the two defects tonight was spent removing — single-source prices and vanished
 > delistings. A pass on it is therefore weaker evidence than a pass on the four-year panel, and it must
@@ -129,12 +132,10 @@ the adjustment choice against OSAP's own code."
 are byte-for-byte what the `CrossSection` repository publishes under `Signals/Code/Predictors/` and
 `Signals/pyCode/Predictors/`).
 
-The Stata original, in full:
+The signal-construction lines of the Stata original (its DATA LOAD lines — a `merge` that pulls
+`shrout cfacshr` from `monthlyCRSP` onto the signal master table — and its SAVE call are omitted):
 
 ```stata
-use permno time_avail_m using "$pathDataIntermediate/SignalMasterTable", clear
-merge 1:1 permno time_avail_m using "$pathDataIntermediate/monthlyCRSP", keepusing(shrout cfacshr) nogenerate keep(match)
-
 gen temp = shrout*cfacshr
 gen ShareIss1Y = (l6.temp - l18.temp)/l18.temp
 label var ShareIss1Y "Share Issuance (1 year)"
@@ -153,18 +154,18 @@ df["time_lag18"] = df["time_avail_m"] - pd.DateOffset(months=18)
 df["ShareIss1Y"] = (df["l6_temp"] - df["l18_temp"]) / df["l18_temp"]
 ```
 
-and both carry the note: *"We tried constructing the share adjustment from facshr as described in Pontiff
+and the `.py` header carries the note (the `.do` file states the same in other words, beside its
+commented-out `facshr` variant): *"We tried constructing the share adjustment from facshr as described in Pontiff
 and Woodgate (2008). Results are almost identical. So we stick with the simpler implementation by using
 cfacshr directly. Note that the signal does not suffer from look-ahead bias despite using cfacshr, see
-https://github.com/OpenSourceAP/CrossSection/issues/152#issue-2462197349"* (the commented-out `facshr`
-variant is in the `.do` file).
+https://github.com/OpenSourceAP/CrossSection/issues/152#issue-2462197349"*.
 
 So the reference, precisely:
 
 | | OSAP `ShareIss1Y` | Ours (`tbot.replication.issuance`) |
 |---|---|---|
 | Share count | CRSP monthly `shrout` (shares outstanding) | XBRL `CommonStockSharesOutstanding` (us-gaap), falling back **per filer** to `EntityCommonStockSharesOutstanding` (dei); the same tag must pair both endpoints |
-| Adjustment | × `cfacshr` (CRSP cumulative share factor → split-adjusted); the `facshr`-built factor gives "almost identical" results | **none — counts are as filed.** Nothing in `issuance.py` or `edgar.py` applies `data/actions/splits`; a forward split between the endpoints reads as issuance of the split ratio, a reverse split as retirement (see the concern below) |
+| Adjustment | × `cfacshr` (CRSP cumulative share factor → split-adjusted); the `facshr`-built factor gives "almost identical" results | **as filed under ruling 40** (`split_adjust=False`, `--no-split-adjust`): a forward split between the endpoints read as issuance of the split ratio, a reverse split as retirement. **Split-adjusted by default since ruling D11** (`split_adjust=True`): the year-ago count × Π `new_rate/old_rate` over the symbol's splits with `filed_then < ex_date <= filed` — see "Split adjustment (fifth experiment)" below |
 | Horizon | 12 months: `t − 18 m` to `t − 6 m` | 12 months: `asof − lag − 365 d` to `asof − lag` |
 | **Lag** | **both endpoints 6 months behind the formation date** (`l6` against `l18`; `DateOffset(months=6/18)`) | **0 by default** (`LAG_DAYS = 0`); `lag_days=180` reproduces OSAP's alignment |
 | Form | percentage change `(l6 − l18) / l18` | `−log(shares(asof − lag) / shares(asof − lag − 365 d))` |
@@ -172,7 +173,7 @@ So the reference, precisely:
 | Sign | higher = more issuance (OSAP's long leg is the *low* decile) | higher = more retirement (this package's "higher is better"); the harness's long-short sign convention already accounts for it |
 
 **Finding.** Log versus percentage change is a monotone transform of the same ratio, so decile membership
-is identical and that difference cannot move ρ. **The material definitional difference is the six-month
+is identical after the sign reversal the Sign row states, and that difference cannot move ρ. **The material definitional difference is the six-month
 lag**: OSAP scores at month `t` the issuance of the year ending six months earlier; we score the year ending
 at the formation date. On a signal whose reference pays +0.13 %/mo, a six-month misalignment of every
 score is a plausible shape (ρ) mechanism.
@@ -183,7 +184,9 @@ score is a plausible shape (ρ) mechanism.
 read on `asof`, so the symbol that trades on the formation date carries the score (a filer renamed inside
 the lag window scores under its new name). A negative or non-int lag raises `ValueError`. **`LAG_DAYS`
 stays 0**: the calibration that established ruling 40 was made on the unlagged read and must stay
-reproducible; the lagged read is a sensitivity cell. Mutation check: lagging only one endpoint scores the
+reproducible; the lagged read is a sensitivity cell. `lag_days=180` approximates OSAP's
+`DateOffset(months=6)` (≈ 182.6 days on average); with quarterly filings and monthly formation the
+difference is immaterial. Mutation check: lagging only one endpoint scores the
 two-year change and fails the equality test.
 
 | Cell | Flags | ρ | 95% CI | n | mean ours | mean ref | level | Ledger event |
@@ -193,34 +196,65 @@ two-year change and fails the equality test.
 **Verdict.** _(controller fills in after the grid runs)_ — moved the shape limit / did not, against
 `ShareIss1Y:ex_price5:base`.
 
-**Concern recorded by the audit, outside this task's scope.** Report §11.7 and the plan describe our counts
-as "split-adjusted shares outstanding"; the code does not adjust them. Under the lag cell that difference
-is untested: a name that splits 2:1 inside its twelve-month window scores `−log 2 = −0.69` — deep in the
-short leg — for every formation date the split sits inside, and a reverse split (common in the distressed
-tail) scores as a large buyback in the long leg. The exposure is not small: `actions.read_splits` holds
-**977 splits on 829 symbols with ex-dates inside 2016-01..2019-12** (281 / 248 / 223 / 225 by year), before
-any universe screen, and each one contaminates twelve formation months. Whether that is a fifth experiment
-(re-base the filed counts with the split factors at the two endpoints) is a controller/ruling-46 decision;
-it is **not** implemented here.
+#### Split adjustment (fifth experiment — ruling D11)
+
+**What the audit found.** Report §11.7 and the plan describe our counts as "split-adjusted shares
+outstanding"; under ruling 40 the code did not adjust them. A name that splits 2:1 inside its twelve-month
+window scored `−log 2 = −0.69` — deep in the short leg — for every formation date the split sat inside, and
+a reverse split (common in the distressed tail) scored as a large buyback in the long leg. The exposure is
+not small: `actions.read_splits` holds **977 splits on 829 symbols with ex-dates inside 2016-01..2019-12**
+(281 / 248 / 223 / 225 by year), before any universe screen, and each one contaminates twelve formation
+months. The controller ruled it the fifth experiment and made the adjustment the signal's definition.
+
+**Mechanism** (`issuance.signal(asof, lag_days=LAG_DAYS, split_adjust=True)`; `issuance._split_factor`;
+tests under "issuance: split adjustment" in `tests/replication/test_signals_price.py`). `_counts` and
+`_pairs` now carry each count's `filed` date. After the join with the ticker map read at `asof`, each
+`(cik, symbol)` row's year-ago count is multiplied by Π `new_rate / old_rate` over the splits of *that
+symbol* (`actions.read_splits`) whose `ex_date` is strictly after the year-ago count's filing date and at or
+before the current count's — the splits the current count already reflects and the year-ago count does
+not. Point-in-time holds because `ex_date <= filed <= asof − lag`. A symbol with no such split has factor
+1.0; a filer with two share classes uses each symbol's own splits for that symbol's row; non-positive or
+non-finite rates are skipped. The window is keyed by filing date rather than period end because the filing
+date is what `pit_facts` knows — a split between a period end and its filing date is a bounded imprecision
+of at most one filing lag. `split_adjust=False` (`calib_one.py --no-split-adjust`) reproduces ruling 40's
+as-filed numbers exactly. Mutation check: relaxing the strict `>` on `filed_then` to `>=` fails the
+on-the-filing-date case of the window test.
+
+**Cells.** After this change a `ShareIss1Y` run without `--no-split-adjust` is split-adjusted, so the cell
+that reproduces ruling 40 is the *flagged* one; the `cell` echo on every `CALIB_DONE` line carries
+`split_adjust` so each ledger cell's definition is unambiguous. The flags compose: a lagged, adjusted read is
+`--lag-days 180` alone.
+
+| Cell | Flags | ρ | 95% CI | n | mean ours | mean ref | level | Ledger event |
+|---|---|---:|---|---:|---:|---:|---:|---|
+| `ShareIss1Y:ex_price5:nosplit` | `--no-split-adjust` (ruling 40's definition) | _(controller fills in after the grid runs)_ | | | | | | |
+| `ShareIss1Y:ex_price5:split` | defaults (split-adjusted) | _(controller fills in after the grid runs)_ | | | | | | |
+
+**Verdict.** _(controller fills in after the grid runs)_ — moved the shape limit / did not, `split` against
+`nosplit` on the same panel.
 
 ---
 
 ## 3. The grid at a glance
 
-Nine cells, all `ex_price5`, all on the PIT map, all 2016-01..2019-12. Eight from the 2×2 of hypotheses
-1 and 3 for each live anomaly, plus the lag cell for hypothesis 4.
+Eleven cells, all `ex_price5`, all on the PIT map, all 2016-01..2019-12. Eight from the 2×2 of
+hypotheses 1 and 3 for each live anomaly, the lag cell for hypothesis 4, and the two split-definition cells
+for the fifth experiment. The `split_adjust` column records which definition a `ShareIss1Y` cell was run
+under (the ledger cannot tell them apart by label alone; the `CALIB_DONE` `cell` echo can).
 
-| # | Cell label | `--min-adv` | `--min-sources` | `--lag-days` | ρ | level | Moved? | Ledger event |
-|---:|---|---:|---:|---:|---:|---:|---|---|
-| 1 | `Mom12m:ex_price5:base` | 1e6 | 2 | — | _(controller fills in after the grid runs)_ | | | |
-| 2 | `Mom12m:ex_price5:adv0` | 0 | 2 | — | _(controller fills in after the grid runs)_ | | | |
-| 3 | `Mom12m:ex_price5:src1` | 1e6 | 1 | — | _(controller fills in after the grid runs)_ | | | |
-| 4 | `Mom12m:ex_price5:adv0src1` | 0 | 1 | — | _(controller fills in after the grid runs)_ | | | |
-| 5 | `ShareIss1Y:ex_price5:base` | 1e6 | 2 | 0 | _(controller fills in after the grid runs)_ | | | |
-| 6 | `ShareIss1Y:ex_price5:adv0` | 0 | 2 | 0 | _(controller fills in after the grid runs)_ | | | |
-| 7 | `ShareIss1Y:ex_price5:src1` | 1e6 | 1 | 0 | _(controller fills in after the grid runs)_ | | | |
-| 8 | `ShareIss1Y:ex_price5:adv0src1` | 0 | 1 | 0 | _(controller fills in after the grid runs)_ | | | |
-| 9 | `ShareIss1Y:ex_price5:lag` | 1e6 | 2 | 180 | _(controller fills in after the grid runs)_ | | | |
+| # | Cell label | `--min-adv` | `--min-sources` | `--lag-days` | `split_adjust` | ρ | level | Moved? | Ledger event |
+|---:|---|---:|---:|---:|---|---:|---:|---|---|
+| 1 | `Mom12m:ex_price5:base` | 1e6 | 2 | — | — | _(controller fills in after the grid runs)_ | | | |
+| 2 | `Mom12m:ex_price5:adv0` | 0 | 2 | — | — | _(controller fills in after the grid runs)_ | | | |
+| 3 | `Mom12m:ex_price5:src1` | 1e6 | 1 | — | — | _(controller fills in after the grid runs)_ | | | |
+| 4 | `Mom12m:ex_price5:adv0src1` | 0 | 1 | — | — | _(controller fills in after the grid runs)_ | | | |
+| 5 | `ShareIss1Y:ex_price5:base` | 1e6 | 2 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
+| 6 | `ShareIss1Y:ex_price5:adv0` | 0 | 2 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
+| 7 | `ShareIss1Y:ex_price5:src1` | 1e6 | 1 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
+| 8 | `ShareIss1Y:ex_price5:adv0src1` | 0 | 1 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
+| 9 | `ShareIss1Y:ex_price5:lag` | 1e6 | 2 | 180 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
+| 10 | `ShareIss1Y:ex_price5:nosplit` | 1e6 | 2 | 0 | false | _(controller fills in after the grid runs)_ | | | |
+| 11 | `ShareIss1Y:ex_price5:split` | 1e6 | 2 | 0 | true | _(controller fills in after the grid runs)_ | | | |
 
 Hypothesis 2 has no cell: it closed on the diagnostic (`17354d8bfc4e4633bf88eae14a60781e`).
 
@@ -228,8 +262,8 @@ Hypothesis 2 has no cell: it closed on the diagnostic (`17354d8bfc4e4633bf88eae1
 
 ## 4. Ruling 46 and the `calibration.limits` event
 
-_(controller fills in after the grid runs)_ — the limits as registered (§1), what each hypothesis did
-(§2), the `calibration.limits` ledger event id, and the eight-plus-one grid event ids.
+_(controller fills in after the grid runs)_ — the limits as registered (§1), what each hypothesis and the
+fifth experiment did (§2), the `calibration.limits` ledger event id, and the grid event ids.
 
 The standing statement, which holds whatever the cells say: **the gate verdict is not re-scored here.**
 A cell that moves a live anomaly inside the band is a measurement, not a new calibration. Changing the
@@ -244,14 +278,20 @@ them.
 ```bash
 # hypotheses 1 and 3 — the 2×2 grid per live anomaly (minutes each; ruling 40's timing)
 for a in Mom12m ShareIss1Y; do
-  uv run python -B tools/t17/calib_one.py $a ex_price5 --label $a:ex_price5:base                              > data/raw/calib6_${a}_base.log 2>&1
-  uv run python -B tools/t17/calib_one.py $a ex_price5 --min-adv 0 --label $a:ex_price5:adv0                 > data/raw/calib6_${a}_adv0.log 2>&1
-  uv run python -B tools/t17/calib_one.py $a ex_price5 --min-sources 1 --label $a:ex_price5:src1             > data/raw/calib6_${a}_src1.log 2>&1
-  uv run python -B tools/t17/calib_one.py $a ex_price5 --min-adv 0 --min-sources 1 --label $a:ex_price5:adv0src1 > data/raw/calib6_${a}_adv0src1.log 2>&1
+  uv run python -B tools/t17/calib_one.py $a ex_price5 --label ${a}:ex_price5:base                              > data/raw/calib6_${a}_base.log 2>&1
+  uv run python -B tools/t17/calib_one.py $a ex_price5 --min-adv 0 --label ${a}:ex_price5:adv0                 > data/raw/calib6_${a}_adv0.log 2>&1
+  uv run python -B tools/t17/calib_one.py $a ex_price5 --min-sources 1 --label ${a}:ex_price5:src1             > data/raw/calib6_${a}_src1.log 2>&1
+  uv run python -B tools/t17/calib_one.py $a ex_price5 --min-adv 0 --min-sources 1 --label ${a}:ex_price5:adv0src1 > data/raw/calib6_${a}_adv0src1.log 2>&1
 done
 # hypothesis 4 — the lagged definition
 uv run python -B tools/t17/calib_one.py ShareIss1Y ex_price5 --lag-days 180 --label ShareIss1Y:ex_price5:lag > data/raw/calib6_ShareIss1Y_lag.log 2>&1
+# fifth experiment — ruling 40's as-filed counts against the split-adjusted definition
+uv run python -B tools/t17/calib_one.py ShareIss1Y ex_price5 --no-split-adjust --label ShareIss1Y:ex_price5:nosplit > data/raw/calib6_ShareIss1Y_nosplit.log 2>&1
+uv run python -B tools/t17/calib_one.py ShareIss1Y ex_price5 --label ShareIss1Y:ex_price5:split                     > data/raw/calib6_ShareIss1Y_split.log 2>&1
 grep -h CALIB_DONE data/raw/calib6_*.log
+# The labels are written `${a}` on purpose: zsh parses `$a:e` as the `:e` (extension) modifier and
+# turns `$a:ex_price5:base` into `x_price5:base` for every anomaly, collapsing the two anomalies'
+# cells onto one label that cannot tell Mom12m from ShareIss1Y.
 # hypothesis 2 — formation dates (read-only; one diagnosis.formation_dates event)
 uv run python -B tools/t17/formation_dates.py
 ```

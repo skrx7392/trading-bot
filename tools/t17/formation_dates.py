@@ -8,8 +8,6 @@ using SPY's Alpaca bars as the exchange calendar.
 import datetime as dt
 import json
 
-import polars as pl
-
 from tbot import ledger
 from tbot.backtest import metrics
 from tbot.warehouse import reconcile, store

@@ -2,7 +2,7 @@
 
 Usage: python -B calib_one.py <Mom12m|EarningsSurprise|Accruals|ShareIss1Y> [reference]
                               [--min-price 5.0] [--min-adv 1e6] [--min-sources 2]
-                              [--lag-days 0] [--label LABEL]
+                              [--lag-days 0] [--no-split-adjust] [--label LABEL]
 
 `reference` selects the OSAP portfolio set: omitted = deciles_ew (data/raw/osap/<name>.csv),
 otherwise data/raw/osap/<name>_<reference>.csv (e.g. ex_price5, ex_nyse_p20_me).
@@ -12,7 +12,9 @@ results live in docs/phase1/calibration-limits.md). With every flag at its defau
 the one that established ruling 40. `--label` names the cell in the `replication.calibration`
 ledger event, e.g. `Mom12m:ex_price5:adv0`; the flags themselves are echoed on the CALIB_DONE
 line. `--min-sources 1` admits single-source closes — a sensitivity, never a headline
-(report §10 b2). `--lag-days` applies to ShareIss1Y only (OSAP's l6/l18 alignment is 180).
+(report §10 b2). `--lag-days` and `--no-split-adjust` apply to ShareIss1Y only: the lag is OSAP's
+l6/l18 alignment (180); `--no-split-adjust` reads the year-ago count as filed instead of on the
+current count's split basis, which is ruling 40's definition (ruling D11 made the adjustment the default).
 """
 import argparse
 import datetime as dt
@@ -52,18 +54,22 @@ parser.add_argument("--min-sources", type=int, default=reconcile.DEFAULT_MIN_SOU
 parser.add_argument("--lag-days", type=int, default=issuance.LAG_DAYS,
                     help="ShareIss1Y only: move both share-count endpoints back this many "
                          f"calendar days (default {issuance.LAG_DAYS})")
+parser.add_argument("--no-split-adjust", dest="split_adjust", action="store_false",
+                    help="ShareIss1Y only: read the year-ago count as filed, not on the current "
+                         "count's split basis (ruling 40's definition; default: adjust)")
 parser.add_argument("--label", default=None,
                     help="cell name for the ledger event (default <anomaly>[:<reference>])")
 args = parser.parse_args()
-if args.lag_days != issuance.LAG_DAYS and args.anomaly != "ShareIss1Y":
-    parser.error("--lag-days applies to ShareIss1Y only")
+if args.anomaly != "ShareIss1Y" and (args.lag_days != issuance.LAG_DAYS or not args.split_adjust):
+    parser.error("--lag-days and --no-split-adjust apply to ShareIss1Y only")
 
 name, reference = args.anomaly, args.reference
 csv_name = f"{name}_{reference}.csv" if reference else f"{name}.csv"
 label = args.label or (f"{name}:{reference}" if reference else name)
 _sig = SIGNALS[name]
 if name == "ShareIss1Y":
-    _sig = functools.partial(issuance.signal, lag_days=args.lag_days)
+    _sig = functools.partial(issuance.signal, lag_days=args.lag_days,
+                             split_adjust=args.split_adjust)
 
 if args.min_sources != reconcile.DEFAULT_MIN_SOURCES:
     # Operator-level sensitivity switch: every canonical read in this process —
@@ -98,6 +104,7 @@ rep = calibrate.run(
     config.data_root() / "raw" / "osap" / csv_name,
     dt.date(2016, 1, 1), dt.date(2020, 1, 31),
 )
-cell = {k: getattr(args, k) for k in ("min_price", "min_adv", "min_sources", "lag_days")}
+cell = {k: getattr(args, k)
+        for k in ("min_price", "min_adv", "min_sources", "lag_days", "split_adjust")}
 print("CALIB_DONE", json.dumps({**rep, "elapsed_s": round(time.time() - t), "cell": cell}),
       flush=True)

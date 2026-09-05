@@ -46,14 +46,30 @@ for, so a delinquent filer drops out instead of scoring.
 ``(temp[t-6m] - temp[t-18m]) / temp[t-18m]`` with ``temp = shrout * cfacshr`` on
 CRSP monthly data: the same twelve-month horizon, but *both* endpoints six
 months behind the formation date, and a percentage change rather than a log
-(a monotone transform of the same ratio, so decile membership is identical).
-The `lag_days` argument to :func:`signal` reproduces that alignment. It moves
-both counts back together, so the horizon stays one year, while the ticker map
-is still read on `asof` — today's names carry yesterday's counts, because the
-symbol that trades on the formation date is the one that gets the score.
+(a monotone transform of the same ratio, so decile membership is identical up
+to the sign convention above). The `lag_days` argument to :func:`signal`
+reproduces that alignment. It moves both counts back together, so the horizon
+stays one year, while the ticker map is still read on `asof` — today's names
+carry yesterday's counts, because the symbol that trades on the formation date
+is the one that gets the score.
 :data:`LAG_DAYS` stays ``0``: the calibration that established ruling 40 was
 run unlagged and must stay reproducible, so the lagged read is a registered
 sensitivity cell (``docs/phase1/calibration-limits.md``), not the default.
+
+**The two counts must be on one split basis.** OSAP's ``shrout * cfacshr`` is
+split-adjusted; a filed count is not, so a 2:1 split between the two filings
+reads as 100% issuance and a reverse split as a buyback, and 977 splits on 829
+symbols fall inside the 2016–2019 development window alone. With
+``split_adjust`` (the default) the year-ago count is put on the current count's
+basis: it is multiplied by ``new_rate / old_rate`` over every split of the
+row's symbol whose ex-date is strictly after the year-ago count's *filing*
+date and at or before the current count's. That window is point-in-time
+(``ex_date <= filed <= asof``), and it is keyed by filing date rather than
+period end because the filing date is what :func:`tbot.warehouse.edgar.pit_facts`
+knows; a split that falls between a period end and its filing date is a
+bounded imprecision of at most one filing lag. This is the definition, not a
+tuning knob (ruling D11): the adjustment is on by default, and
+``split_adjust=False`` reproduces ruling 40's unadjusted numbers exactly.
 """
 
 import datetime as dt
@@ -62,7 +78,7 @@ import polars as pl
 
 from tbot._dates import as_date
 from tbot.replication import _finalise
-from tbot.warehouse import edgar, tickers
+from tbot.warehouse import actions, edgar, tickers
 
 #: Preference order. The dei cover-page count is the fallback because it is a
 #: cover-page disclosure (as-of the filing date, not the period end) and the
@@ -88,12 +104,19 @@ MAX_FACT_AGE_DAYS = 400
 #: sensitivity cell (``tools/t17/calib_one.py --lag-days 180``).
 LAG_DAYS = 0
 
-#: The frame `_pairs` returns: one row per filer with both ends of the year.
-_PAIR_SCHEMA = pl.Schema({"cik": pl.Int64, "val": pl.Float64, "val_then": pl.Float64})
+#: The frame `_pairs` returns: one row per filer with both ends of the year and
+#: the filing date each count came from (the split-adjustment window's bounds).
+_PAIR_SCHEMA = pl.Schema({
+    "cik": pl.Int64,
+    "val": pl.Float64,
+    "val_then": pl.Float64,
+    "filed": pl.Date,
+    "filed_then": pl.Date,
+})
 
 
 def _counts(tag: str, asof: dt.date) -> pl.DataFrame:
-    """The usable `tag` count each filer had on file at `asof`, as ``cik, val``.
+    """The usable `tag` count each filer had on file at `asof`, as ``cik, val, filed``.
 
     Non-positive and non-finite counts are dropped — ``log`` of them is
     undefined, and a share count of zero is bad data rather than a company with
@@ -112,12 +135,12 @@ def _counts(tag: str, asof: dt.date) -> pl.DataFrame:
             # negative; `is_between` would be the same filter written twice.
             & (age <= MAX_FACT_AGE_DAYS)
         )
-        .select("cik", "val")
+        .select("cik", "val", "filed")
     )
 
 
 def _pairs(asof: dt.date) -> pl.DataFrame:
-    """Both ends of the year per filer, as ``cik, val, val_then``.
+    """Both ends of the year per filer, as ``cik, val, val_then, filed, filed_then``.
 
     :data:`TAGS` are consulted in order and resolved **once per cik**: a filer
     enters on the first tag that yields a usable count at *both* endpoints, and
@@ -145,7 +168,43 @@ def _pairs(asof: dt.date) -> pl.DataFrame:
     return pl.concat(frames)
 
 
-def signal(asof: dt.date, lag_days: int = LAG_DAYS) -> pl.DataFrame:
+def _split_factor(rows: pl.DataFrame) -> pl.DataFrame:
+    """`rows` with a ``factor`` column: the split basis change between its two counts.
+
+    Per ``(cik, symbol)`` row, the product of ``new_rate / old_rate`` over the
+    symbol's splits with ``filed_then < ex_date <= filed`` — the splits the
+    current count already reflects and the year-ago count does not. A symbol
+    without such a split gets ``1.0``. Non-positive or non-finite rates are bad
+    data and are skipped rather than multiplied in.
+    """
+    symbols = rows["symbol"].unique(maintain_order=True).to_list()
+    splits = actions.read_splits(symbols).filter(
+        pl.col("old_rate").is_finite()
+        & pl.col("new_rate").is_finite()
+        & (pl.col("old_rate") > 0)
+        & (pl.col("new_rate") > 0)
+    )
+    if splits.height == 0:
+        return rows.with_columns(factor=pl.lit(1.0, dtype=pl.Float64))
+    factors = (
+        rows.select("cik", "symbol", "filed", "filed_then")
+        .join(splits, on="symbol", how="inner")
+        # Strictly after the year-ago filing: a split on that day is already in
+        # that count. At or before the current filing: one the day after is not.
+        .filter(
+            (pl.col("ex_date") > pl.col("filed_then")) & (pl.col("ex_date") <= pl.col("filed"))
+        )
+        .group_by("cik", "symbol", maintain_order=True)
+        .agg(factor=(pl.col("new_rate") / pl.col("old_rate")).product())
+    )
+    return rows.join(factors, on=["cik", "symbol"], how="left").with_columns(
+        pl.col("factor").fill_null(1.0)
+    )
+
+
+def signal(
+    asof: dt.date, lag_days: int = LAG_DAYS, split_adjust: bool = True
+) -> pl.DataFrame:
     """Net share issuance over the year ending at ``asof - lag_days``.
 
     Returns :data:`tbot.replication.SCHEMA` sorted by symbol, and a typed empty
@@ -162,11 +221,18 @@ def signal(asof: dt.date, lag_days: int = LAG_DAYS) -> pl.DataFrame:
     six-month-lagged construction; see the module docstring. A negative or
     non-integer lag raises `ValueError`.
 
+    `split_adjust` (default ``True``) puts the year-ago count on the current
+    count's split basis using the splits of the row's symbol between the two
+    filing dates (:func:`_split_factor`); ``False`` is ruling 40's as-filed
+    reading, kept so that calibration stays reproducible. A non-bool raises
+    `TypeError`.
+
     Every ticker mapped to a filer *on `asof`* — not on the lagged date —
     carries the filer's score, because a company with two listed share classes
     has two tradable names and one share count; the map is point-in-time, so a
     symbol the filer picked up later is not yet its name, and one it picked up
-    inside the lag window already is.
+    inside the lag window already is. The split adjustment is per symbol, so
+    with two share classes each class's row uses its own symbol's splits.
 
     Raises `FileNotFoundError` if the SEC ticker map has not been fetched. That
     is deliberate: an unmappable warehouse would otherwise be indistinguishable
@@ -175,10 +241,13 @@ def signal(asof: dt.date, lag_days: int = LAG_DAYS) -> pl.DataFrame:
     asof = as_date(asof, "asof")
     if isinstance(lag_days, bool) or not isinstance(lag_days, int) or lag_days < 0:
         raise ValueError(f"lag_days must be a non-negative int, got {lag_days!r}")
+    if not isinstance(split_adjust, bool):
+        raise TypeError(f"split_adjust must be a bool, got {split_adjust!r}")
     mapped = tickers.ticker_map(asof)  # fail on a missing map before doing any work
 
-    scored = _pairs(asof - dt.timedelta(days=lag_days)).with_columns(
-        score=-(pl.col("val") / pl.col("val_then")).log()
-    )
-    # Inner join: a filer missing from the ticker map has no tradable name.
-    return _finalise(scored.join(mapped, on="cik", how="inner"))
+    # Inner join: a filer missing from the ticker map has no tradable name. The
+    # join comes before the score because the split basis is per symbol.
+    rows = _pairs(asof - dt.timedelta(days=lag_days)).join(mapped, on="cik", how="inner")
+    if split_adjust:
+        rows = _split_factor(rows).with_columns(val_then=pl.col("val_then") * pl.col("factor"))
+    return _finalise(rows.with_columns(score=-(pl.col("val") / pl.col("val_then")).log()))
