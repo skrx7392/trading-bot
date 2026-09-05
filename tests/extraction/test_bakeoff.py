@@ -47,6 +47,16 @@ def _chat_response(value):
                                   "content": json.dumps({"value": value})}})
 
 
+def _raw_response(content):
+    """A reply whose content is whatever the model felt like emitting.
+
+    The MLX runner does not enforce the `format` schema, so this is not a
+    hypothetical: it is what 12 of 53 nemotron replies looked like.
+    """
+    return _Response({"model": "fake", "done": True,
+                      "message": {"role": "assistant", "content": content}})
+
+
 def _echo_revenue(url, body):
     """A perfect extractor: reads the number out of 'Revenue was N million.'."""
     doc = body["messages"][-1]["content"]
@@ -226,6 +236,151 @@ def test_predictor_owns_and_exposes_the_client_it_creates(monkeypatch):
     assert client.closed is True
 
 
+# --- the system prompt ------------------------------------------------------------------
+
+def test_prompt_v1_is_frozen():
+    """v1 is what the recorded v1 ledger events were scored under; it cannot move."""
+    assert bakeoff.SYSTEM_PROMPT == (
+        'Extract the requested field from the document. Return JSON {"value": ...} only.'
+    )
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "in thousands",       # the 47-of-98 scale defect
+        "in millions",
+        "1,000",
+        "1,000,000",
+        "(415)",              # losses in parentheses are negative
+        "NEGATIVE",
+        "current",            # the 10-Q leading column, not the prior-year comparative
+        "cover page",         # where a share count comes from
+        '{"value":',          # the reply shape is still specified
+    ],
+)
+def test_prompt_v2_states_the_rules_the_dev_split_needs(rule):
+    assert rule in bakeoff.PROMPT_V2
+
+
+def test_prompt_v2_is_not_prompt_v1():
+    assert bakeoff.PROMPT_V2 != bakeoff.SYSTEM_PROMPT
+
+
+def test_predictor_sends_prompt_v1_by_default(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    client = FakeClient(lambda u, b: _chat_response(1.0))
+    bakeoff.ollama_predictor("m", host=HOST, client=client)("doc", "f")
+    assert client.requests[0]["json"]["messages"][0] == {
+        "role": "system", "content": bakeoff.SYSTEM_PROMPT}
+
+
+def test_predictor_sends_the_system_prompt_it_is_given(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    client = FakeClient(lambda u, b: _chat_response(1.0))
+    bakeoff.ollama_predictor(
+        "m", host=HOST, client=client, system_prompt=bakeoff.PROMPT_V2)("doc", "f")
+    assert client.requests[0]["json"]["messages"][0] == {
+        "role": "system", "content": bakeoff.PROMPT_V2}
+    assert client.requests[0]["json"]["messages"][1]["content"].startswith("Field: f")
+
+
+def test_predictor_validates_the_system_prompt(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    with pytest.raises(TypeError):
+        bakeoff.ollama_predictor("m", host=HOST, system_prompt=None)
+    with pytest.raises(ValueError):
+        bakeoff.ollama_predictor("m", host=HOST, system_prompt="   ")
+
+
+@pytest.mark.parametrize(
+    "prompt, want",
+    [
+        (bakeoff.SYSTEM_PROMPT, "v1"),
+        (bakeoff.PROMPT_V2, "v2"),
+    ],
+)
+def test_the_known_prompts_have_short_labels(prompt, want):
+    assert bakeoff.prompt_label(prompt) == want
+
+
+def test_an_unknown_prompt_is_labelled_by_a_stable_hash():
+    """A one-off prompt still has to be identifiable in the ledger months later."""
+    label = bakeoff.prompt_label("something else entirely")
+    assert label not in ("v1", "v2")
+    assert label == bakeoff.prompt_label("something else entirely")
+    assert label != bakeoff.prompt_label("something else entirely.")
+
+
+# --- the tolerant fallback parse ---------------------------------------------------------
+#
+# Ollama's MLX runner ignores the `format` schema, so a reply that is only a
+# number is a real and frequent outcome, not a malformed response.
+
+@pytest.mark.parametrize(
+    "content, want",
+    [
+        ("$668,857,000", 668857000.0),   # the observed nemotron failure, verbatim
+        ("668857000", 668857000.0),      # valid JSON, but a bare number not an object
+        ("668,857,000", 668857000.0),
+        ("  $1,234.50  ", 1234.5),
+        ("(415)", -415.0),               # a loss, printed the way filings print it
+        ("$(415)", -415.0),
+        ("-415", -415.0),
+        ("-$415", -415.0),
+        # A minus and parentheses are two spellings of one loss, so a reply that
+        # uses both is still negative — the sign is read once, never toggled.
+        ("-(415)", -415.0),
+        ("(-$415)", -415.0),
+        ("$-415", -415.0),
+        ("415", 415.0),                  # the unsigned shapes stay positive
+        ("$415", 415.0),
+        ("1,234.5", 1234.5),
+        ("5e6", 5000000.0),
+    ],
+)
+def test_predictor_rescues_a_reply_that_is_only_a_number(monkeypatch, content, want):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    predict = bakeoff.ollama_predictor(
+        "m", host=HOST, client=FakeClient(lambda u, b: _raw_response(content)))
+    assert predict("doc", "f") == want
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "54 (this is the net income for the six months ended June 30, 2015)",
+        "The revenue was approximately $5 million.",
+        "not json at all",
+        "[1, 2, 3]",
+        '{"answer": 5}',
+        "",
+        "   ",
+        "$",
+        "nan",
+        "inf",
+    ],
+)
+def test_predictor_does_not_rescue_a_reply_that_is_more_than_a_number(monkeypatch, content):
+    """Pulling a number out of prose invents an answer; a wrong answer is the honest score."""
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    predict = bakeoff.ollama_predictor(
+        "m", host=HOST, client=FakeClient(lambda u, b: _raw_response(content)))
+    with pytest.raises(ValueError):
+        predict("doc", "f")
+
+
+def test_the_predictor_counts_its_fallback_parses(monkeypatch):
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    replies = iter([_chat_response(1.0), _raw_response("$2,000"), _chat_response(3.0)])
+    predict = bakeoff.ollama_predictor(
+        "m", host=HOST, client=FakeClient(lambda u, b: next(replies)))
+    assert predict.fallbacks == 0
+    for _ in range(3):
+        predict("doc", "f")
+    assert predict.fallbacks == 1
+
+
 # --- run --------------------------------------------------------------------------------
 
 def test_run_returns_one_scored_row_per_model(tmp_path, monkeypatch):
@@ -334,6 +489,81 @@ def test_run_records_elapsed_seconds(tmp_path, monkeypatch):
     bakeoff.run(["m"], client=FakeClient(_echo_revenue))
     payload = json.loads(ledger.read_events("bakeoff.result")["payload"][0])
     assert isinstance(payload["elapsed_s"], float) and payload["elapsed_s"] >= 0.0
+
+
+def test_run_sends_prompt_v1_on_every_call_by_default(tmp_path, monkeypatch):
+    _seed(monkeypatch, tmp_path)
+    client = FakeClient(_echo_revenue)
+    bakeoff.run(["a", "b"], client=client)
+    assert client.requests
+    assert all(r["json"]["messages"][0]["content"] == bakeoff.SYSTEM_PROMPT
+               for r in client.requests)
+
+
+def test_run_threads_the_system_prompt_to_every_call(tmp_path, monkeypatch):
+    _seed(monkeypatch, tmp_path)
+    client = FakeClient(_echo_revenue)
+    bakeoff.run(["a", "b"], client=client, system_prompt=bakeoff.PROMPT_V2)
+    assert client.requests
+    assert all(r["json"]["messages"][0]["content"] == bakeoff.PROMPT_V2
+               for r in client.requests)
+
+
+@pytest.mark.parametrize(
+    "kwargs, want",
+    [
+        ({}, "v1"),
+        ({"system_prompt": bakeoff.SYSTEM_PROMPT}, "v1"),
+        ({"system_prompt": bakeoff.PROMPT_V2}, "v2"),
+    ],
+)
+def test_run_records_which_prompt_scored_the_model(tmp_path, monkeypatch, kwargs, want):
+    """Two bake-offs months apart are only comparable if the prompt is in the record."""
+    _seed(monkeypatch, tmp_path)
+    bakeoff.run(["m"], client=FakeClient(_echo_revenue), **kwargs)
+    payload = json.loads(ledger.read_events("bakeoff.result")["payload"][0])
+    assert payload["prompt"] == want
+
+
+def test_run_records_an_unknown_prompt_under_its_hash_label(tmp_path, monkeypatch):
+    _seed(monkeypatch, tmp_path)
+    prompt = "Extract the field. Answer with a number."
+    bakeoff.run(["m"], client=FakeClient(_echo_revenue), system_prompt=prompt)
+    payload = json.loads(ledger.read_events("bakeoff.result")["payload"][0])
+    assert payload["prompt"] == bakeoff.prompt_label(prompt)
+    assert payload["prompt"] not in ("v1", "v2")
+
+
+def test_run_validates_the_system_prompt(tmp_path, monkeypatch):
+    _seed(monkeypatch, tmp_path)
+    with pytest.raises(TypeError):
+        bakeoff.run(["m"], client=FakeClient(_echo_revenue), system_prompt=None)
+    with pytest.raises(ValueError):
+        bakeoff.run(["m"], client=FakeClient(_echo_revenue), system_prompt=" ")
+    assert ledger.read_events().height == 0
+
+
+def test_run_reports_the_fallback_parses_in_the_ledger(tmp_path, monkeypatch):
+    """A score propped up by rescued replies must never look like a clean one."""
+    _seed(monkeypatch, tmp_path, n=10)
+
+    def responder(url, body):
+        doc = body["messages"][-1]["content"]
+        number = float(doc.rsplit("Revenue was ", 1)[1].split()[0])
+        if body["model"] == "sloppy" and number < 3:
+            return _raw_response(f"${number:,.0f}")  # ignored the schema, still right
+        return _chat_response(number)
+
+    df = bakeoff.run(["sloppy", "tidy"], client=FakeClient(responder))
+    assert df["accuracy"].to_list() == [1.0, 1.0]
+    payloads = {json.loads(p)["model"]: json.loads(p)
+                for p in ledger.read_events("bakeoff.result")["payload"].to_list()}
+    n_rescued = sum(1 for i in range(10)
+                    if goldenset.split_of(f"case-{i}") == "dev" and i < 3)
+    assert n_rescued > 0
+    assert payloads["sloppy"]["parsed_fallback"] == n_rescued
+    assert payloads["sloppy"]["errors"] == 0
+    assert payloads["tidy"]["parsed_fallback"] == 0
 
 
 def test_run_with_no_models_returns_a_typed_empty_frame(tmp_path, monkeypatch):

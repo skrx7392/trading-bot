@@ -1,0 +1,25 @@
+# The warehouse volume the nightly CronJob mounts at /data.
+#
+# ReadWriteOnce is right: concurrencyPolicy Forbid on the CronJob guarantees a
+# single writer. local-path is k3s's built-in provisioner on quasar (the only
+# storage class there); it binds lazily, so the volume materialises on the host
+# under /var/lib/rancher/k3s/storage/pvc-<uid>_tbot_tbot-data/ the first time a
+# pod mounts it.
+#
+# The store is append-only and never prunes itself (one immutable parquet file
+# per batch and per ledger event), so the claim only ever grows. 20Gi holds the
+# phase-0 backfill (~6Gi) with room for years of nightly increments.
+#
+# The secret this namespace also needs (tbot-secrets: APCA_API_KEY_ID,
+# APCA_API_SECRET_KEY) is created with kubectl and deliberately not committed.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tbot-data
+  namespace: tbot
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi

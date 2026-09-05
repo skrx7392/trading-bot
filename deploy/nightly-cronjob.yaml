@@ -47,14 +47,27 @@ spec:
                 # been observed against a real run. Deferred to deploy-time
                 # verification: turn it on once a read-only run has been seen to
                 # survive, with emptyDir volumes for whatever it still needs.
-              # Nightly ingest + reconcile is a few hundred symbols of pandas
+              # Nightly ingest + reconcile is a few thousand symbols of polars
               # work -- bursty, not sustained. quasar is shared (k3s system
               # workloads, ai-proxy, ddns), so the request is what the scheduler
               # should actually set aside and the limit is a ceiling on a bad
               # night rather than an allocation.
+              #
+              # Memory is measured, not guessed. 2026-09-04, `/usr/bin/time -l`
+              # on a full run against the real warehouse: peak RSS 2.04 GB
+              # (1.90 GiB), 186s wall. The request is that working set and the
+              # limit doubles it.
+              #
+              # The previous 512Mi/2Gi was a guess and the job was OOMKilled
+              # against it: `read_canonical` and `store.read_bars` each collected
+              # their whole store before filtering, which put the same run at
+              # 25.0 GB. Both now push the window into the lazy scan. What is
+              # left is almost entirely `edgar.read_filings()`, which still reads
+              # its 7.8M rows whole -- acceptable at ~2 GB, and the thing to fix
+              # before these numbers can come down again.
               resources:
-                requests: {cpu: "250m", memory: "512Mi"}
-                limits: {cpu: "2", memory: "2Gi"}
+                requests: {cpu: "250m", memory: "2Gi"}
+                limits: {cpu: "2", memory: "4Gi"}
               envFrom:
                 - secretRef: {name: tbot-secrets}   # APCA_API_KEY_ID / APCA_API_SECRET_KEY
               volumeMounts:

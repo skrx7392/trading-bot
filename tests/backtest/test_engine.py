@@ -44,7 +44,9 @@ def _seed_two_stocks(tmp_path, monkeypatch):
         rows += [{"symbol": "UP", "ts": d, "close": up}, {"symbol": "DOWN", "ts": d, "close": dn}]
     df = pl.DataFrame(rows, schema_overrides={"ts": pl.Date}).with_columns(
         open=pl.col("close"), high=pl.col("close"), low=pl.col("close"), volume=pl.lit(1e7))
-    store.write_bars(df.select(["symbol","ts","open","high","low","close","volume"]), source="stooq")
+    for src in ("stooq", "alpaca"):  # two agreeing vendors: see `_seed`
+        store.write_bars(
+            df.select(["symbol","ts","open","high","low","close","volume"]), source=src)
     reconcile.run(days[0], days[-1])
     return days
 
@@ -87,8 +89,14 @@ def _weekdays(start: dt.date, end: dt.date) -> list[dt.date]:
     return [d for d in (start + dt.timedelta(i) for i in range(n)) if d.weekday() < 5]
 
 
-def _seed(tmp_path, monkeypatch, series, source="stooq", volume=1e7):
-    """Write ``{symbol: {date: close}}`` to the warehouse and reconcile it."""
+def _seed(tmp_path, monkeypatch, series, source=None, volume=1e7):
+    """Write ``{symbol: {date: close}}`` to the warehouse and reconcile it.
+
+    `source` of ``None`` writes the frame from both ``stooq`` and ``alpaca``, so
+    every day reconciles to a two-source ``ok`` — `read_canonical` publishes only
+    closes a second vendor confirmed. Naming one of the two re-writes that
+    vendor's bars, which is how a test stages a disagreement on purpose.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     rows = [
         {"symbol": sym, "ts": d, "close": float(px)}
@@ -98,9 +106,10 @@ def _seed(tmp_path, monkeypatch, series, source="stooq", volume=1e7):
     df = pl.DataFrame(rows, schema_overrides={"ts": pl.Date}).with_columns(
         open=pl.col("close"), high=pl.col("close"), low=pl.col("close"),
         volume=pl.lit(float(volume)))
-    store.write_bars(
-        df.select(["symbol", "ts", "open", "high", "low", "close", "volume"]), source=source
-    )
+    for src in (("stooq", "alpaca") if source is None else (source,)):
+        store.write_bars(
+            df.select(["symbol", "ts", "open", "high", "low", "close", "volume"]), source=src
+        )
     reconcile.run(df["ts"].min(), df["ts"].max())
     return df
 
@@ -361,9 +370,12 @@ def test_quarantine_gap_forces_a_liquidation(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}}, source="stooq")
     # A second vendor that disagrees with stooq on exactly one day: two sources,
     # no majority -> that symbol-day is quarantined and vanishes from canonical.
+    # B is written from both vendors so it survives the two-source read filter and
+    # stays available as the name the engine rotates into.
     disagree = dict(a)
     disagree[gap_day] = a[gap_day] * 1.5
-    _seed(tmp_path, monkeypatch, {"A": disagree}, source="alpaca")
+    _seed(tmp_path, monkeypatch,
+          {"A": disagree, "B": {d: 30.0 for d in days}}, source="alpaca")
 
     assert reconcile.read_canonical(symbols=["A"]).filter(
         pl.col("ts") == gap_day

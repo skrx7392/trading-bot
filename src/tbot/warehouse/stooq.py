@@ -1,11 +1,30 @@
-"""Stooq bulk-dump ingestion — the historical base of the bar store.
+"""Stooq bulk-dump ingestion — **retired as a warehouse source (2026-09-05)**.
 
-Stooq publishes free end-of-day history for the whole US market as a single zip
-(``d_us_txt.zip``) of per-ticker text files. That dump is the cheapest way to get
-two decades of daily bars, so it is the base layer every other source is
-reconciled against.
+Stooq is no longer one of the sources reconciliation votes on. Its bars were
+moved to ``data/retired/`` and nothing in the pipeline ingests it; this module
+stays in the tree because it still parses the dump correctly and the parser is
+the only way to read one, but calling :func:`ingest_dump` puts a retired source
+back into the vote. Ledger event: ``decision.warehouse.sources`` (user-approved).
 
-Each file is a header line followed by rows of::
+Two findings retired it, both fatal for the roles it was meant to fill:
+
+*Its price basis is idiosyncratic and per-symbol.* The warehouse basis is
+split-adjusted, dividend-unadjusted. Stooq matches that on some names and not
+others, with no documented rule: on 2025-03-04 KO agrees with split-only
+exactly, AAPL sits 43 bps under it and BKNG 97 bps under. Going back, KO on
+2016-01-04 is 20% *below* split-only and 11% *above* total-return — neither
+basis, and not a constant offset either. A base layer whose adjustment method
+varies by symbol cannot be reconciled against; it turns a vendor quirk into a
+permanent two-of-three disagreement.
+
+*It has no delisted names.* The dump was taken as the survivorship-bias defence,
+and its bulk file contains zero delisted tickers — exactly the history it was
+there to supply. Alpaca's SIP feed does carry inactive listed symbols, so that
+job moved there.
+
+Format, for whoever reads a dump next. Stooq publishes free end-of-day history
+for the whole US market as a single zip (``d_us_txt.zip``) of per-ticker text
+files. Each file is a header line followed by rows of::
 
     <TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>
 
@@ -97,6 +116,10 @@ def ingest_dump(zip_path: Path | str, batch_rows: int = BATCH_ROWS) -> int:
     ``source="stooq"`` in batches of roughly `batch_rows` rows. Re-ingesting the
     same dump is a correction, not a duplicate: the store dedupes on
     ``(symbol, ts, resolution, source)`` keeping the latest ingest.
+
+    Retired: nothing in the pipeline calls this. Running it re-admits ``stooq``
+    to the reconciliation vote on a price basis that is not the store's — see
+    the module docstring before you do.
     """
     path = Path(zip_path)
     if batch_rows < 1:

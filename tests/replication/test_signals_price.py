@@ -37,8 +37,9 @@ def test_momentum_ranks_winner(tmp_path, monkeypatch):
                  {"symbol": "LOSE", "ts": d, "close": 100 * (0.997 ** i)}]
     df = pl.DataFrame(rows, schema_overrides={"ts": pl.Date}).with_columns(
         open=pl.col("close"), high=pl.col("close"), low=pl.col("close"), volume=pl.lit(1e6))
-    store.write_bars(df.select(["symbol", "ts", "open", "high", "low", "close", "volume"]),
-                     source="stooq")
+    for src in ("stooq", "alpaca"):  # two agreeing vendors: see `_seed_prices`
+        store.write_bars(
+            df.select(["symbol", "ts", "open", "high", "low", "close", "volume"]), source=src)
     reconcile.run(days[0], days[-1])
     sig = momentum.signal(days[-1]).sort("score", descending=True)
     assert sig["symbol"][0] == "WIN" and sig.height == 2
@@ -105,12 +106,19 @@ def _weekdays(n: int, start: dt.date = dt.date(2019, 1, 1)) -> list[dt.date]:
     return out
 
 
-def _seed_prices(rows: list[dict], source: str = "stooq", reconcile_range=True) -> None:
-    """Write one vendor's daily bars and vote them into the canonical series."""
+def _seed_prices(rows: list[dict], source: str | None = None, reconcile_range=True) -> None:
+    """Write daily bars and vote them into the canonical series.
+
+    `source` of ``None`` writes the same bars from both ``stooq`` and ``alpaca``,
+    because `read_canonical` publishes only closes a second vendor confirmed.
+    Naming one of those two sources *re-writes* that vendor's bar, which is how a
+    test stages a disagreement the vote has to resolve.
+    """
     df = pl.DataFrame(rows, schema={"symbol": pl.Utf8, "ts": pl.Date, "close": pl.Float64})
     df = df.with_columns(open=pl.col("close"), high=pl.col("close"),
                          low=pl.col("close"), volume=pl.lit(1e6))
-    store.write_bars(df.select(list(store.INPUT_COLUMNS)), source=source)
+    for src in (("stooq", "alpaca") if source is None else (source,)):
+        store.write_bars(df.select(list(store.INPUT_COLUMNS)), source=src)
     if reconcile_range:
         reconcile.run(df["ts"].min(), df["ts"].max())
 
@@ -199,8 +207,9 @@ def test_momentum_reads_only_the_vetted_close_series(tmp_path, monkeypatch):
     days = _weekdays(300)
     _seed_prices(_flat_series({"OK": 10.0, "DISPUTED": 10.0}, days))
     far = days[-252]
-    # A second vendor contradicts DISPUTED's far-date close by 50%: no majority.
-    _seed_prices([{"symbol": "DISPUTED", "ts": far, "close": 15.0}], source="yf",
+    # One of the two vendors restates DISPUTED's far-date close 50% higher, so
+    # the pair now dissents and no majority is reachable: quarantined.
+    _seed_prices([{"symbol": "DISPUTED", "ts": far, "close": 15.0}], source="alpaca",
                  reconcile_range=False)
     reconcile.run(far, far)
     assert momentum.signal(days[-1])["symbol"].to_list() == ["OK"]

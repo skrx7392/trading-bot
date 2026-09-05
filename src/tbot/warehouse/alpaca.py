@@ -1,8 +1,21 @@
-"""Alpaca daily-bar fetcher — the incremental source on top of the Stooq base.
+"""Alpaca daily-bar fetcher — the base of the bar store, and what keeps it current.
 
-Stooq is a bulk historical dump; Alpaca is what keeps the store current. It is
-read through the free IEX feed (``feed=iex``), which covers IEX-printed volume
-only — good enough for daily OHLC research, not for microstructure work.
+Read through the SIP feed (``feed=sip``), the consolidated tape: official closes
+and consolidated volume, so both are comparable with the other sources. On this
+account SIP reaches back to 2016 and serves delisted tickers, which is what
+makes it the base rather than an incremental top-up — it carries the history and
+the dead names the survivorship-bias defence needs. (The free IEX feed carries
+IEX-only prints — closes off the consolidated ones by a median ~17 bps and a
+sliver of the volume — and returns nothing before 2021.)
+
+Before 2016 there is no SIP history and yfinance is the only source; see
+:mod:`tbot.warehouse.yf` for what that costs.
+
+Bars are requested ``adjustment=split``, which is the store's price basis:
+**split-adjusted, dividend-unadjusted**. That is what yfinance's raw
+``auto_adjust=False`` Close is, so the two agree to ~1 bp on names that have
+split; Alpaca's default ``raw`` does not (BKNG 2025-03-04: 4914.49 raw against
+195.94 split-adjusted) and would splice a second price basis into the store.
 
 Credentials come from ``APCA_API_KEY_ID`` / ``APCA_API_SECRET_KEY``. The HTTP
 client is injectable so the parsing and pagination logic is testable without a
@@ -34,7 +47,13 @@ SOURCE = "alpaca"
 
 _URL = "https://data.alpaca.markets/v2/stocks/bars"
 TIMEFRAME = "1Day"
-FEED = "iex"
+FEED = "sip"
+
+#: The price basis every bar is requested on: split-adjusted, dividend-unadjusted
+#: — the store's basis, and the one yfinance's raw Close uses. Alpaca defaults to
+#: ``raw`` when this is omitted, so it is sent explicitly on every request.
+ADJUSTMENT = "split"
+
 PAGE_LIMIT = 10_000
 
 #: Symbols per request. The whole list goes into the query string, and the
@@ -142,6 +161,7 @@ def fetch_bars(
                     "start": start.isoformat(),
                     "end": end.isoformat(),
                     "feed": FEED,
+                    "adjustment": ADJUSTMENT,
                     "limit": PAGE_LIMIT,
                 }
                 if token:

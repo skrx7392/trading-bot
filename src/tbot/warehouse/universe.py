@@ -25,9 +25,11 @@ from :func:`tbot.warehouse.reconcile.read_canonical` — the vetted series, with
 quarantined symbol-days already removed — because screening on a price no vendor
 majority will vouch for is how a bad tick becomes a position. Volumes come
 straight from :func:`tbot.warehouse.store.read_bars` and are medianed across
-whatever sources reported: volumes are *not* reconciled (Alpaca's free tier is
-the IEX feed and its volumes diverge from the consolidated tape by design), so
-the median across sources is the robust estimate available.
+whatever sources reported: volumes are *not* reconciled, because the only thing
+they feed is this liquidity screen, where a few percent of error moves nothing
+— a name near the `min_adv` line is a name we are indifferent about. Closes buy
+positions and so are voted on; volumes only sort names, so the median across
+sources is estimate enough.
 
 Both halves are strictly bounded by `asof`: ``filed <= asof`` for filings and
 ``ts <= asof`` for prices. No later filing, restatement, delisting or price
@@ -37,8 +39,10 @@ a backtest over a sequence of `asof` dates honest.
 The `cik` to `symbol` bridge is SEC's ``company_tickers.json``, cached under
 ``<data_root>/raw/``. It is a *current* mapping, not a point-in-time one — a
 ticker that has been reused since `asof` will map to its new owner — which is
-the one known PIT hole here and is why the plan cross-checks delistings against
-Stooq's delisted series separately. A filer missing from the map drops out of
+the one known PIT hole here. Reuse is not hypothetical: Alpaca's ``BBBY``
+history splices Bed Bath & Beyond with Beyond Inc., two unrelated companies
+under one symbol. A point-in-time ticker map is therefore a phase-1
+requirement, not a nicety. A filer missing from the map drops out of
 the universe rather than failing the build; a missing map *file* is a loud
 error, because an empty universe is indistinguishable from "nothing qualified".
 

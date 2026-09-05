@@ -619,9 +619,11 @@ def _seed(tmp_path, monkeypatch):
     df = pl.DataFrame(rows, schema_overrides={"ts": pl.Date}).with_columns(
         open=pl.col("close"), high=pl.col("close"), low=pl.col("close"),
         volume=pl.lit(1e6))
-    store.write_bars(
-        df.select(["symbol", "ts", "open", "high", "low", "close", "volume"]),
-        source="stooq")
+    # Two agreeing vendors: `read_canonical` drops a close only one source saw.
+    for src in ("stooq", "alpaca"):
+        store.write_bars(
+            df.select(["symbol", "ts", "open", "high", "low", "close", "volume"]),
+            source=src)
     reconcile.run(days[0], days[-1])
     return days
 

@@ -678,3 +678,115 @@ def test_task12_fact_series_shape(tmp_path, monkeypatch):
           .sort(["cik", "end"]))
     assert df["val"].to_list() == [1.0, 2.0]
     assert df["fp"].to_list() == ["Q1", "Q2"] and df["fy"].to_list() == [2020, 2020]
+
+
+# --- lazy, predicate-pushed, cached reads -------------------------------------------
+
+def _seed_two_companies(tmp_path, monkeypatch):
+    """Two companies, two tags, two filings — enough for every predicate below."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    edgar.ingest_companyfacts(json.dumps({"cik": 1, "facts": {"us-gaap": {
+        "Assets": {"units": {"USD": [
+            {"end": "2020-12-31", "val": 10.0, "accn": "a1", "fy": 2020, "fp": "FY",
+             "form": "10-K", "filed": "2021-02-01"}]}},
+        "Revenues": {"units": {"USD": [
+            {"start": "2020-01-01", "end": "2020-12-31", "val": 5.0, "accn": "a1",
+             "fy": 2020, "fp": "FY", "form": "10-K", "filed": "2021-02-01"}]}},
+    }}}).encode())
+    edgar.ingest_companyfacts(json.dumps({"cik": 2, "facts": {"us-gaap": {
+        "Assets": {"units": {"USD": [
+            {"end": "2020-12-31", "val": 20.0, "accn": "b1", "fy": 2020, "fp": "FY",
+             "form": "10-K", "filed": "2021-03-01"}]}},
+    }}}).encode())
+    edgar.ingest_submissions(_subs(
+        1, accessionNumber=["a1", "a2"], form=["10-K", "8-K"],
+        filingDate=["2021-02-01", "2021-05-01"],
+        primaryDocument=["a.htm", "b.htm"]), cik=1)
+
+
+def test_read_facts_pushes_the_tag_predicate_down(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    df = edgar.read_facts(["Revenues"])
+    assert df["tag"].unique().to_list() == ["Revenues"]
+    assert df.height == 1
+    # the scan helper never collects rows outside the predicate
+    assert edgar._scan("facts", edgar.FACTS_SCHEMA, tags=("Revenues",)).collect().height == 1
+
+
+def test_read_facts_is_cached_per_data_root_and_tags(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    calls = {"n": 0}
+    real = edgar._collect
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(edgar, "_collect", counting)
+    a = edgar.read_facts(["Assets"])
+    b = edgar.read_facts(["Assets"])
+    assert calls["n"] == 1 and a.equals(b)
+    edgar.read_facts(["Revenues"])
+    assert calls["n"] == 2
+
+
+def test_ingest_invalidates_the_cache(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    assert edgar.read_facts(["Assets"]).height == 2
+    edgar.ingest_companyfacts(json.dumps({"cik": 3, "facts": {"us-gaap": {
+        "Assets": {"units": {"USD": [
+            {"end": "2020-12-31", "val": 30.0, "accn": "c1", "fy": 2020, "fp": "FY",
+             "form": "10-K", "filed": "2021-03-01"}]}},
+    }}}).encode())
+    assert edgar.read_facts(["Assets"]).height == 3
+
+
+def test_submissions_ingest_invalidates_the_cache(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    assert edgar.read_filings().height == 2
+    edgar.ingest_submissions(_subs(
+        2, accessionNumber=["b1"], form=["10-K"], filingDate=["2021-03-01"],
+        primaryDocument=["k.htm"]), cik=2)
+    assert edgar.read_filings().height == 3
+
+
+def test_cache_does_not_leak_across_data_roots(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path / "one", monkeypatch)
+    assert edgar.read_facts(["Assets"]).height == 2
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path / "two"))
+    assert edgar.read_facts(["Assets"]).height == 0
+
+
+def test_read_filings_predicates(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    only_k = edgar.read_filings(forms=["10-K"])
+    assert only_k["form"].to_list() == ["10-K"]
+    window = edgar.read_filings(filed_from=dt.date(2021, 4, 1), filed_to=dt.date(2021, 12, 31))
+    assert window["accn"].to_list() == ["a2"]
+    assert edgar.read_filings().height == 2  # defaults unchanged
+
+
+def test_read_filings_predicates_keep_the_typed_schema(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    df = edgar.read_filings(forms=["S-1"])
+    assert df.height == 0 and dict(df.schema) == dict(edgar.FILINGS_SCHEMA)
+    empty = edgar.read_filings(forms=[])
+    assert empty.height == 0 and dict(empty.schema) == dict(edgar.FILINGS_SCHEMA)
+
+
+def test_read_filings_rejects_bad_predicates(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    with pytest.raises(TypeError):
+        edgar.read_filings(forms="10-K")       # a bare string is a common slip
+    with pytest.raises(TypeError):
+        edgar.read_filings(forms=[1, 2])
+    with pytest.raises(ValueError):
+        edgar.read_filings(filed_from="01/01/2021")
+
+
+def test_read_facts_returns_a_copy_the_caller_cannot_poison(tmp_path, monkeypatch):
+    _seed_two_companies(tmp_path, monkeypatch)
+    df = edgar.read_facts(["Assets"])
+    df.with_columns(pl.lit(0.0).alias("val"))  # polars frames are immutable; this pins that
+    assert edgar.read_facts(["Assets"])["val"].to_list() == [10.0, 20.0]

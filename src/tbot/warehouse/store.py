@@ -12,6 +12,11 @@ Every writer hands over the same seven columns — ``symbol, ts, open, high, low
 close, volume`` — and :func:`write_bars` normalises their dtypes and stamps on
 ``source``, ``resolution`` and ``ingested_at``. Normalising at the write
 boundary is what lets bars from different fetchers concatenate at read time.
+
+A read is *windowed*, not filtered after the fact: ``symbols``, ``start`` and
+``end`` go into the lazy scan, and ``source``/``resolution`` are answered by
+which directories are globbed at all. See :func:`_scan` for why narrowing before
+the dedupe returns the same rows, and what it costs not to.
 """
 
 import datetime as dt
@@ -178,6 +183,39 @@ def _batch_files(resolution: str, source: str | None) -> list[Path]:
     return files
 
 
+def _scan(
+    files: list[Path],
+    symbols: list[str] | None,
+    start: dt.date | None,
+    end: dt.date | None,
+) -> pl.LazyFrame:
+    """The lazy read, narrowed to the caller's window before anything is collected.
+
+    **Why this is safe to do before the dedupe.** Every predicate here is a
+    component of :data:`DEDUPE_KEY`, so a row and the correction that supersedes
+    it necessarily agree on it: they share a ``symbol`` and a ``ts``, and either
+    both pass a filter or neither does. Filtering first therefore cannot change
+    which row wins a key, only how many keys are considered — which is what
+    makes this a pure memory bound rather than a change of semantics.
+
+    Nothing filters on ``resolution`` or ``source``: :func:`_batch_files` has
+    already applied both by choosing directories, and a file under
+    ``bars/<source>/<resolution>/`` cannot hold another source's rows.
+
+    Not an optimisation to be casual about. The store is every source's whole
+    history, and collecting it to answer a 63-day question peaked at 24.7 GB —
+    twice a night, which is what OOMKilled the nightly under its 2 GiB limit.
+    """
+    scan = pl.scan_parquet(files, include_file_paths=_FILE_COL)
+    if symbols is not None:
+        scan = scan.filter(pl.col("symbol").is_in(pl.lit(symbols, dtype=pl.List(pl.Utf8))))
+    if start is not None:
+        scan = scan.filter(pl.col("ts") >= start)
+    if end is not None:
+        scan = scan.filter(pl.col("ts") <= end)
+    return scan
+
+
 def read_bars(
     symbols: Iterable[str] | None = None,
     start: dt.date | None = None,
@@ -192,10 +230,21 @@ def read_bars(
     result may hold several rows per ``(symbol, ts)`` — one per source. Always
     returns the full :data:`SCHEMA`, sorted by ``symbol, ts, source``, including
     when nothing matches.
+
+    The window is pushed into the scan rather than applied to a collected frame,
+    so the cost of a read scales with what was asked for and not with what the
+    store holds; :func:`_scan` carries the argument for why that is identical.
     """
     resolution = _safe_component(resolution, "resolution")
     if source is not None:
         source = _safe_component(source, "source")
+    # Coerced before the store is touched, so an empty warehouse cannot swallow
+    # a malformed date by returning early. `symbols` is drained here too: it may
+    # be any iterable, and the scan would otherwise consume a generator inside a
+    # lazy expression.
+    symbols = None if symbols is None else list(symbols)
+    start = None if start is None else as_date(start, "start")
+    end = None if end is None else as_date(end, "end")
 
     files = _batch_files(resolution, source)
     if not files:
@@ -204,18 +253,10 @@ def read_bars(
     # Each file is internally unique on DEDUPE_KEY, so (ingested_at, path) is a
     # total order over the candidates for a key — no reliance on sort stability.
     df = (
-        pl.scan_parquet(files, include_file_paths=_FILE_COL)
+        _scan(files, symbols, start, end)
         .collect()
         .sort(["ingested_at", _FILE_COL])
         .unique(subset=list(DEDUPE_KEY), keep="last", maintain_order=True)
         .drop(_FILE_COL)
     )
-
-    if symbols is not None:
-        wanted = pl.lit(list(symbols), dtype=pl.List(pl.Utf8))
-        df = df.filter(pl.col("symbol").is_in(wanted))
-    if start is not None:
-        df = df.filter(pl.col("ts") >= as_date(start, "start"))
-    if end is not None:
-        df = df.filter(pl.col("ts") <= as_date(end, "end"))
     return df.sort(["symbol", "ts", "source"]).select(list(SCHEMA))

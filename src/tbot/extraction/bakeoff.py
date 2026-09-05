@@ -7,16 +7,36 @@ API, scores each model with :func:`tbot.extraction.goldenset.score`, and writes
 one ``bakeoff.result`` event per model to the decision ledger so the choice
 stays traceable long after the terminal that ran it is closed.
 
-Structured output, not parsing
-------------------------------
+Structured output, asked for but not guaranteed
+-----------------------------------------------
 
-Every request carries Ollama's ``format`` JSON-schema (:data:`FORMAT`), which
-constrains decoding to an object with a ``value`` key. That is the difference
-between an extraction pipeline and a regex over prose: the model cannot answer
-"The revenue was approximately $5 million." because that string is not a
-sampling path the grammar allows. The schema admits ``string`` *or* ``number``
-because the golden set holds both kinds of field, and
-:func:`~tbot.extraction.goldenset.score` reconciles the two at compare time.
+Every request carries Ollama's ``format`` JSON-schema (:data:`FORMAT`), which is
+*meant* to constrain decoding to an object with a ``value`` key. The schema
+admits ``string`` *or* ``number`` because the golden set holds both kinds of
+field, and :func:`~tbot.extraction.goldenset.score` reconciles the two at
+compare time.
+
+**On Ollama 0.32.13's MLX runner the schema is silently ignored.** Measured
+directly: a request whose schema requires a ``zzz_marker`` key, sent to
+``nemotron-3.5-lightning:30b-a3b-nvfp4`` and to ``qwen3.8:27b-nvfp4`` (both
+served by ``ollama runner --mlx-engine``), comes back as the plain sentence
+``Paris is the capital of France.`` — not merely the wrong shape but no JSON at
+all. The identical request to a GGUF model on the same server and the same
+Ollama build, which uses the ggml runner, returns ``{"zzz_marker": "France"}``.
+So this is an engine gap, not our request and not the Ollama version, and it is
+not fixable from the client: it survives ``format: "json"``, a narrower
+number-only schema, and every ``options.num_ctx`` we pinned.
+
+The practical consequence is that on Apple Silicon every well-formed reply is
+the model *voluntarily* obeying :data:`SYSTEM_PROMPT`, not a grammar holding it
+there — so a plain ``$668,857,000`` is an ordinary outcome rather than a
+malformed response. :func:`_bare_number` rescues exactly that case, and only
+that case: the whole reply must be a number, so ``54 (this is the net income
+for the six months ended June 30, 2015)`` still scores wrong rather than having
+a ``54`` mined out of it. Every rescue is counted and reported to the ledger as
+``parsed_fallback``, because a score propped up by tolerant parsing and a score
+earned under a real grammar are different measurements and the record has to
+say which one it is.
 
 Reasoning is switched off (``"think": false``)
 ------------------------------------------------
@@ -68,8 +88,10 @@ losing because the second entrant was never pulled, so :func:`run` always
 returns a full table. An accuracy of exactly 0.0 is the tell.
 """
 
+import hashlib
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 
@@ -79,7 +101,17 @@ import polars as pl
 from tbot import ledger
 from tbot.extraction import _check_split, _non_blank, goldenset
 
-__all__ = ["RESULT_SCHEMA", "SYSTEM_PROMPT", "FORMAT", "OPTIONS", "ollama_predictor", "run"]
+__all__ = [
+    "RESULT_SCHEMA",
+    "SYSTEM_PROMPT",
+    "PROMPT_V2",
+    "PROMPT_LABELS",
+    "FORMAT",
+    "OPTIONS",
+    "prompt_label",
+    "ollama_predictor",
+    "run",
+]
 
 #: One row per candidate. Held to exactly these columns so two bake-offs run
 #: months apart are directly comparable.
@@ -87,9 +119,51 @@ RESULT_SCHEMA = pl.Schema(
     {"model": pl.Utf8, "n": pl.Int64, "correct": pl.Int64, "accuracy": pl.Float64}
 )
 
+#: Prompt v1 — the brief's wording, frozen. Every ``bakeoff.result`` event
+#: recorded before prompt iteration began was scored under this exact string, so
+#: changing it would silently re-label history rather than improve it. New
+#: wording arrives as a new constant.
 SYSTEM_PROMPT = (
     'Extract the requested field from the document. Return JSON {"value": ...} only.'
 )
+
+#: Prompt v2 — v1 plus the four defects the dev split actually contains.
+#:
+#: v1 scored 3/53 and 2/53 while a frontier model on the same cases scored 52/53,
+#: so the gap was the instruction, not the extraction. Counted over the golden
+#: set: 47 of 98 cases print the figure "in thousands" or "in millions", 17 are
+#: losses printed in parentheses, and every 10-Q puts a prior-year comparative
+#: column immediately beside the answer. v1 says nothing about scale, sign,
+#: which column, or which line item, so a model that reads the filing correctly
+#: still answers ``125.2`` where the expected value is ``125200000``.
+PROMPT_V2 = (
+    "Extract the requested field from the document.\n"
+    "\n"
+    "Which figure:\n"
+    "- `revenue` = total revenue / net sales for the CURRENT reporting period. "
+    "For a 10-Q that is the three-month period just ended — the leading column — "
+    "not the prior-year comparative column beside it and not the year-to-date "
+    "figure. For a 10-K it is the fiscal year just ended.\n"
+    "- `net income` = net income (loss) attributable to the company, for that "
+    "same current period.\n"
+    "- `shares outstanding` = the common shares outstanding stated on the cover "
+    "page.\n"
+    "\n"
+    "Scale: report the value in RAW units — dollars, or shares. If the statement "
+    "is headed \"in thousands\", multiply the printed figure by 1,000; if \"in "
+    "millions\", by 1,000,000. Cover-page share counts are already unscaled — do "
+    "not multiply them.\n"
+    "\n"
+    "Sign: a loss printed as (415) or $(415) is NEGATIVE — answer -415000 if the "
+    "statement is in thousands.\n"
+    "\n"
+    'Return JSON {"value": <bare number>} only: no commas, no currency symbol, '
+    "no units, no words."
+)
+
+#: Short, stable names for the prompts a bake-off is expected to be run under.
+#: Anything else is labelled by content hash; see :func:`prompt_label`.
+PROMPT_LABELS = {SYSTEM_PROMPT: "v1", PROMPT_V2: "v2"}
 
 #: Ollama's structured-output schema. ``value`` is string-or-number because the
 #: golden set mixes registrant names with revenue figures.
@@ -145,8 +219,70 @@ def _excerpt(value) -> str:
     return text if len(text) <= _ERROR_EXCERPT else f"{text[:_ERROR_EXCERPT]}..."
 
 
-def _parse_value(body, model: str):
-    """Pull ``value`` out of an Ollama chat reply, or say precisely what was wrong.
+def prompt_label(system_prompt: str) -> str:
+    """A short name for a prompt, for the ledger: ``v1``, ``v2`` or a hash.
+
+    A recorded accuracy is only comparable against another accuracy scored under
+    the same instruction, so the prompt belongs in the event next to the number.
+    The known prompts get readable labels; anything else gets a truncated
+    SHA-256 of its text, which is stable across processes (unlike :func:`hash`)
+    and distinguishes two prompts that differ by a single character.
+    """
+    system_prompt = _non_blank(system_prompt, "system_prompt")
+    known = PROMPT_LABELS.get(system_prompt)
+    if known is not None:
+        return known
+    return f"sha256:{hashlib.sha256(system_prompt.encode()).hexdigest()[:12]}"
+
+
+#: A number and nothing else, once currency, grouping and parentheses are gone.
+#: ``fullmatch`` against this is what keeps :func:`_bare_number` from mining a
+#: leading number out of a sentence. Digits are required, so ``nan`` and ``inf``
+#: — both of which :func:`float` accepts and neither of which any filing states
+#: — are refused before they can become an unmatchable prediction.
+_BARE_NUMBER = re.compile(r"\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?")
+
+
+def _bare_number(content: str) -> float | None:
+    """``$668,857,000`` → ``668857000.0``; anything with prose in it → ``None``.
+
+    The rescue for the MLX runner's unenforced grammar (see the module
+    docstring), deliberately narrow. It accepts the three shapes a filing prints
+    a figure in — a currency symbol, thousands separators, and a loss wrapped in
+    parentheses — and refuses everything else, so a model that answers with an
+    explanation scores wrong rather than having a plausible-looking number
+    extracted from it by the harness.
+    """
+    text = content.strip()
+    minus = parenthesised = False
+    while True:  # every branch shortens `text`, so this terminates
+        if len(text) > 1 and text.startswith("(") and text.endswith(")"):
+            parenthesised, text = True, text[1:-1].strip()
+        elif text.startswith("$"):
+            text = text[1:].strip()
+        elif text.startswith("-"):
+            minus, text = True, text[1:].strip()
+        else:
+            break
+    # The sign is read once, not toggled: a minus and parentheses are two ways of
+    # writing the same loss, so `-(415)` and `(-$415)` are -415, not +415.
+    negative = minus or parenthesised
+    text = text.replace(",", "")
+    if not _BARE_NUMBER.fullmatch(text):
+        return None
+    try:
+        value = float(text)
+    except (ValueError, OverflowError):  # a 400-digit exponent
+        return None
+    return -value if negative else value
+
+
+def _parse_value(body, model: str) -> tuple[object, bool]:
+    """``(value, rescued)`` from an Ollama chat reply, or say what was wrong.
+
+    ``rescued`` is ``True`` when the reply was not the object the schema asked
+    for but was unambiguously a number — the MLX runner's unenforced ``format``,
+    which the caller counts rather than ignores.
 
     Every failure here is a :class:`ValueError` that names the model and shows
     what came back, because :func:`~tbot.extraction.goldenset.score` swallows it
@@ -156,21 +292,33 @@ def _parse_value(body, model: str):
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str):
         raise ValueError(f"{model}: response has no message.content: {_excerpt(body)}")
+
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:
+        rescued = _bare_number(content)
+        if rescued is not None:
+            return rescued, True
         raise ValueError(
             f"{model}: message.content is not JSON: {_excerpt(content)}"
         ) from exc
+
     if not isinstance(parsed, dict) or "value" not in parsed:
+        rescued = _bare_number(content)  # a naked `668857000` parses as JSON, too
+        if rescued is not None:
+            return rescued, True
         raise ValueError(
             f"{model}: extracted JSON has no 'value' key: {_excerpt(content)}"
         )
-    return parsed["value"]
+    return parsed["value"], False
 
 
 def ollama_predictor(
-    model: str, host: str | None = None, client=None, think: bool = False
+    model: str,
+    host: str | None = None,
+    client=None,
+    think: bool = False,
+    system_prompt: str = SYSTEM_PROMPT,
 ) -> Callable[[str, str], str | float]:
     """A ``predict(doc_text, field)`` backed by one Ollama model.
 
@@ -183,10 +331,17 @@ def ollama_predictor(
 
     ``think`` defaults to ``False``; see the module docstring for why leaving a
     reasoning model's chain of thought on breaks the structured reply.
+
+    ``system_prompt`` defaults to :data:`SYSTEM_PROMPT` — prompt v1 — so that a
+    call written against the recorded v1 events keeps scoring what those events
+    describe; :data:`PROMPT_V2` is passed in explicitly. The predictor exposes
+    ``predict.fallbacks``, the number of replies so far that were rescued by
+    :func:`_bare_number` rather than parsed as the schema's object.
     """
     if not isinstance(think, bool):
         raise TypeError(f"think must be a bool, got {type(think).__name__}")
     model = _non_blank(model, "model")
+    system_prompt = _non_blank(system_prompt, "system_prompt")
     url = f"{_resolve_host(host)}/api/chat"
     if client is None:
         client = httpx.Client(timeout=TIMEOUT)
@@ -201,7 +356,7 @@ def ollama_predictor(
                 "format": FORMAT,
                 "options": OPTIONS,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {
                         "role": "user",
                         "content": f"Field: {field}\n\nDocument:\n{doc_text}",
@@ -217,11 +372,16 @@ def ollama_predictor(
                 f"{model}: response body is not JSON: "
                 f"{_excerpt(getattr(response, 'text', ''))}"
             ) from exc
-        return _parse_value(body, model)
+        value, rescued = _parse_value(body, model)
+        if rescued:
+            predict.fallbacks += 1
+        return value
 
     predict.model = model
     predict.url = url
     predict.client = client
+    predict.system_prompt = system_prompt
+    predict.fallbacks = 0
     return predict
 
 
@@ -273,6 +433,7 @@ def run(
     host: str | None = None,
     client=None,
     think: bool = False,
+    system_prompt: str = SYSTEM_PROMPT,
 ) -> pl.DataFrame:
     """Score every model over one golden-set split and record the results.
 
@@ -286,12 +447,24 @@ def run(
     (``errors: n``) is a pull, a host or a protocol problem wearing the same
     score.
 
+    The event also carries ``prompt`` — :func:`prompt_label` of the instruction
+    the models were scored under — and ``parsed_fallback``, how many replies were
+    rescued by :func:`_bare_number` instead of arriving as the schema's object.
+    An accuracy is meaningless without the prompt beside it once prompts are
+    being iterated, and a score that leans on rescued replies is a different
+    claim from one that does not; both belong in the record rather than in
+    whoever ran it.
+
     ``split`` defaults to ``dev`` on purpose. The holdout half is the promotion
     test and every look at it costs some of its independence, so scoring it is
     something a caller has to ask for by name.
+
+    ``system_prompt`` defaults to prompt v1 so that the numbers a bare
+    ``run([...])`` produces stay comparable with the v1 events already recorded.
     """
     names = _check_models(models)
     split = _check_split(split)
+    label = prompt_label(system_prompt)
 
     owned = client is None
     if owned:
@@ -300,9 +473,14 @@ def run(
     rows = []
     try:
         for model in names:
-            predict, errors = _recording(
-                ollama_predictor(model, host=host, client=client, think=think)
+            raw = ollama_predictor(
+                model,
+                host=host,
+                client=client,
+                think=think,
+                system_prompt=system_prompt,
             )
+            predict, errors = _recording(raw)
             started = time.perf_counter()
             result = goldenset.score(predict, split)
             elapsed = round(time.perf_counter() - started, 3)
@@ -311,10 +489,12 @@ def run(
                 {
                     "model": model,
                     "split": split,
+                    "prompt": label,
                     **result,
                     "elapsed_s": elapsed,
                     "errors": len(errors),
                     "first_error": errors[0] if errors else None,
+                    "parsed_fallback": raw.fallbacks,
                 },
             )
             rows.append({"model": model, **result})

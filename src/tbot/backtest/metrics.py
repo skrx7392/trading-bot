@@ -49,45 +49,83 @@ correlation toward zero along with it. So each failure gets its own answer:
     Dropped before ranking. A name with no vetted close on the formation date
     could not have been bought, so it cannot be in a portfolio — the same rule
     :mod:`tbot.backtest.engine` applies to its rebalance.
-``a name with a formation price but no price at the hold end``
-    Dropped **from its leg's mean** for that month. See the simplification note
-    below; this one is not free.
+``a name that stops printing mid-hold``
+    **Sold at its last vetted close**, with a haircut below a dollar. See the
+    delisting section below; this is the one case that is not a drop.
+``a name with a formation price, no price at the hold end, and prints again later``
+    Dropped **from its leg's mean** for that month — a gap, not an exit.
 ``a leg that loses every name``
     The month is skipped: half a spread is not a spread.
 
-Documented simplification: the delisting return is the survivors' return
-------------------------------------------------------------------------
+Delisting exits, and why dropping the name was the wrong answer
+----------------------------------------------------------------
 
 Dropping a name that vanishes mid-hold silently assumes it earned exactly what
 its surviving leg-mates earned. Reality is not that — a name that stops printing
 usually stopped for a reason, and the literature's own fix is to substitute a
-delisting return (CRSP's, or the -30% convention for performance delistings).
+delisting return. The rule here (v0, ledgered as ruling 39) is:
 
-The direction of the resulting error is worth stating precisely, because the
-reflex ("survivorship bias flatters the backtest") points the wrong way here.
-Both delisting channels bias the measured spread *down*: a performance
-delisting concentrates in the **short** leg, and dropping a -80% name raises
-that leg's mean, which shrinks ``long - short``; an acquisition pays a premium
-and concentrates among **winners**, and dropping it lowers the long leg's mean,
-which shrinks the spread again. So the phase-0 series understates the factor
-rather than inventing one — the safe direction for a gate whose job is to refuse
-false replications.
+    A name in a leg with no vetted close at ``held_to``, but whose **last
+    canonical close in the whole loaded panel** falls strictly inside
+    ``(formed, held_to)``, has been delisted mid-hold. It exits at that last
+    close. If that close is below :data:`DELIST_PRICE_FLOOR` a further
+    :data:`DELIST_RETURN` is applied on top, because a name forced off an
+    exchange under a dollar typically loses most of the residual value in the
+    OTC aftermarket — Shumway (1997)'s -30% for performance delistings. A name
+    whose last close is on or after ``held_to`` but missing *at* ``held_to`` is
+    a quarantined or skipped day, not a delisting, and is still dropped.
 
-For the correlation specifically the effect is milder still, and for a different
-reason: Pearson's rho is invariant to scale, so uniform shrinkage does not move
-it at all. What moves it is the *month-to-month randomness* of which names
-happen to vanish, which is noise, and noise pushes rho toward zero — never
-toward a false pass. Note that
-:func:`~tbot.warehouse.reconcile.read_canonical` drops quarantined symbol-days,
-so a one-day vendor disagreement on a month end enters this same path and is
-indistinguishable from a delisting. None of it is quantified; Task 13's
-calibration is what will show whether it bites, and the real fix — an explicit
-``delisted`` flag carrying a delisting return — belongs in the warehouse.
+Both bounds are deliberate. ``formed < t`` because a name whose last close *is*
+the formation close tells us nothing about what it was worth afterwards, and
+booking an exit at the purchase price would assert a 0% hold return — a claim,
+not a measurement. ``t < held_to`` because a later print is proof the name
+survived the hold.
 
-Also not modelled: dividends beyond the vendors' own adjustment, any lag between
-the formation close and a tradeable price (the engine's next-day execution is
-deliberately *not* replicated — the literature forms at the close), and rebalance
-costs of any kind.
+The bias this removes had a known sign, which is why it was tolerated for as
+long as it was. Both delisting channels biased the measured spread *down*: a
+performance delisting concentrates in the **short** leg, and dropping a -80%
+name raised that leg's mean, shrinking ``long - short``; an acquisition pays a
+premium and concentrates among **winners**, and dropping it lowered the long
+leg's mean, shrinking the spread again. So the series understated the factor
+rather than inventing one. For the correlation specifically the effect was
+milder still — Pearson's rho is scale-invariant, so uniform shrinkage does not
+move it, and what moved it was the month-to-month randomness of which names
+vanished, which is noise pushing rho toward zero rather than toward a false
+pass. The magnitude miss on the live anomalies is what this fixes.
+
+Two residual imprecisions, both stated rather than hidden.
+:func:`~tbot.warehouse.reconcile.read_canonical` drops quarantined symbol-days
+and truncates history before a 5x single-day break, so a name whose panel ends
+mid-month for either of those reasons is booked as a delisting it did not
+suffer. And the panel is only read over ``[start, end]``: a name whose real
+history continues past `end` but whose last close *within the window* falls
+inside the final month's hold books a spurious exit. Callers who care about the
+final month should pass an `end` one month past the last month they use and cut
+the series — which is what the calibration driver does.
+
+Dividend income, and the basis it sits on
+------------------------------------------
+
+Returns are **total** returns. A name's hold return is ``(p1 + D) / p0 - 1``,
+where ``D`` is the cash per share of every dividend whose ex-date falls in
+``(formed, held_to]``. That window is half-open deliberately: the holder of
+record at the close *before* the ex-date is paid, and this portfolio is bought
+at the formation close, so a dividend going ex on the formation date belongs to
+the previous holder while one going ex on the hold end is ours. The short leg
+pays away what the long leg receives, and ``long - short`` books that for free.
+
+The rates come from :func:`tbot.warehouse.actions.read_dividends`, which returns
+them already divided onto the store's split-adjusted price basis (spec A3) — a
+$0.77 AAPL dividend declared in 2019 is added as $0.1925 to a 2019 close that
+has been divided by four. Adding a declared rate to an adjusted price is the one
+mistake this whole path exists to avoid, and it is a *large* one: for a 2016
+dividend on a name that later split 7:1 it overstates the month by a factor of
+seven. ``dividends=None`` restores the previous price-only series, which is what
+every test that seeds no dividends still measures.
+
+Still not modelled: any lag between the formation close and a tradeable price
+(the engine's next-day execution is deliberately *not* replicated — the
+literature forms at the close), and rebalance costs of any kind.
 
 Reading the statistics
 ----------------------
@@ -108,7 +146,7 @@ import numpy as np
 import polars as pl
 
 from tbot._dates import as_date
-from tbot.warehouse import reconcile
+from tbot.warehouse import actions, reconcile
 
 #: The long-short series schema. Task 13 joins on ``month``; nothing else is
 #: promised, and one row per month is guaranteed (months with no row were
@@ -119,6 +157,17 @@ SERIES_SCHEMA = pl.Schema({"month": pl.Date, "ret_ls": pl.Float64})
 #: Two points are always perfectly correlated; three is the first number that
 #: can be wrong.
 MIN_OVERLAP = 3
+
+#: Extra return applied on top of a below-floor delisting exit. Shumway (1997)
+#: measured that performance-related delistings whose final CRSP return is
+#: missing average about -30%, and that is the number the literature substitutes.
+#: Applied only below :data:`DELIST_PRICE_FLOOR` (v0 rule, ruling 39).
+DELIST_RETURN = -0.30
+
+#: The last close below which a delisting is read as a performance delisting.
+#: $1 is the exchanges' own continued-listing threshold, so a name whose final
+#: print is under it was very likely being pushed off rather than bought out.
+DELIST_PRICE_FLOOR = 1.0
 
 
 def _month_ends(days: list[dt.date]) -> list[dt.date]:
@@ -216,19 +265,136 @@ def _universe_symbols(universe_fn, asof: dt.date) -> list[str]:
     )
 
 
-def _leg_return(
-    symbols: list[str], p0: dict[str, float], p1: dict[str, float]
-) -> float | None:
-    """Equal-weight mean return of a leg, or ``None`` if nothing in it survived.
+def _income_between(
+    divs: pl.DataFrame, formed: dt.date, held_to: dt.date
+) -> dict[str, float]:
+    """``{symbol: cash per share}`` for ex-dates in ``(formed, held_to]``.
 
-    Every symbol has a formation price by construction; one with no price at the
-    hold end has left the leg (see the module docstring's simplification note).
+    Summed, not taken first: a month can hold two ex-dates for one name (a
+    regular quarterly and a special), and keeping only one of them would book a
+    silent shortfall no assertion downstream could see.
     """
-    rets = [p1[s] / p0[s] - 1.0 for s in symbols if s in p1]
+    if divs.height == 0:
+        return {}
+    part = (
+        divs.filter(
+            (pl.col("ex_date") > formed)
+            & (pl.col("ex_date") <= held_to)
+            & pl.col("rate").is_finite()
+        )
+        .group_by("symbol")
+        .agg(pl.col("rate").sum())
+    )
+    return dict(zip(part["symbol"].to_list(), part["rate"].to_list()))
+
+
+def _last_closes(can: pl.DataFrame) -> dict[str, tuple[dt.date, float]]:
+    """``{symbol: (last_ts, last_close)}`` over the whole loaded panel.
+
+    Computed once per call rather than per month: it is the only thing that can
+    distinguish "this name stopped existing" from "this name missed a print",
+    and the answer for a given symbol does not depend on which hold is being
+    priced.
+    """
+    if can.height == 0:
+        return {}
+    last = (
+        can.sort(["symbol", "ts"])
+        .group_by("symbol", maintain_order=True)
+        .agg(pl.col("ts").last(), pl.col("close").last())
+    )
+    return {
+        s: (t, c)
+        for s, t, c in zip(
+            last["symbol"].to_list(), last["ts"].to_list(), last["close"].to_list()
+        )
+    }
+
+
+def _exits_between(
+    last: dict[str, tuple[dt.date, float]], formed: dt.date, held_to: dt.date
+) -> dict[str, float]:
+    """Exit prices for names whose last vetted close falls strictly inside the hold.
+
+    ``formed < t`` because a name whose last close *is* the formation close
+    carries no evidence of what it was worth afterwards; booking an exit there
+    would assert a 0% hold return, which is a claim rather than a measurement.
+    ``t < held_to`` because a name that prints on or after the hold end did not
+    leave — it missed a day, which is a gap, and gaps stay dropped. (Those two
+    bounds meet: a name whose last close is exactly ``held_to`` is priced at
+    ``held_to`` and never reaches this path at all.)
+    """
+    out: dict[str, float] = {}
+    for s, (t, c) in last.items():
+        if formed < t < held_to and math.isfinite(c) and c > 0:
+            out[s] = c * (1.0 + DELIST_RETURN) if c < DELIST_PRICE_FLOOR else c
+    return out
+
+
+def _leg_return(
+    symbols: list[str],
+    p0: dict[str, float],
+    p1: dict[str, float],
+    income: dict[str, float] | None = None,
+    exits: dict[str, float] | None = None,
+) -> float | None:
+    """Equal-weight mean **total** return of a leg: ``(p1 + income) / p0 - 1``.
+
+    `income` is the per-share dividend cash received over the hold, keyed by
+    symbol and already on the split-adjusted price basis. A short leg pays it
+    rather than receiving it, which the caller gets for free from
+    ``long - short``.
+
+    `exits` prices the names that stopped trading mid-hold (see
+    :func:`_exits_between`); a name in it is sold at that price instead of being
+    dropped. The hold-end price wins where both exist, which cannot happen for a
+    real delisting and is the conservative order if it ever did.
+
+    Every symbol has a formation price by construction; one with neither a
+    hold-end price nor an exit has left the leg. Returns ``None`` if nothing in
+    the leg survived.
+    """
+    inc, ex = income or {}, exits or {}
+    rets = []
+    for s in symbols:
+        if s in p1:
+            rets.append((p1[s] + inc.get(s, 0.0)) / p0[s] - 1.0)
+        elif s in ex:
+            rets.append((ex[s] + inc.get(s, 0.0)) / p0[s] - 1.0)
     if not rets:
         return None
     out = sum(rets) / len(rets)
     return out if math.isfinite(out) else None
+
+
+def _dividends_arg(dividends, start: dt.date, end: dt.date) -> pl.DataFrame:
+    """Normalise the `dividends` argument to a frame of ``symbol, ex_date, rate``.
+
+    ``"store"`` reads the warehouse over ``[start, end]`` on the adjusted basis;
+    ``None`` is the price-only series; a frame is taken as given, which is what
+    tests and callers with their own dividend source inject.
+    """
+    if dividends is None:
+        return pl.DataFrame(schema=actions.DIVIDEND_SCHEMA)
+    if isinstance(dividends, str):
+        if dividends != "store":
+            raise TypeError(
+                f"dividends must be 'store', None, or a DataFrame, got {dividends!r}"
+            )
+        return actions.read_dividends(start=start, end=end)
+    if not isinstance(dividends, pl.DataFrame):
+        raise TypeError(
+            "dividends must be 'store', None, or a DataFrame, got "
+            f"{type(dividends).__name__}"
+        )
+    missing = [c for c in ("symbol", "ex_date", "rate") if c not in dividends.columns]
+    if missing:
+        raise ValueError(f"dividends frame is missing column(s) {', '.join(missing)}")
+    return dividends.select(
+        pl.col("symbol").cast(pl.Utf8),
+        pl.col("ex_date").cast(pl.Date),
+        pl.col("rate").cast(pl.Float64),
+    )
 
 
 def monthly_longshort(
@@ -237,14 +403,24 @@ def monthly_longshort(
     end: dt.date,
     n_deciles: int = 10,
     universe_fn: Callable[[dt.date], pl.DataFrame] | None = None,
+    *,
+    dividends: str | pl.DataFrame | None = "store",
 ) -> pl.DataFrame:
     """Build the monthly equal-weight long-short return series for a signal.
 
     At each month end in ``[start, end]`` the cross-section is scored, ranked and
     split into `n_deciles` buckets; the top bucket is held long and the bottom
-    short until the next month end. Returns are **gross** — see the module
-    docstring for that decision and for how thin months, missing prices and
-    mid-hold delistings are handled.
+    short until the next month end. Returns are **gross** of costs but **include
+    dividend income** by ex-date and **delisting exits** at the last vetted
+    close — see the module docstring for both decisions and for how thin months
+    and missing prices are handled.
+
+    Note on `end`: the delisting rule reads "last close in the loaded panel", and
+    the panel is loaded over ``[start, end]``. A name whose history really
+    continues past `end` but whose last close inside the window falls in the
+    final month's hold is therefore booked as a spurious exit. Pass an `end` one
+    month past the last month you intend to use and cut the returned series to
+    make that edge unreachable.
 
     Args:
         signal_fn: ``signal_fn(asof) -> pl.DataFrame[symbol, score]``, higher
@@ -260,6 +436,11 @@ def monthly_longshort(
             names on that date, either as a frame with a ``symbol`` column (what
             :func:`tbot.warehouse.universe.build` returns) or as an iterable of
             symbols. Names outside it are dropped before ranking.
+        dividends: Keyword-only. ``"store"`` (the default) books the cash
+            dividends in the warehouse over ``[start, end]``, on the
+            split-adjusted price basis. ``None`` restores price-only returns. A
+            ``pl.DataFrame`` with ``symbol``, ``ex_date`` and ``rate`` columns
+            is used as given — the caller owns the split adjustment then.
 
     Returns:
         :data:`SERIES_SCHEMA` — ``month`` (the first of the month the return was
@@ -268,10 +449,11 @@ def monthly_longshort(
 
     Raises:
         TypeError: If `signal_fn` or `universe_fn` is not callable, the dates are
-            not date-ish, `n_deciles` is not an int, or the signal frame is not a
+            not date-ish, `n_deciles` is not an int, `dividends` is neither
+            ``"store"``, ``None`` nor a DataFrame, or the signal frame is not a
             DataFrame with a numeric score.
-        ValueError: If `start` is after `end`, `n_deciles` < 2, or the signal
-            frame is missing a required column.
+        ValueError: If `start` is after `end`, `n_deciles` < 2, or the signal or
+            dividend frame is missing a required column.
     """
     if not callable(signal_fn):
         raise TypeError(f"signal_fn must be callable, got {type(signal_fn).__name__}")
@@ -285,6 +467,9 @@ def monthly_longshort(
         raise TypeError(f"n_deciles must be an int, got {type(n_deciles).__name__}")
     if n_deciles < 2:
         raise ValueError(f"n_deciles must be >= 2, got {n_deciles}")
+    # Resolved before the panel is read so a bad argument fails in milliseconds
+    # rather than after a multi-second canonical scan.
+    divs = _dividends_arg(dividends, start, end)
 
     # The vetted series, and only it. A non-positive or non-finite close is not a
     # price a return can be computed from, and NaN would pass every threshold it
@@ -297,6 +482,7 @@ def monthly_longshort(
 
     ends = _month_ends(sorted(can["ts"].unique().to_list()))
     prices = _closes_at(can, ends)
+    last = _last_closes(can)
 
     rows: list[dict] = []
     for formed, held_to in zip(ends, ends[1:]):
@@ -320,9 +506,11 @@ def monthly_longshort(
         if width < 1:
             continue  # fewer names than buckets; the month is skipped, not zeroed
 
+        income = _income_between(divs, formed, held_to)
+        exits = _exits_between(last, formed, held_to)
         ranked = scores["symbol"].to_list()  # worst score first
-        long_leg = _leg_return(ranked[-width:], p0, p1)
-        short_leg = _leg_return(ranked[:width], p0, p1)
+        long_leg = _leg_return(ranked[-width:], p0, p1, income, exits)
+        short_leg = _leg_return(ranked[:width], p0, p1, income, exits)
         if long_leg is None or short_leg is None:
             continue  # a leg lost every name mid-hold; half a spread is not a spread
         rows.append({"month": held_to.replace(day=1), "ret_ls": long_leg - short_leg})

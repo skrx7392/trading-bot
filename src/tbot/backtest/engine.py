@@ -28,8 +28,9 @@ Documented simplifications (all of them v0)
 -------------------------------------------
 
 **Next-day execution at the close is a proxy for the next open.** The plan's
-target is "decide at the close, trade at the next open"; Stooq's opens are not
-yet validated, so the engine fills at the next *close* instead. This is neither
+target is "decide at the close, trade at the next open"; opens are not
+reconciled — the vote is on closes only — so the engine fills at the next
+*close* instead. This is neither
 uniformly conservative nor uniformly optimistic — it hands the strategy one
 extra day of price movement it did not decide on, which is noise for a monthly
 rebalance and would not be for a daily one. Upgrade this to true opens before
@@ -201,10 +202,11 @@ def _market_frame(start: dt.date, end: dt.date) -> pl.DataFrame:
     """Canonical closes for ``[start, end]`` with trailing cost-model inputs.
 
     Closes come from :func:`reconcile.read_canonical` — the vetted series, the
-    only one the engine is allowed to trade on. Volumes come from the raw bar
-    store and are *median-ed across sources* for the same reason closes are
-    voted on: Alpaca's free tier reports IEX volume, which is a fraction of the
-    consolidated tape, and one vendor's view should not halve an ADV estimate.
+    only one the engine is allowed to trade on. Volumes are *not* voted on —
+    they feed the cost model's ADV term and the liquidity screen, where a few
+    percent of error moves nothing — so they come straight from the raw bar
+    store, median-ed across whatever sources reported so one vendor's outlier
+    cannot swing the estimate.
 
     Both trailing windows end at the row they annotate, so a trade priced on day
     `d` uses only data through day `d`'s close — the same information the

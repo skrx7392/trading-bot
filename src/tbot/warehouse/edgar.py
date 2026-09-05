@@ -40,6 +40,7 @@ import json
 import math
 import os
 from collections.abc import Iterable
+from functools import lru_cache
 from pathlib import Path
 
 import polars as pl
@@ -195,17 +196,9 @@ def _write(name: str, cik: int, df: pl.DataFrame) -> None:
     os.replace(tmp, target)
 
 
-def _read(name: str, schema: pl.Schema, sort_key: tuple[str, ...]) -> pl.DataFrame:
-    """Concatenate every company's file, or return a typed empty frame."""
+def _files(name: str) -> list[Path]:
     d = _dir(name, create=False)
-    files = sorted(d.glob("*.parquet")) if d.is_dir() else []
-    if not files:
-        return pl.DataFrame(schema=schema)
-    df = pl.concat([pl.read_parquet(f) for f in files])
-    # Stable: files are globbed in sorted order and parquet preserves write order,
-    # so rows that tie on the sort key keep document order instead of whatever the
-    # sort's worker threads happen to produce. See `_PIT_SORT` for why that matters.
-    return df.select(list(schema)).sort(list(sort_key), maintain_order=True)
+    return sorted(d.glob("*.parquet")) if d.is_dir() else []
 
 
 # --- ingestion ----------------------------------------------------------------------
@@ -272,6 +265,7 @@ def ingest_companyfacts(json_bytes: bytes | str) -> int:
 
     if rows:
         _write("facts", cik, pl.DataFrame(rows, schema=FACTS_SCHEMA))
+        clear_cache()  # the memo now describes a warehouse that no longer exists
     ledger.log_event(
         FACTS_EVENT, {"cik": cik, "rows": len(rows), "skipped": skipped}
     )
@@ -345,6 +339,7 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
                 subset=list(_FILINGS_DEDUPE_KEY), keep="last", maintain_order=True
             )
         _write("filings", cik, df)
+        clear_cache()  # the memo now describes a warehouse that no longer exists
     ledger.log_event(
         FILINGS_EVENT, {"cik": cik, "rows": stored, "skipped": skipped}
     )
@@ -354,32 +349,130 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
 # --- reads --------------------------------------------------------------------------
 
 
-def read_filings() -> pl.DataFrame:
+def _scan(
+    name: str,
+    schema: pl.Schema,
+    *,
+    tags: tuple[str, ...] | None = None,
+    forms: tuple[str, ...] | None = None,
+    filed_from: dt.date | None = None,
+    filed_to: dt.date | None = None,
+) -> pl.LazyFrame:
+    """One lazy scan over every company file with the predicates pushed into it.
+
+    Pushed predicates are applied per file before concatenation, so a tag that
+    appears in 1% of rows costs 1% of the read rather than 125M rows of concat.
+    The concat is a plain vertical concat in sorted-file order; the stable sort
+    in :func:`_collect` keeps document order on ties (see :data:`_PIT_SORT`).
+    """
+    files = _files(name)
+    if not files:
+        return pl.LazyFrame(schema=schema)
+    lf = pl.scan_parquet(files)
+    if tags is not None:
+        lf = lf.filter(pl.col("tag").is_in(pl.lit(list(tags), dtype=pl.List(pl.Utf8))))
+    if forms is not None:
+        lf = lf.filter(pl.col("form").is_in(pl.lit(list(forms), dtype=pl.List(pl.Utf8))))
+    if filed_from is not None:
+        lf = lf.filter(pl.col("filed") >= filed_from)
+    if filed_to is not None:
+        lf = lf.filter(pl.col("filed") <= filed_to)
+    return lf
+
+
+def _collect(lf: pl.LazyFrame, schema: pl.Schema, sort_key: tuple[str, ...]) -> pl.DataFrame:
+    """Materialise a scan into the declared schema, or a typed empty frame.
+
+    Stable: files are globbed in sorted order and parquet preserves write order,
+    so rows that tie on the sort key keep document order instead of whatever the
+    sort's worker threads happen to produce. See :data:`_PIT_SORT` for why that
+    matters.
+    """
+    df = lf.collect()
+    if df.height == 0:
+        return pl.DataFrame(schema=schema)
+    return df.select(list(schema)).sort(list(sort_key), maintain_order=True)
+
+
+@lru_cache(maxsize=32)
+def _cached(root: str, name: str, key: tuple) -> pl.DataFrame:
+    """The memo behind both readers.
+
+    ``root`` is part of the key so tests and multi-root callers never collide;
+    ``key`` is the predicate tuple ``(tags, forms, filed_from, filed_to)``.
+    Polars frames are immutable, so handing out the cached object is safe — a
+    caller's ``with_columns`` builds a new frame and cannot poison this one.
+    """
+    schema, sort_key = (
+        (FACTS_SCHEMA, _FACTS_SORT) if name == "facts" else (FILINGS_SCHEMA, _FILINGS_SORT)
+    )
+    tags, forms, filed_from, filed_to = key
+    return _collect(
+        _scan(name, schema, tags=tags, forms=forms, filed_from=filed_from, filed_to=filed_to),
+        schema,
+        sort_key,
+    )
+
+
+def clear_cache() -> None:
+    """Forget every memoised read.
+
+    Called by both ingesters, so an ingest is immediately visible to a reader in
+    the same process. Call it yourself after replacing files under
+    ``<data_root>/edgar/`` by any other means.
+    """
+    _cached.cache_clear()
+
+
+def read_filings(
+    forms: Iterable[str] | None = None,
+    filed_from: dt.date | None = None,
+    filed_to: dt.date | None = None,
+) -> pl.DataFrame:
     """Every ingested filing, sorted by ``cik, filed, accn``.
 
+    Optionally narrowed to `forms` and to a ``filed`` window (`filed_from` and
+    `filed_to` are both inclusive). ``None`` means no predicate; an empty `forms`
+    collection means none (matching :func:`read_facts`). The predicates are
+    pushed into the parquet scan, so narrowing is cheaper than reading whole and
+    filtering afterwards, and the result is memoised per ``(data_root,
+    predicates)`` until the next ingest.
+
     Always returns the full :data:`FILINGS_SCHEMA`, including when nothing has
-    been ingested.
+    been ingested or nothing matches.
     """
-    return _read("filings", FILINGS_SCHEMA, _FILINGS_SORT)
+    if isinstance(forms, (str, bytes)):
+        raise TypeError("forms must be a collection of strings, not a bare string")
+    if forms is None:
+        wanted = None
+    else:
+        wanted = tuple(forms)
+        if any(not isinstance(f, str) for f in wanted):
+            raise TypeError("forms must be a collection of strings")
+    start = as_date(filed_from, "filed_from") if filed_from is not None else None
+    end = as_date(filed_to, "filed_to") if filed_to is not None else None
+    return _cached(str(config.data_root()), "filings", (None, wanted, start, end))
 
 
 def read_facts(tags: Iterable[str] | None = None) -> pl.DataFrame:
     """Every ingested fact, optionally narrowed to `tags`.
 
     `tags` of ``None`` means every tag; an empty collection means none (matching
-    :func:`tbot.warehouse.store.read_bars`). Always returns the full
-    :data:`FACTS_SCHEMA`, sorted by ``cik, taxonomy, tag, unit, end, filed, accn``,
-    including when nothing matches.
+    :func:`tbot.warehouse.store.read_bars`). The tag predicate is pushed into the
+    parquet scan and the result is memoised per ``(data_root, tags)`` until the
+    next ingest. Always returns the full :data:`FACTS_SCHEMA`, sorted by
+    ``cik, taxonomy, tag, unit, end, filed, accn``, including when nothing matches.
     """
-    df = _read("facts", FACTS_SCHEMA, _FACTS_SORT)
     if tags is None:
-        return df
+        return _cached(str(config.data_root()), "facts", (None, None, None, None))
     if isinstance(tags, (str, bytes)):
         raise TypeError("tags must be a collection of strings, not a bare string")
-    wanted = list(tags)
+    wanted = tuple(tags)
     if any(not isinstance(t, str) for t in wanted):
         raise TypeError("tags must be a collection of strings")
-    return df.filter(pl.col("tag").is_in(pl.lit(wanted, dtype=pl.List(pl.Utf8))))
+    if not wanted:
+        return pl.DataFrame(schema=FACTS_SCHEMA)
+    return _cached(str(config.data_root()), "facts", (wanted, None, None, None))
 
 
 def pit_facts(tag: str, asof: dt.date) -> pl.DataFrame:

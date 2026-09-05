@@ -54,16 +54,16 @@ Repo layout: `warehouse/` `backtest/` `replication/` `search/` `paper/` `docs/`.
 
 **Storage: DuckDB over Parquet.** Dataset is ~2–4 GB (daily bars, ~5,000 names, 20 years ≈ 25M rows) — columnar files, no server, rsyncable between MacBook and quasar. Rejected: Postgres/SQLite (row stores, wrong shape, ops coupling), ClickHouse (overkill). Schema carries **bar resolution as a dimension** — `bars(symbol, ts, resolution, o, h, l, c, v, source)` — so minute data (phase 4, tens of GB, date-partitioned) is an addition, not a migration.
 
-**Prices — three sources, three roles:**
+**Prices — three sources, three roles:** *(amended 2026-09-05, see Amendments)*
 - **Stooq** — free bulk historical base, includes some delisted names.
 - **Alpaca free API** — recent/current data; same integration later serves paper trading. (IEX-sourced feed; fine for daily closes, *not* representative for intraday quote research — phase-4 note.)
 - **yfinance — validation only, never the base** (survivorship-biased: delisted names silently vanish; ToS-gray). 
 
-**Three-way nightly reconciliation:** majority vote on discrepancies across Stooq/Alpaca/yfinance; disagreeing rows quarantined with source attribution logged to the decision ledger. Two sources can't tell you which is wrong; three can.
+**Three-way nightly reconciliation:** majority vote on discrepancies across Stooq/Alpaca/yfinance; disagreeing rows quarantined with source attribution logged to the decision ledger. Two sources can't tell you which is wrong; three can. *(amended 2026-09-05, see Amendments)*
 
 **Fundamentals: SEC EDGAR bulk, no contest.** Financial Statement Data Sets (quarterly XBRL dumps of every filer), `submissions` API for **acceptance timestamps** (the point-in-time key), full-text search. Only free source that is PIT by construction and includes dead companies. Paid upgrade path (Sharadar-class, ~$40/mo) buys convenience not correctness; deferred until ingestion pain is demonstrated.
 
-**Universe builder:** point-in-time universe reconstructed from EDGAR filer history (a filer that stops filing + deregistration forms ⇒ delisting candidates), cross-checked against Stooq delisted series. Default filters (overridable per registered hypothesis): US-listed common shares, price > $5, ADV > $1M. This is the fiddliest ingestion work and the largest single chunk of phase 0.
+**Universe builder:** point-in-time universe reconstructed from EDGAR filer history (a filer that stops filing + deregistration forms ⇒ delisting candidates), cross-checked against Stooq delisted series. Default filters (overridable per registered hypothesis): US-listed common shares, price > $5, ADV > $1M. This is the fiddliest ingestion work and the largest single chunk of phase 0. *(amended 2026-09-05, see Amendments)*
 
 ### 4.2 Backtester (`backtest/`)
 
@@ -150,7 +150,7 @@ Nightly ingestion, reconciliation, incremental extraction, and Kronos scoring as
 
 ## 5. Forward design notes — phases 4 and 5
 
-**Intraday (phase 4).** Where fill assumptions dominate: at daily bars a sloppy fill model costs basis points, at minute bars it invents strategies — hence the gate-3→4 requirement that the cost model be validated on our own live order history first. Minute-bar data: Alpaca free tier is IEX-only (~2–3% of volume — usable for prototyping, not for microstructure truth); full-market minute data is a paid decision at the gate. PDT makes intraday a $25k+ decision. Engine: LEAN (or equal) behind the existing strategy interface, calibrated on documented intraday effects before use. Kronos variant choice re-opens (512 bars ≈ 1.3 minute-bar days; mini's 2048 ≈ a week; throughput at ~400× inference volume).
+**Intraday (phase 4).** Where fill assumptions dominate: at daily bars a sloppy fill model costs basis points, at minute bars it invents strategies — hence the gate-3→4 requirement that the cost model be validated on our own live order history first. Minute-bar data: Alpaca free tier is IEX-only (~2–3% of volume — usable for prototyping, not for microstructure truth) *(amended 2026-09-05, see Amendments)*; full-market minute data is a paid decision at the gate. PDT makes intraday a $25k+ decision. Engine: LEAN (or equal) behind the existing strategy interface, calibrated on documented intraday effects before use. Kronos variant choice re-opens (512 bars ≈ 1.3 minute-bar days; mini's 2048 ≈ a week; throughput at ~400× inference volume).
 
 **Options (phase 5).** Free community EOD chain archives are sufficient for *feasibility* research on EOD-rebalanced defined-risk structures — the variance-risk-premium family is the one options domain with a documented persistent premium. Intraday options history has no serious free source: paid decision (~$40–80/mo class) at the gate. Retail options base rates are brutal (spread-crossing + theta); nothing here trades until the daily-bar pipeline has proven the methodology end-to-end.
 
@@ -176,6 +176,15 @@ No HFT/latency competition. No LLM discretionary trading (P2). No RL initially (
 | $25k+ PDT commitment; paid minute data; event-driven engine adoption | gate 3→4 |
 | Options data budget | gate 4→5 |
 | Cost-model ML upgrade; RL-for-execution revisit | phase-4 order volume |
+| ~~News-feed ingestion~~ — **decided 2026-09-05: scheduled for phase 2 (paper trading)**, see below | decided |
+| **8-K event features** — registered phase-1 hypothesis, see below | phase-1 replication/search |
+
+**News feed and 8-K event features (user decision, 2026-09-05; ledger ruling 41).**
+
+- **News-feed ingestion lands in phase 2, alongside paper trading** — not phase 1, and not deferred to phase 4. The reason is sequencing, not capability: running the feed while paper trading runs builds the experience and the knowledge base — how the feed behaves, how we react to it, all of it in the ledger — *before* anything news-driven can touch live capital.
+- **Point-in-time timestamps are mandatory** for any news source used in a backtest. Among the free sources only SEC filings carry an exact acceptance timestamp (`warehouse/edgar.py` submissions, already ingested); a source that cannot say when a headline was *knowable* is a look-ahead hazard and is not admissible as a backtest input, whatever it is worth live.
+- **Headline-reaction (intraday) trading stays gated behind phase 4**, with the other intraday work. Phase-2 news is for observation and feature construction, not for reacting inside the session.
+- **8-K event features are a registered phase-1 hypothesis**: item codes, filing time relative to the close, and local-model sentiment over the filing text. PIT-safe by construction (EDGAR acceptance timestamps) and zero-cost, reusing the phase-0 extraction rig and the chosen local model (A6). Registered as a hypothesis, not a commitment — it faces the same gauntlet as any return signal.
 
 ## 9. References
 
@@ -185,3 +194,44 @@ No HFT/latency competition. No LLM discretionary trading (P2). No RL initially (
 - Kronos: arXiv 2508.02739. TSFM return-forecasting evaluation: arXiv 2606.27100.
 - Fin-RATE benchmark (2026); Open FinLLM Leaderboard.
 - SEC EDGAR: Financial Statement Data Sets; submissions API; full-text search.
+
+## 10. Amendments (2026-09-05, gate 0→1)
+
+Written after the phase-0 backfills ran against real vendor data. Sections 1–9 above are the design as it stood on 2026-09-01 and are left unedited; where a statement has been overtaken it carries a pointer here. Rulings are recorded in `docs/phase0-execution/sdd-ledger.md` ("Gate 0→1 rulings").
+
+**A1. Alpaca is read on the SIP feed, split-adjusted** (amends §4.1 sources, §5 intraday). `warehouse/alpaca.py` requests `feed=sip` with `adjustment=split` (commit `9a407b4`). On this account the SIP consolidated feed reaches back to **2016**, serves **delisted tickers**, and its closes agree with yfinance's split-only closes to **~1 bp**. The spec's "Alpaca free tier is IEX-only" premise — and everything downstream of it about IEX closes diverging and IEX volume being a sliver — does not describe this account. SIP volume is consolidated tape volume. The §5 intraday note stands only as a warning about *some* free tiers, not about ours.
+
+**A2. Stooq is dropped from the warehouse** (amends §4.1 sources, §4.1 universe builder). User-approved; ledger event `decision.warehouse.sources`. Two findings, either sufficient: (i) Stooq's closes are adjusted by an **idiosyncratic per-symbol method** — on 2025-03-04 KO matches split-only exactly, AAPL is 43 bps under, BKNG 97 bps under; KO on 2016-01-04 sits 20% *below* split-only and 11% *above* total-return, so it is neither basis and not a constant offset; (ii) its bulk dump contains **zero delisted names**, which was the entire reason it was chosen as the base. Its bars are retired to `data/retired/`. `warehouse/stooq.py` stays in the tree — it still parses the dump correctly — but is no longer a source in the vote. The universe builder's "cross-checked against Stooq delisted series" is therefore void; delisting evidence comes from EDGAR filer history plus Alpaca's inactive-asset list.
+
+**A3. Price basis: split-adjusted, dividend-unadjusted, on every source** (amends §4.1). Base = **Alpaca SIP**, 2016→now, over the active *and* inactive listed symbols in `data/raw/alpaca_assets.json`. Validator, and the **sole** pre-2016 history, = **yfinance** with `auto_adjust=False`. Pre-2016 is consequently unvoted (one source trivially agrees with itself) and **survivorship-biased** — Yahoo drops delisted names rather than keeping their history — so any result leaning on pre-2016 data must say so. The reconciler is unchanged and source-agnostic: it votes over whatever the store holds, so this is an ingestion change, not an engine change. With two sources the `majority` verdict is arithmetically unreachable and the vote is binary (agree ⇒ `ok`, disagree ⇒ `quarantined`).
+
+**A4. Reconciliation stays closes-only, for a different reason** (amends §4.1 reconciliation). Controller ruling. The original justification — Alpaca reports IEX volume, a sliver of the tape — is wrong under A1. The correct one: **volume feeds only the ADV liquidity screen** (universe builder, and the cost model's ADV term), where a few percent of error changes no decision, because a name near the `min_adv` line is a name we are indifferent about. Closes buy positions and are voted on; volumes only sort names and are median-ed across sources. Voting on volume would buy nothing and would quarantine good closes over a number nothing trades on.
+
+**A5. Ticker reuse is real; the PIT ticker map is promoted to a phase-1 requirement** (amends §4.1 universe builder, §8 deferred decisions). Alpaca's `BBBY` history splices **Bed Bath & Beyond** and **Beyond Inc.** — two unrelated companies under one symbol. The `cik`→`symbol` bridge (SEC `company_tickers.json`) is a *current* mapping, so any reused ticker maps to its new owner and silently backdates that company's prices onto the dead one's filings. This was carried as a deferred minor through phase 0; it is now a phase-1 requirement, not a nicety.
+
+**A6. Extraction: golden set seeded, prompt v2 promoted, qwen3.8:27b-nvfp4 chosen** (resolves the §8 deferred decision "Quasar nightly extraction model — phase-0 bake-off result"). Golden set: **98 XBRL-verified cases**, split 53 dev / 45 holdout. Prompt v2 promoted (the units iteration flagged at T14). Bake-off: **qwen3.8:27b-nvfp4** dev 53/53, holdout **43/45**; muse-glimmer 41/45; nemotron 25/53; Claude Opus ceiling 52/53 — i.e. the local model is at the frontier model's measured ceiling on this task, at $0. Holdout independence was spent to promote v2 and is not available again without new cases. Separately: **Ollama 0.32.13's MLX runner ignores the `format` grammar entirely**, so JSON shape depends on the prompt rather than being enforced by the runtime; `parsed_fallback` is tracked per response so a prompt regression shows up as a rising fallback rate instead of hiding inside a passing score.
+
+**A7. Gate 0→1 replication criterion, power-aware — reference proposal (recorded 2026-09-05, before the fix-round re-run).**
+The original G1 ("ρ > 0.9 on ≥ 3 of 4 anomalies vs OSAP") assumed decades of overlap. The two-source window is 2016-01..2019-12 (36–47 months), over which OSAP's own `EarningsSurprise` (t = −2.07, inverted) and `Accruals` (t = +0.11) carry no signal, so ρ there measures panel composition, not correctness. The replacement for G1 proposed here, written blind and recorded before any fix-round output exists, is:
+
+- **G1a (live anomalies: `Mom12m`, `ShareIss1Y`)** — Pearson ρ ≥ **0.85** against OSAP `deciles_ew` LS over the maximal two-source window, **and** `mean_ours` within **[0.5×, 1.5×]** of `mean_osap`. Both must pass.
+- **G1b (dormant anomalies: `EarningsSurprise`, `Accruals`)** — `|mean_ours − mean_osap|` ≤ **0.5%/month** over the same window, ρ reported but not gated.
+- A dormant/live classification is made from OSAP's own series **before** looking at ours; it is recorded here so it cannot move. The classifier is `docs/gate-0-1-report.md` §10 (b1)'s: **live ⇔ |mean_osap| > 0.5%/month** over 2016-01..2019-12.
+- The panel is the universe-screened one (`universe.build`), which is the like-for-like comparison with CRSP common shares (ruling 31 — the fix-round plan's draft cited 32, which is the nightly-memory ruling).
+
+**The classification, computed once, from `data/raw/osap/<signal>.csv` over 2016-01-29..2019-12-31 (n = 48 monthly decimal returns each; t = mean / (sd/√n), sd with ddof = 1):**
+
+| OSAP series | mean/mo | sd/mo | t-stat | \|mean\| > 0.5%/mo? | Class |
+|---|---:|---:|---:|---|---|
+| `Mom12m` | +0.840% | 5.685% | +1.02 | yes | **live** |
+| `ShareIss1Y` | +1.310% | 3.901% | +2.33 | yes | **live** |
+| `EarningsSurprise` | −0.395% | 1.324% | −2.07 | no | **dormant** |
+| `Accruals` | +0.026% | 1.622% | +0.11 | no | **dormant** |
+
+These reproduce §4.4 of the gate report exactly. Note the classifier is the **mean-magnitude** rule, not a significance rule: the fix-round plan's draft of this amendment phrased it as "|t| ≥ 2 ⇒ live", which does **not** yield the classification it then names — on these numbers |t| ≥ 2 would make `EarningsSurprise` (−2.07) live and `Mom12m` (+1.02) dormant. That phrasing is recorded here as superseded, and the reason the mean rule is the right one is substantive rather than convenient: G1a asks whether we reproduce a spread that is actually *there*, and `EarningsSurprise`'s significance in this window is **inverted versus the literature**, so gating ρ on it would be gating on reproducing a sign flip. `Mom12m` pays +0.84%/month here with a t of 1.02 — a real spread the window is too short to certify — and it is exactly the anomaly the fix round's dividend and delisting work should move, so it must stay inside the gate rather than be excused out of it by low power.
+
+This is a harder bar than "3 of 4": it requires both live anomalies to reproduce in level as well as shape. The numbers above were set from the fix-round *plan*, not from its results.
+
+**Status: reference proposal, recorded 2026-09-05, before the fix-round re-run.** It does not amend §3's gate 0→1 line. The final thresholds will be set by the user after reviewing the fix-round outputs (report §11); any difference from this reference is recorded there with its rationale, so the reader can see what was proposed blind and what was chosen informed.
+
+**Decision (2026-09-05, informed by the fix-round results; report §11, ruling 40).** The user adopted **every threshold above unchanged** — ρ ≥ 0.85 and `mean_ours` ∈ [0.5×, 1.5×] `mean_osap` for the live pair, |Δmean| ≤ 0.5%/month for the dormant pair, and the `|mean_osap| > 0.5%/month` live/dormant classifier computed on the **unscreened** series. **One thing changed: the reference set.** The standard reference for G1 is now OSAP's price-screened portfolio set `PredictorAltPorts_LiqScreen_Price_gt_5` (`ex_price5`), not `deciles_ew`, because it matches the panel's construction — two-source, close > $5, ADV > $1M, alive EDGAR filer — whereas the unscreened deciles are driven by microcaps and delisted names the panel excludes by design (over 2016–2019 OSAP's own `Mom12m` pays +0.088%/mo screened against +0.840% unscreened; `ShareIss1Y` +0.269% against +1.310%). Verdict under this rule: `Mom12m` ρ **0.937 pass**, level 0.17 vs 0.60 = **0.29× fail** → **pass with caveat**, the level shortfall carried as an open item; `ShareIss1Y` ρ **0.785 fail** (CI reaches 0.875) and level 2.97× also outside the band → **fail**; `EarningsSurprise` and `Accruals` **pass** G1b (|Δ| 0.136 and 0.295 pp/month). **G1 is therefore not fully met.** The user declined to widen the level band to fit — an alternative [0.25×, 4×] band would have passed momentum on both conditions and was rejected, on the reasoning that "we can iterate on paper-trading results". Dividends and delisting exits (ruling 39) moved none of the four ρ values, so the report §10 option-(a) hypothesis for the magnitude gap is refuted; the open hypotheses are listed in report §11.7. **Direction:** proceed with phase-1 planning while nightly runs 2–5 accrue, carrying the G1 items as registered calibration limits. See also §8's news-feed and 8-K entries, which are the phase-1/phase-2 work this decision hands forward.

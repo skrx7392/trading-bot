@@ -64,6 +64,12 @@ forecaster that returns a non-finite or negative volatility. A NaN error term
 poisons a mean into a NaN ``mae``, and a NaN ``mae`` does not compare greater
 than anything — a broken candidate would quietly rank first.
 
+What is quiet, but counted: a Kronos sample path that denormalises to a
+non-positive price. It is redrawn, and dropped if it never recovers — see
+:func:`kronos_forecaster_from_predictor`, which carries the reasoning and the
+``resamples``/``dropped_paths`` counters that make the drop visible. If every
+path for one context is dropped, that is loud again.
+
 What is quiet: a symbol too short to yield a single step. That is a normal
 consequence of a 252-bar window over a young listing, not an error, so the
 symbol contributes nothing and the run continues. If *no* symbol yields a step,
@@ -79,6 +85,7 @@ Not a dependency of ``tbot`` and not installable from PyPI — see
 :func:`kronos_forecaster`, which carries the four commands.
 """
 
+import hashlib
 import math
 import os
 import statistics
@@ -545,11 +552,57 @@ def _import_kronos(repo_root=None):
     return Kronos, KronosPredictor, KronosTokenizer
 
 
+def _torch():
+    """Import torch at call time.
+
+    Not a dependency of ``tbot`` at all — see :func:`kronos_forecaster` — so the
+    import lives here, behind the one code path that needs it (seeding), and this
+    module stays importable and unit-testable on a machine with no torch.
+    """
+    import torch
+
+    return torch
+
+
+def _retry_seed(seed: int, path_index: int, attempt: int) -> int:
+    """The torch seed for one resampled draw: a pure function of its coordinates.
+
+    Reseeding a retry with the *base* seed would redraw the identical
+    pathological path forever, so the retry must move the generator — but it must
+    move it to somewhere a rerun will also go, or a seeded :func:`calibrate` stops
+    reproducing the moment the guard fires. A digest of ``(seed, path_index,
+    attempt)`` gives both. ``hash()`` would not: it is salted per interpreter.
+    """
+    digest = hashlib.blake2b(
+        f"{seed}:{path_index}:{attempt}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") % (2**63)
+
+
+class _PathologicalPath(ValueError):
+    """One sampled path that cannot be a price series — resample, then drop.
+
+    A ``ValueError`` carrying the public message verbatim, so that re-raising it
+    when every path has been dropped is indistinguishable to a caller from the
+    T15 behaviour of raising on the first bad draw. The subclass exists only so
+    the adapter's retry loop can tell "the model drew a wild sample" (retryable)
+    from "the model returned the wrong shape" (a bug; retrying it would turn one
+    clear error into several identical ones).
+    """
+
+
 def _predicted_closes(pred, horizon: int, label: str) -> pl.Series:
     """Pull the close path out of whatever ``predict`` returned.
 
     Duck-typed on purpose — the unit tests drive this with a stub predictor and
     never load a 4M-parameter model to check that a column is read by name.
+
+    Raises:
+        ValueError: If the frame has no ``close`` column or the wrong number of
+            rows — structural, and not retryable.
+        _PathologicalPath: If the path holds a non-finite or non-positive price.
+            A subclass of ``ValueError``: callers that do not know about the
+            retry loop see exactly the error they saw before it existed.
     """
     try:
         column = pred["close"]
@@ -566,7 +619,7 @@ def _predicted_closes(pred, horizon: int, label: str) -> pl.Series:
             f"{label} returned {values.size} rows, expected pred_len={horizon}"
         )
     if not np.isfinite(values).all() or values.min() <= 0.0:
-        raise ValueError(
+        raise _PathologicalPath(
             f"{label} returned a non-finite or non-positive close price "
             f"(min {values.min()}); lower the sampling temperature or drop the path"
         )
@@ -580,6 +633,8 @@ def kronos_forecaster_from_predictor(
     paths: int = 1,
     temperature: float = 1.0,
     top_p: float = 0.9,
+    max_resamples: int = 3,
+    seed: int | None = None,
 ) -> VolForecaster:
     """Adapt a live ``KronosPredictor`` to the :data:`VolForecaster` contract.
 
@@ -604,6 +659,44 @@ def kronos_forecaster_from_predictor(
     on shape — and it is the handicap the calibration is measuring, since
     :func:`calibrate` forwards whatever the caller's bars hold.
 
+    Pathological paths: resample, then drop, then raise
+    ---------------------------------------------------
+
+    A wild sample can denormalise to a non-finite or non-positive close, whose
+    logarithm is not a number. T15 shipped that as an immediate raise, and on the
+    first real run it aborted a 99-symbol × 3-variant calibration minutes in. The
+    policy here is T15's own prescription — a documented resample-with-limit, and
+    deliberately **not** a clamp: flooring a negative price at something positive
+    invents a path the model never drew and then reports its volatility as if the
+    model had, which is a fabricated forecast dressed as a real one.
+
+    So a pathological path is redrawn up to `max_resamples` times; if it is still
+    pathological it is **dropped**, and the forecast is the mean of the surviving
+    paths' realized vols. If *every* path is dropped the original ``ValueError``
+    is raised, unchanged — the model cannot forecast this context, and that is
+    not something to average around. A structurally wrong prediction (no
+    ``close`` column, the wrong number of rows) is never resampled: it is a bug,
+    not a wild sample, and redrawing it only multiplies the error.
+
+    Dropping is a silent change to what a forecast means, so it is counted. The
+    returned callable carries two integer attributes, cumulative over its whole
+    life and readable at the end of a run:
+
+    ``resamples``
+        Extra draws spent, across all calls. Divided by ``steps × paths`` this is
+        how often the guard fired.
+    ``dropped_paths``
+        Paths that never recovered. Every one of these is a forecast averaged
+        over fewer paths than it claims in its name, so a calibration driver
+        should report both numbers beside the ``mae`` table rather than beneath
+        it — a run with many drops is a run whose Kronos row is noisier than its
+        ``n`` suggests.
+
+    Under `seed` the whole thing is deterministic: retry seeds come from
+    :func:`_retry_seed`, a digest of ``(seed, path index, attempt)``, so a rerun
+    redraws exactly the same retries and a seeded :func:`calibrate` reproduces
+    even when the guard fires.
+
     Args:
         predictor: Anything exposing ``predict`` with the upstream signature.
         horizon: Bars to forecast; must match :func:`calibrate`'s `horizon`, or
@@ -612,9 +705,16 @@ def kronos_forecaster_from_predictor(
             noise of a stochastic forecaster at a linear cost in inference time.
         temperature: ``T`` — the sampling temperature.
         top_p: Nucleus-sampling mass.
+        max_resamples: Extra draws allowed per pathological path before it is
+            dropped. ``0`` drops on the first bad draw. The cost of the guard is
+            bounded at ``paths × (1 + max_resamples)`` inferences per forecast.
+        seed: Reseeds torch's global generator at the start of every forecast, so
+            one context always yields one answer; retries are reseeded from it
+            deterministically. ``None`` leaves the generator alone, and the
+            model's own RNG advances naturally between a draw and its retry.
 
     Returns:
-        A :data:`VolForecaster`.
+        A :data:`VolForecaster` carrying ``resamples`` and ``dropped_paths``.
 
     Raises:
         TypeError: If `predictor` has no ``predict``, or an argument is of the
@@ -633,6 +733,9 @@ def kronos_forecaster_from_predictor(
     if not math.isfinite(temperature) or temperature <= 0.0:
         raise ValueError(f"temperature must be positive, got {temperature}")
     top_p = _unit_interval(top_p, "top_p")
+    max_resamples = _positive_int(max_resamples, "max_resamples", minimum=0)
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise TypeError(f"seed must be an int or None, got {type(seed).__name__}")
 
     def forecast(ctx: pl.DataFrame) -> float:
         pd = _pandas()
@@ -663,27 +766,58 @@ def kronos_forecaster_from_predictor(
         )
 
         x_df = pd.DataFrame(candles)  # built once; predict() copies before writing
+        if seed is not None:
+            _torch().manual_seed(seed)
+
         vols = []
-        for _ in range(paths):
-            pred = predictor.predict(
-                df=x_df,
-                x_timestamp=x_timestamp,
-                y_timestamp=y_timestamp,
-                pred_len=horizon,
-                T=temperature,
-                top_p=top_p,
-                sample_count=1,
-                verbose=False,
-            )
-            vols.append(realized_vol(_predicted_closes(pred, horizon, "KronosPredictor.predict")))
+        last_failure = None
+        for index in range(paths):
+            for attempt in range(max_resamples + 1):
+                if attempt and seed is not None:
+                    # Move the generator somewhere a rerun will also go; without a
+                    # seed the model's own RNG has already advanced by one draw.
+                    _torch().manual_seed(_retry_seed(seed, index, attempt))
+                pred = predictor.predict(
+                    df=x_df,
+                    x_timestamp=x_timestamp,
+                    y_timestamp=y_timestamp,
+                    pred_len=horizon,
+                    T=temperature,
+                    top_p=top_p,
+                    sample_count=1,
+                    verbose=False,
+                )
+                try:
+                    closes = _predicted_closes(pred, horizon, "KronosPredictor.predict")
+                except _PathologicalPath as exc:
+                    last_failure = exc
+                    if attempt < max_resamples:
+                        forecast.resamples += 1
+                    continue
+                vols.append(realized_vol(closes))
+                break
+            else:  # every allowed draw for this path was pathological
+                forecast.dropped_paths += 1
+
+        if not vols:
+            # Loud on purpose: the model cannot forecast this context at all, and
+            # there is nothing left to take a mean of.
+            raise last_failure
         return float(sum(vols) / len(vols))
 
-    forecast.__name__ = f"kronos_h{horizon}_p{paths}"
+    forecast.__name__ = f"kronos_h{horizon}_p{paths}" + (f"_seed{seed}" if seed is not None else "")
     forecast.__qualname__ = forecast.__name__
     forecast.__doc__ = (
         f"Kronos volatility forecaster: {paths} sampled path(s) of {horizon} bars, "
-        "annualised via realized_vol."
+        f"annualised via realized_vol. Pathological paths are redrawn up to "
+        f"{max_resamples} time(s), then dropped; see `resamples` and `dropped_paths`."
+        + (f" Reseeded to {seed} on every call." if seed is not None else "")
     )
+    #: Extra draws spent on pathological paths, and paths that never recovered.
+    #: Cumulative over this forecaster's life — the honest record of how often
+    #: the guard fired, for a driver to report beside the calibration table.
+    forecast.resamples = 0
+    forecast.dropped_paths = 0
     return forecast
 
 
@@ -695,6 +829,7 @@ def kronos_forecaster(
     paths: int = 1,
     temperature: float = 1.0,
     top_p: float = 0.9,
+    max_resamples: int = 3,
     seed: int | None = None,
     repo_root=None,
 ) -> VolForecaster:
@@ -724,23 +859,27 @@ def kronos_forecaster(
             :func:`kronos_forecaster_from_predictor`.
         temperature: Sampling temperature ``T``.
         top_p: Nucleus-sampling mass.
+        max_resamples: Redraws allowed for a pathological sample path before it
+            is dropped; see :func:`kronos_forecaster_from_predictor` for the
+            resample → drop → raise policy and the counters that record it.
         seed: Seeds torch's global generator at the start of *every* forecast, so
             one context always yields one answer and a whole calibration run
-            reproduces exactly. Kronos forecasts by sampling; without this, two
-            runs of :func:`calibrate` over the same bars return different ``mae``
-            values and a "Kronos beat the EWMA" verdict is partly reading noise —
-            the same reason :data:`tbot.extraction.bakeoff.OPTIONS` pins its
-            temperature. Sampled paths *within* one call still differ from each
-            other, which is what makes `paths` worth more than 1. ``None`` leaves
-            the generator alone.
+            reproduces exactly — resampled retries included, since their seeds
+            are derived from this one. Kronos forecasts by sampling; without
+            this, two runs of :func:`calibrate` over the same bars return
+            different ``mae`` values and a "Kronos beat the EWMA" verdict is
+            partly reading noise — the same reason
+            :data:`tbot.extraction.bakeoff.OPTIONS` pins its temperature. Sampled
+            paths *within* one call still differ from each other, which is what
+            makes `paths` worth more than 1. ``None`` leaves the generator alone.
         repo_root: The Kronos checkout. Defaults to :data:`REPO_ENV_VAR`, then to
             a plain ``import model``.
 
     Returns:
-        A :data:`VolForecaster` closing over a loaded predictor. Loading is
-        eager — one call here, then every forecast is pure inference — so a
-        missing checkpoint fails before a calibration run starts rather than
-        halfway through it.
+        A :data:`VolForecaster` closing over a loaded predictor, carrying the
+        ``resamples`` and ``dropped_paths`` counters. Loading is eager — one call
+        here, then every forecast is pure inference — so a missing checkpoint
+        fails before a calibration run starts rather than halfway through it.
 
     Raises:
         TypeError: If an argument is of the wrong type.
@@ -761,6 +900,7 @@ def kronos_forecaster(
     # rather than a checkpoint download.
     horizon = _positive_int(horizon, "horizon", minimum=MIN_HORIZON)
     paths = _positive_int(paths, "paths")
+    max_resamples = _positive_int(max_resamples, "max_resamples", minimum=0)
     if device is not None and not isinstance(device, str):
         raise TypeError(f"device must be a string or None, got {type(device).__name__}")
     if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
@@ -777,21 +917,17 @@ def kronos_forecaster(
             module.eval()
 
     predictor = KronosPredictor(net, tokenizer, device=device, max_context=spec.max_context)
-    forecaster = kronos_forecaster_from_predictor(
-        predictor, horizon=horizon, paths=paths, temperature=temperature, top_p=top_p
+    # Seeding lives in the adapter rather than in a wrapper here, because the
+    # retry loop is what has to derive a reproducible seed per redraw — and
+    # because a wrapper would hide the adapter's `resamples`/`dropped_paths`
+    # counters from the caller. `torch` is still imported at call time, inside
+    # _torch(), so the adapter stays unit-testable with no torch at all.
+    return kronos_forecaster_from_predictor(
+        predictor,
+        horizon=horizon,
+        paths=paths,
+        temperature=temperature,
+        top_p=top_p,
+        max_resamples=max_resamples,
+        seed=seed,
     )
-    if seed is None:
-        return forecaster
-
-    # torch rather than the adapter, so the adapter stays importable — and
-    # unit-testable — on a machine with no torch at all.
-    import torch
-
-    def seeded(ctx: pl.DataFrame) -> float:
-        torch.manual_seed(seed)
-        return forecaster(ctx)
-
-    seeded.__name__ = f"{forecaster.__name__}_seed{seed}"
-    seeded.__qualname__ = seeded.__name__
-    seeded.__doc__ = f"{forecaster.__doc__} Reseeded to {seed} on every call."
-    return seeded
