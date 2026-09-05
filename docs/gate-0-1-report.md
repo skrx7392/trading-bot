@@ -556,7 +556,11 @@ canonical two-source symbol-days 2016-01-01..2019-12-31:
 
 The 0.93 pp the PIT map gives up is the evidence-gated bounding of symbols whose series genuinely began at a
 rename; the unmapped remainder under both maps is dominated by ETFs (`AAXJ`, `ACWI`, `AGG`, `AGZ`, `AOA`,
-`AOM`, …), which are not SEC filers and were never in the universe.
+`AOM`, …), which are not SEC filers and were never in the universe. After the fix wave's rule-2 change
+(decision D13: no old-symbol interval is inferred when the new symbol's series predates the rename) the
+nightly's rebuild (event `ca9f2f4ec0ad4543a2fbebb3367ada3a`) holds 355 rename, 660 asset and 11,423 total
+intervals; the 1,136 rows dropped were the inert old-symbol intervals of lineage-keyed renames, and the
+coverage measurement is the counter to re-run before the search branch leans on the map.
 
 **The two live calibrations, re-run on the PIT map** (same panel, `ex_price5` reference, series cut to
 `month <= 2019-12`):
@@ -572,7 +576,11 @@ rename; the unmapped remainder under both maps is dominated by ETFs (`AAXJ`, `AC
 verdicts in §11.4 stand unchanged. That is the expected outcome of the evidence gates — on a lineage-keyed
 backfill the current map was already attributing almost every stored series to the right filer — and it is
 also ruling 37's prediction (the diagnosis variant that dropped every symbol in both asset lists moved ρ by
-0.001) confirmed on the full panel.
+0.001) confirmed on the full panel. One caveat on attribution: the PIT-map re-run (`b0d2302d…`, 09:57) also
+sits after the same-morning re-base of 31 symbols (the 08:20 and 08:25 `rebase.split` events), so the
+≤ 0.001 delta is the map *plus* the re-base, not the map alone. And, registered: ruling-40/46 numbers
+reproduce only up to subsequent re-bases, because the universe's price screen runs on the split-adjusted
+basis — a later split moves a name's 2016–2019 median close and with it its membership.
 
 **Registered limit.** The map cannot tell a genuine lineage from a symbol-string splice of two companies:
 if a vendor ever serves two companies under one symbol, that series is attributed to the current owner for
@@ -648,17 +656,25 @@ inside the $5 screen (§12.2's single-source row lifts ρ to 0.817) and CRSP's o
 8.69% in 2020, against 4.27% in 2016 and 1.83% in 2026 — is explained. `tools/t17/quarantine_by_month.py`
 buckets every canonical symbol-day in 2018-01..2021-12 by month, and every `reconcile.quarantine` event in
 that window by the size of the disagreement `|alpaca/yf − 1|`. Ledger event
-`39e9d5f9e0f647d4bd59c41783909ed5` (`diagnosis.quarantine`); raw output in `data/raw/quarantine_diag.json`
-and `data/raw/quarantine_diag.log`. **7,221,479 canonical symbol-days, 434,692 quarantined (6.02%)**;
-437,574 quarantine events in the window carried both vendors' closes, over **5,225 distinct symbols**.
-(Events exceed quarantined rows by 0.7% because a re-voted symbol-day logs a second event; the read side
-keeps only the newest verdict.)
+`5e1aab5a92ee4114a0b0ab2ca3093088` (`diagnosis.quarantine`, the third run — the fix wave's recount; the
+second run `39e9d5f9e0f647d4bd59c41783909ed5` and the first `f18d0f20d8a94d0fb1656d8abd4abc95` stand in the
+ledger as superseded); raw output in `data/raw/quarantine_diag.json` and `data/raw/quarantine_diag.log`.
+**7,221,479 canonical symbol-days, 434,692 quarantined (6.02%)**; 437,574 quarantine *events* in the window
+carried both vendors' closes, over **5,225 distinct symbols**. (Events exceed quarantined rows by 0.7%
+because a re-voted symbol-day logs a second event; the read side keeps only the newest verdict.)
+
+*Deviation from the task-11 brief, stated.* The brief's tool bucketed the gaps over the whole window; the
+shipped tool adds the by-month cross-tab (accepted in the execution ledger, since the aggregate alone
+could not select an outcome), and the third run counts the persistent floor on **current verdicts** rather
+than on events, adds the per-name median close ratio and the rates conditional on two sources. Nothing about
+the vote, the tolerance or the data changed between the runs; the event-based tables below reproduce the
+second run to the row.
 
 **It is a regime with month-boundary edges, and the calendar year hid them.** The rate averages **4.03%**
-across 2018-01..2018-11 (range 3.87–4.47%), steps to 6.78% in **2018-12** and stays between 6.4% and 10.1% for 28 consecutive
-months through **2021-03**, then falls to 2.90% in 2021-04 and settles at **3.18%** across 2021-06..2021-12.
-So the elevated period starts a month before 2019 and ends a quarter into 2021; "2019–2020" is an artifact
-of bucketing by calendar year. The 29 months above 5%:
+across 2018-01..2018-11 (range 3.87–4.47%), steps to 6.78% in **2018-12** and stays between 6.36% and 10.05%
+for 28 consecutive months through **2021-03**, then falls to 2.90% in 2021-04 and settles at **3.18%**
+across 2021-06..2021-12. So the elevated period starts a month before 2019 and ends a quarter into 2021;
+"2019–2020" is an artifact of bucketing by calendar year. The 29 months above 5%:
 
 | Month | Rows | Quar. | Rate | Month | Rows | Quar. | Rate | Month | Rows | Quar. | Rate |
 |---|---:|---:|---:|---|---:|---:|---:|---|---:|---:|---:|
@@ -677,7 +693,16 @@ of bucketing by calendar year. The 29 months above 5%:
 Peak month **2020-03** (15,704 of 156,185 = 10.05%), the payload's `peak_month`. 2021-05 (5.21%) and
 2021-06 (4.08%) are a ragged two-month tail after the 2021-04 drop, not a second regime.
 
-**What kind of disagreement, over the whole window:**
+**Conditional on two sources, the step is larger than the headline rates show.** Only a two-source day can
+be quarantined, and the two-source share of the panel itself rises across the window. Pooled over each
+window's rows (`by_regime` in the payload): the headline rate goes 4.03% → 7.71% → 3.18% across
+2018-01..2018-11, 2018-12..2021-03 and 2021-06..2021-12, while **among two-source days it goes 5.65% →
+10.10% → 3.81%** and the two-source share goes **71.3% → 76.4% → 83.6%**. So the regime's step is +4.45 pp
+conditionally against +3.68 pp headline, and part of the post-2021 fall in the headline rate is the panel
+becoming more two-source rather than less disputed — the conditional rate after the regime is still below
+the 2018 baseline on both measures.
+
+**What kind of disagreement, over the whole window** (event counts — one per vote):
 
 | Gap `abs(alpaca/yf − 1)` | 10–50 bps | 0.5–2% | 2–10% | 10–50% | 50%–5× | > 5× |
 |---|---:|---:|---:|---:|---:|---:|
@@ -685,7 +710,8 @@ Peak month **2020-03** (15,704 of 156,185 = 10.05%), the payload's `peak_month`.
 | Share | 40.5% | 16.3% | 10.6% | 14.5% | 12.4% | 5.6% |
 
 No single bucket dominates the window, so the aggregate alone selects none of the three diagnoses. The
-month-by-month cross-tab does, because the buckets move independently — mean events per month:
+month-by-month cross-tab does, because the buckets move independently — mean events per month (the
+parenthetical rates are the mean of the monthly rates, as in the table above):
 
 | Regime | 10–50 bps | 0.5–2% | 2–10% | 10–50% | 50%–5× | > 5× | total | > 10% |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -694,52 +720,100 @@ month-by-month cross-tab does, because the buckets move independently — mean e
 | — of which 2020-03..2020-07 (9.32%) | 6,514 | **3,428** | **1,490** | 1,280 | 1,068 | 461 | 14,239 | 2,808 |
 | 2021-06..2021-12 (3.18%) | 993 | 651 | 654 | 1,222 | 1,072 | 855 | 5,447 | 3,149 |
 
-**The lift is entirely sub-2%, and the price-corrupting buckets carry none of it.** The regime adds
-**+5,790 quarantines per month** over the 2018 baseline: **+4,596 of them (79.4%) are 10–50 bps** and
-+1,371 are 0.5–2% — together **103% of the excess**, because the three buckets above 10% are *net −335*
-per month (−191, −208, +64). Large disagreements — splices, missed splits, partial back-adjustments — run
-at 2,515–3,416 events a month (mean 2,962) across all four years and are visibly *not* elevated in
-2019–2020 — their two quietest months, 2020-02 and 2021-01, are inside the regime. The COVID quarter adds its own component in the 0.5–2% and 2–10% buckets (2020-03 alone: 4,847 and 2,550,
-against 695 and 925 in the 2018 baseline) — two vendors disagreeing more about a close on days the close
-moved 10%, which is the one part of the picture with an obvious mechanism.
+**The *excess* is sub-2%, and the price-corrupting buckets carry none of it — but they are a quarter of the
+regime's quarantines, not a footnote.** The regime adds **+5,790 quarantine events per month** over the
+2018 baseline: **+4,596 of them (79.4%) are 10–50 bps** and +1,371 are 0.5–2% — together **103% of the
+excess**, because the three buckets above 10% are *net −335* per month (−191, −208, +64). Those large
+disagreements — splices, missed splits, partial back-adjustments, and the vendor-basis floor below — run at
+2,515–3,416 events a month (mean 2,962) across all four years and are visibly *not* elevated in 2019–2020
+(their two quietest months, 2020-02 and 2021-01, are inside the regime); but at 2,834 of the regime's 11,546
+events a month they are still **24.5%** of what the regime quarantines. The COVID quarter adds its own
+component in the 0.5–2% and 2–10% buckets (2020-03 alone: 4,847 and 2,550, against 695 and 925 in the 2018
+baseline) — two vendors disagreeing more about a close on days the close moved 10%, which is the one part of
+the picture with an obvious mechanism.
 
-**The constant floor is a set of names that never agree.** 140 of the 5,225 symbols are quarantined on ≥ 900
-of the window's ~1,008 trading days. The top-30 list is `FTFT` (1,166 events — re-votes) followed by 28
-names all tied at 1,008, i.e. every trading day: `APH`, `ABTS`, `ADEA`, `AEHL`, `AEMD`, `AGEN`, `ANAB`,
-`ARMK`, `AROW`, `ATRO`, `AVK`, `BDX`, `BHP`, `BWA`, `CBIO`, `CBSH`, `CENN`, `CENT`, `CHGX`, `CIG`, `CLM`,
-`CLWT`, `CMCSA`, `CMCT`, `CNH`, `CNQ`, `CRESY`, `CRF`, `DBVT`. That list is alphabetical inside the tie, so
-it is a sample of the 140 and not a ranking — but it is a broad cross-section (mega-caps `CMCSA`, `BDX`,
-`APH`; ADRs `BHP`, `CIG`, `CNQ`, `CRESY`; closed-end funds `AVK`, `CLM`, `CRF`; microcaps `AEHL`, `CLWT`).
-Being constant across all 48 months, they are the ~3% floor and arithmetically cannot be the lift.
+**The constant floor is a set of names on two adjustment bases, and it is a registered limit.** On current
+verdicts, **138 of the 5,225 symbols are quarantined on ≥ 900 of the window's 1,008 sessions** — 120 of them
+on every session — and being constant across all 48 months they are the floor and arithmetically cannot be
+the lift. (The second run counted 140 on *events*, which count every vote a symbol-day ever received; `APH`
+was one of the two, at 1,010 events, and it is not in the floor: it was re-based that morning and its 2
+remaining quarantined days are real.) The mechanism is visible per name in the median `alpaca/yf` close
+ratio over its quarantined days: **128 of the 138 sit at a constant ratio of 2% or more, 98 at 10% or
+more**, and only 2 are inside the 10–50 bps bucket where a close convention would put them. The ratios are
+what one corporate action, adjusted for by one vendor and not by the other, leaves behind: simple
+fractions for a consolidation (`UHAL` 10.0, `AEHL` 64, `DBVT` 5.0, `IESC` 0.5, `ABTS` 15, `RCON` 200) and
+small non-integer factors for a spin-off distribution or a reclassification (`ZBH` 1.030, `LEN` 1.033,
+`CMCSA` 1.067, `BWA` 1.136, `GSK` 1.250, `LBTYK` 1.91). Alpaca's close is the higher one for 123 of the 138.
+These are not microcaps the screen would have dropped anyway: **130 of the 138 have a median close above the
+universe's $5 line**, and the set includes `CMCSA`, `HON`, `MMM`, `GE`, `T`, `IBM`, `FDX`, `BDX`, `DHR`,
+`SPGI`, `LH`, `DD`. Each has been absent from the canonical panel — and therefore from the universe and
+every calibration — for its *entire* history, on every day of it, and a re-base does not touch it: the
+re-base re-pulls both vendors' current series, and the two current series disagree by the same constant.
+**Registered as a limit**, with the follow-up: identify the corporate action per floor name from
+`data/actions` (splits, dividends, name changes, mergers) and decide, per action type, which vendor's basis
+matches spec A3 — a consolidation is a split and belongs on the split-adjusted basis; a spin-off
+distribution is not, and does not — then re-pull the side that is wrong and re-vote. Until that is done,
+the panel's coverage excludes these names and the universe never sees them.
 
-**Disposition: the third outcome — tolerance, not data. No action; `DEFAULT_TOL` stays at 10 bps.** Chosen
-on the excess rather than the window aggregate: 79.4% of the regime's extra quarantines are disagreements
-between 10 and 50 bps, and 103% of them are under 2%. The first outcome's re-pull is **not** triggered, on
-two grounds. *Size*: an adjustment-basis event (a silent yfinance dividend or split revision, spec A3) is
-percent-scale on a typical payer and an integer factor on a split, and four fifths of the excess is under
-50 bps. *Shape*, which is the stronger one: an adjustment basis applies to a vendor's whole stored series
-for a symbol, so it shows as a name that disagrees on **every** day — exactly the 140-name floor, flat
-across all 48 months — and not as a regime that switches on at one month boundary and off at another across
-thousands of names. A re-pull swaps our fixed-vintage yfinance series for today's; nothing here suggests
-today's vintage would print different closes for these months, and the set it would cover is not a short
-list of symbol-months but essentially the whole cross-section for 28 of them. The second outcome's splices
-are the flat >10% floor, already handled on the read side by ruling 43's break detector and by the
-quarantine itself. Ruling 29's rule stands as written: the climbing rate was a vendor problem to investigate, the
-investigation is this section, and its answer is not a reason to widen `tol`.
+**Disposition: the third outcome — tolerance, not data. No action on the regime; `DEFAULT_TOL` stays at 10
+bps.** Chosen on the excess rather than the window aggregate: 79.4% of the regime's extra quarantines are
+disagreements between 10 and 50 bps, and 103% of them are under 2%. The first outcome's re-pull is **not**
+triggered for the regime, on two grounds. *Size*: an adjustment-basis event (a silent yfinance dividend or
+split revision, spec A3) is percent-scale on a typical payer and an integer factor on a split, and four
+fifths of the excess is under 50 bps. *Shape*, which is the stronger one: an adjustment basis applies to a
+vendor's whole stored series for a symbol, so it shows as a name that disagrees on **every** day — exactly
+the 138-name floor, flat across all 48 months — and not as a regime that switches on at one month boundary
+and off at another across thousands of names. A re-pull swaps our fixed-vintage yfinance series for today's;
+nothing here suggests today's vintage would print different closes for these months, and the set it would
+cover is not a short list of symbol-months but essentially the whole cross-section for 28 of them. The
+floor *is* the adjustment-basis case, and for it the answer is the registered follow-up above, not a blanket
+re-pull. The second outcome's splices are the flat >10% remainder, already handled on the read side by
+ruling 43's break detector and by the quarantine itself. Ruling 29's rule stands as written: the climbing
+rate was a vendor problem to investigate, the investigation is this section, and its answer is not a reason
+to widen `tol`.
 
 **What this means for gap 6.** A result may lean on 2019–2020 — the exposure is *coverage*, not
 contamination. The rows the regime *adds* to the quarantine are ones where the two vendors printed closes
 within 2% (four fifths of them within 50 bps) of each other; the panel loses ~3.7 pp more of its
-symbol-days per month than in 2018, and — the large-gap buckets being net negative across the regime — not
-one of those extra losses is a bar where a vendor printed a price the other would call wrong by an order of
-magnitude. This bears directly on the replication window: 13 of the development window's 48 months
-(2018-12..2019-12) sit inside the regime, and the sensitivity check §9 asked for is the calibration grid in
-§12.2–12.4, which re-runs the same anomalies with the panel varied.
+symbol-days per month than in 2018 (+4.45 pp among two-source days), and — the large-gap buckets being net
+negative across the regime — not one of those extra losses is a bar where a vendor printed a price the other
+would call wrong by an order of magnitude. This bears directly on the replication window: 13 of the
+development window's 48 months (2018-12..2019-12) sit inside the regime, and the sensitivity check §9 asked
+for is the calibration grid in §12.2–12.4, which re-runs the same anomalies with the panel varied.
 
-**Registered limits.** (a) *Which* vendor moved is not identified. A 10–50 bps difference is a close
-convention — consolidated official close versus last trade, or rounding — and this measurement sees only
-the gap, not which side changed; the month-boundary edges (2018-12 in, 2021-04 out) say a vintage or
+**Registered limits.** (a) *Which* vendor moved in the regime is not identified. A 10–50 bps difference is a
+close convention — consolidated official close versus last trade, or rounding — and this measurement sees
+only the gap, not which side changed; the month-boundary edges (2018-12 in, 2021-04 out) say a vintage or
 convention changed on one side, and no ledger event of ours records such a change. (b) The event counts are
-per *vote*, so a re-voted symbol-day is counted twice; at 0.7% over the canonical row count this cannot
-move any share above. (c) Pairs where either vendor is absent are skipped by construction, so this says
-nothing about single-source days, which the `min_sources` filter handles separately.
+per *vote*, so a re-voted symbol-day is counted twice; at 0.7% over the canonical row count this cannot move
+any share above, and the floor is counted on verdicts, where it cannot arise. (c) Pairs where either vendor
+is absent are skipped by construction, so the bucket tables say nothing about single-source days; the
+conditional line above is the measurement that accounts for them. (d) The vendor-basis floor, as above:
+138 names, entire history, untouched by a re-base, follow-up registered (carried into §12.6).
+
+### 12.6 Registered limits carried into the search branch
+
+Three limits the whole-branch review named are carried rather than fixed here, and the search-protocol plan
+takes them as prerequisites (decisions D12–D14 in `docs/phase1/decisions-taken.md`):
+
+1. **Panel-horizon truncation — look-ahead in where the break detector is applied.** `read_canonical`'s
+   confirmed-break truncation is applied at the horizon of the frame it is handed, and two consumers hand it
+   one panel for the whole window — `metrics.monthly_longshort` and `engine._market_frame` — so a break
+   confirmed in 2018 removes the 2016–2017 rows for every formation date in the window, including the 2017
+   ones that could not have seen it (the point-in-time consumers, `universe.build` and the fundamental
+   signals, pass `end=asof` and are not affected). Pre-existing since ruling 30; the direction flatters (a dead
+   issuer's history leaves the panel early); the exposure is a two-vendor-agreed ≥ 5× break on a name past
+   the $5 and $1M screens. Every calibration number in §11–§12 carries it. Fix sketch: read the panel with
+   `max_jump=None` and apply the cutoff per formation month — truncate each name at the last break confirmed
+   by *that month's* horizon — then re-run the calibrations to quantify the change, under its own ruling and
+   ledger event. Nothing trades on these numbers before that re-run.
+2. **`process_date` vendor semantics.** The engine's merger and rename filters (ruling 45) assume Alpaca's
+   `process_date` is the first non-trading day under the old name; if it is the last trading day, cash
+   mergers book as `gap_exceeded` exits at the last close, five days late. One `reason` count on a
+   real-warehouse engine run over the development window (38 mergers, 23 renames) settles it. Not yet run.
+3. **The vendor-basis floor (§12.5).** 138 names quarantined on ≥ 900 of the window's 1,008 sessions because
+   the two vendors sit on different adjustment bases for the whole series (one adjusted for a
+   consolidation, spin-off or reclassification, the other not) — absent from the canonical panel and from
+   the universe for their entire history, and untouched by a re-base. Follow-up: identify the corporate
+   action per floor name from `data/actions` and decide which vendor's basis matches spec A3 (a
+   consolidation is a split; a spin-off distribution is not).

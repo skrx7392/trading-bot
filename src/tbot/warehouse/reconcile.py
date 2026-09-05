@@ -98,13 +98,26 @@ retroactive.
     ``max_jump=None`` disables the detector.
 
     ``end`` bounds the detector, because ``end`` is a *point-in-time horizon*
-    and not a display filter: every consumer here passes ``end=asof``, and
-    letting a break the caller could not yet have known about retract history it
-    could legitimately have traded would put look-ahead — and survivorship bias,
-    in the direction that flatters a backtest — into every result. A name that
+    and not a display filter: the point-in-time consumers — ``universe.build``
+    and the fundamental signals — pass ``end=asof``, and letting a break the
+    caller could not yet have known about retract history it could
+    legitimately have traded would put look-ahead — and survivorship bias, in
+    the direction that flatters a backtest — into every result. A name that
     collapses 100x in 2021 would otherwise vanish from the 2020 universe. The
     contamination is still reached, one horizon later: the moment ``asof`` moves
     past the splice, the dead issuer's history stops being returned.
+
+    **Two consumers do not pass ``end=asof``, and that is a registered limit
+    (decision D12, report §12.6).** ``metrics.monthly_longshort`` and
+    ``engine._market_frame`` read one panel through the *window's* end, so a
+    break confirmed in 2018 truncates the 2016–2017 rows for every formation
+    date in the window, including the 2017 ones that could not have seen it.
+    The exposure is a two-vendor-agreed 5x break on a name past the $5 and
+    $1M screens, and the direction is the flattering one — the dead issuer's
+    history leaves the panel early. Every calibration number carries it. The
+    fix belongs to the search branch's first prerequisite task: read the panel
+    with ``max_jump=None`` and apply the truncation per formation month at
+    that month's horizon, then re-run the calibrations to quantify the change.
 
     ``start`` bounds it too, and — unlike ``end`` — bounding it there changes
     nothing about the answer. Under "keep the tail at and after the *last* break

@@ -64,6 +64,15 @@ stays inside the registered limit.
 
 **Verdict.** `Mom12m`: **moved the level limit** — the price-only screen (`--min-adv 0`) lifts the level from 0.25× to 0.91× of the screened reference, inside the [0.5×, 1.5×] band, at ρ 0.868 [0.752, 0.932] — so the momentum level gap is the ADV screen (our panel drops the illiquid tail OSAP's $5 screen keeps). `ShareIss1Y`: **did not** — ρ falls to 0.640 and the level stays outside the band (2.16×). Neither is re-scored: see §4.
 
+**A named candidate for the momentum level, not run: an unadjusted-price screen.** `universe.build`'s
+`min_price` is applied to the *split-adjusted* canonical close, so a name that later split (or reverse-split)
+is screened at a price its shareholders never saw at formation time, while OSAP's $5 screen is on CRSP's
+as-traded price. Two consequences, both untested: the panel's composition inside the $5 line differs from
+the reference's in a way that moves with every re-base (report §12.1's attribution caveat), and the
+momentum level — the limit most sensitive to composition in this grid — is where it would show first. The
+experiment is a `min_price` screen on the unadjusted close (the canonical close divided back through
+`actions.read_splits`), one cell, no calibration change.
+
 ### Hypothesis 2 — formation-date timing
 
 **Statement (§11.7).** "OSAP forms on the CRSP month-end, we on the last two-source trading day; not always
