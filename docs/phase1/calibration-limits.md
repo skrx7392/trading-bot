@@ -11,7 +11,7 @@ screen or the source rule *to fit the reference* is the failure mode report §10
 because it tripped"); if any cell below moves a live anomaly inside the band, that is evidence to put in front
 of the user with both numbers, not a new headline.
 
-Cells the controller has not yet run are marked **_(controller fills in after the grid runs)_**.
+Every cell has been run (2026-09-05, PIT map, `ex_price5`); each number below is reproducible from the ledger event named beside it.
 
 ---
 
@@ -57,12 +57,12 @@ stays inside the registered limit.
 
 | Cell | Flags | ρ | 95% CI | n | mean ours | mean ref | level | Ledger event |
 |---|---|---:|---|---:|---:|---:|---:|---|
-| `Mom12m:ex_price5:base` | defaults | _(controller fills in after the grid runs)_ | | | | | | |
-| `Mom12m:ex_price5:adv0` | `--min-adv 0` | _(controller fills in after the grid runs)_ | | | | | | |
-| `ShareIss1Y:ex_price5:base` | defaults | _(controller fills in after the grid runs)_ | | | | | | |
-| `ShareIss1Y:ex_price5:adv0` | `--min-adv 0` | _(controller fills in after the grid runs)_ | | | | | | |
+| `Mom12m:ex_price5:base` | defaults | 0.9358 | [0.877, 0.967] | 36 | +0.147% | +0.595% | 0.25× | `ee541aa560e2464badc0771c066a171a` |
+| `Mom12m:ex_price5:adv0` | `--min-adv 0` | 0.8677 | [0.754, 0.931] | 36 | +0.541% | +0.595% | 0.91× | `4ee9c762671841f0a4618a1decbff107` |
+| `ShareIss1Y:ex_price5:base` | defaults | 0.7849 | [0.643, 0.875] | 47 | +0.387% | +0.132% | 2.93× | `54f25b2b487b4196a306eb480ee619db` |
+| `ShareIss1Y:ex_price5:adv0` | `--min-adv 0` | 0.6403 | [0.433, 0.783] | 47 | +0.285% | +0.132% | 2.16× | `d931bfbd4e544fefa13f04dd170da731` |
 
-**Verdict.** _(controller fills in after the grid runs)_ — moved the limit / did not, per anomaly.
+**Verdict.** `Mom12m`: **moved the level limit** — the price-only screen (`--min-adv 0`) lifts the level from 0.25× to 0.91× of the screened reference, inside the [0.5×, 1.5×] band, at ρ 0.868 [0.752, 0.932] — so the momentum level gap is the ADV screen (our panel drops the illiquid tail OSAP's $5 screen keeps). `ShareIss1Y`: **did not** — ρ falls to 0.640 and the level stays outside the band (2.16×). Neither is re-scored: see §4.
 
 ### Hypothesis 2 — formation-date timing
 
@@ -114,13 +114,12 @@ vendor never covered are largely the same tail.
 
 | Cell | Flags | ρ | 95% CI | n | mean ours | mean ref | level | Ledger event |
 |---|---|---:|---|---:|---:|---:|---:|---|
-| `Mom12m:ex_price5:src1` | `--min-sources 1` | _(controller fills in after the grid runs)_ | | | | | | |
-| `Mom12m:ex_price5:adv0src1` | `--min-adv 0 --min-sources 1` | _(controller fills in after the grid runs)_ | | | | | | |
-| `ShareIss1Y:ex_price5:src1` | `--min-sources 1` | _(controller fills in after the grid runs)_ | | | | | | |
-| `ShareIss1Y:ex_price5:adv0src1` | `--min-adv 0 --min-sources 1` | _(controller fills in after the grid runs)_ | | | | | | |
+| `Mom12m:ex_price5:src1` | `--min-sources 1` | 0.9430 | [0.899, 0.968] | 47 | -0.460% | +0.052% | -8.88× | `2ca2576ca3874be78212470a61ad6347` |
+| `Mom12m:ex_price5:adv0src1` | `--min-adv 0 --min-sources 1` | 0.8444 | [0.736, 0.911] | 47 | +0.462% | +0.052% | 8.91× | `3735d25380de4f94900bfbb370c98c55` |
+| `ShareIss1Y:ex_price5:src1` | `--min-sources 1` | 0.8171 | [0.692, 0.894] | 47 | +0.330% | +0.132% | 2.50× | `edaaa524429e4755990588c2c61c0069` |
+| `ShareIss1Y:ex_price5:adv0src1` | `--min-adv 0 --min-sources 1` | 0.6833 | [0.493, 0.811] | 47 | +0.238% | +0.132% | 1.80× | `94cd39c14d2f42549719bf2675e5258e` |
 
-**Verdict.** _(controller fills in after the grid runs)_ — a sensitivity, never a headline; if a `src1` cell
-moves a live anomaly inside the band, that is the report-§10 failure mode and a decision for the user.
+**Verdict.** A sensitivity, never a headline. `min_sources=1` extends the overlap to 47 months (the single-source months of 2016 re-enter) and re-admits ruling 30's contamination: `Mom12m` shows ρ 0.943 with a **negative** mean (−0.46%/mo against a 47-month reference mean of +0.05%), `ShareIss1Y` ρ 0.817 at 2.50×. Nothing here moves a limit; the single-source cells describe a different, dirtier panel and stay under the b2 caveat.
 
 ### Hypothesis 4 — the `ShareIss1Y` definition
 
@@ -191,10 +190,9 @@ two-year change and fails the equality test.
 
 | Cell | Flags | ρ | 95% CI | n | mean ours | mean ref | level | Ledger event |
 |---|---|---:|---|---:|---:|---:|---:|---|
-| `ShareIss1Y:ex_price5:lag` | `--lag-days 180` | _(controller fills in after the grid runs)_ | | | | | | |
+| `ShareIss1Y:ex_price5:lag` | `--lag-days 180` | 0.7881 | [0.647, 0.877] | 47 | +0.247% | +0.132% | 1.87× | `10d69e9faadb406babd5657d83f56835` |
 
-**Verdict.** _(controller fills in after the grid runs)_ — moved the shape limit / did not, against
-`ShareIss1Y:ex_price5:base`.
+**Verdict.** The six-month lag **did not move the shape limit** (ρ 0.788 [0.648, 0.877] against 0.785) but moved the level toward the reference (2.93× → 1.87×), still outside the band. OSAP's alignment is not what separates our issuance series from theirs in shape.
 
 #### Split adjustment (fifth experiment — ruling D11)
 
@@ -227,11 +225,10 @@ that reproduces ruling 40 is the *flagged* one; the `cell` echo on every `CALIB_
 
 | Cell | Flags | ρ | 95% CI | n | mean ours | mean ref | level | Ledger event |
 |---|---|---:|---|---:|---:|---:|---:|---|
-| `ShareIss1Y:ex_price5:nosplit` | `--no-split-adjust` (ruling 40's definition) | _(controller fills in after the grid runs)_ | | | | | | |
-| `ShareIss1Y:ex_price5:split` | defaults (split-adjusted) | _(controller fills in after the grid runs)_ | | | | | | |
+| `ShareIss1Y:ex_price5:nosplit` | `--no-split-adjust` (ruling 40's definition) | 0.7849 | [0.643, 0.875] | 47 | +0.387% | +0.132% | 2.93× | `54f25b2b487b4196a306eb480ee619db` |
+| `ShareIss1Y:ex_price5:split` | defaults (split-adjusted) | 0.7954 | [0.659, 0.881] | 47 | +0.672% | +0.132% | 5.10× | `fef23b3f836f4373a6263794527829c9` |
 
-**Verdict.** _(controller fills in after the grid runs)_ — moved the shape limit / did not, `split` against
-`nosplit` on the same panel.
+**Verdict.** Split adjustment lifts ρ by 0.011 (0.795 [0.658, 0.881]) and moves the level **away** from the reference (2.93× → 5.10×): the as-filed counts had put names that just split — momentum winners — spuriously in the short leg, and removing them widens our spread. With the lag as well (`ShareIss1Y:ex_price5:lag180:split`, `f5d5865f74a148c1b8abcfff7266e152`): ρ 0.787, 2.28×. The definition is now OSAP's; the shape gap is not definitional.
 
 ---
 
@@ -244,17 +241,17 @@ under (the ledger cannot tell them apart by label alone; the `CALIB_DONE` `cell`
 
 | # | Cell label | `--min-adv` | `--min-sources` | `--lag-days` | `split_adjust` | ρ | level | Moved? | Ledger event |
 |---:|---|---:|---:|---:|---|---:|---:|---|---|
-| 1 | `Mom12m:ex_price5:base` | 1e6 | 2 | — | — | _(controller fills in after the grid runs)_ | | | |
-| 2 | `Mom12m:ex_price5:adv0` | 0 | 2 | — | — | _(controller fills in after the grid runs)_ | | | |
-| 3 | `Mom12m:ex_price5:src1` | 1e6 | 1 | — | — | _(controller fills in after the grid runs)_ | | | |
-| 4 | `Mom12m:ex_price5:adv0src1` | 0 | 1 | — | — | _(controller fills in after the grid runs)_ | | | |
-| 5 | `ShareIss1Y:ex_price5:base` | 1e6 | 2 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
-| 6 | `ShareIss1Y:ex_price5:adv0` | 0 | 2 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
-| 7 | `ShareIss1Y:ex_price5:src1` | 1e6 | 1 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
-| 8 | `ShareIss1Y:ex_price5:adv0src1` | 0 | 1 | 0 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
-| 9 | `ShareIss1Y:ex_price5:lag` | 1e6 | 2 | 180 | _(controller states)_ | _(controller fills in after the grid runs)_ | | | |
-| 10 | `ShareIss1Y:ex_price5:nosplit` | 1e6 | 2 | 0 | false | _(controller fills in after the grid runs)_ | | | |
-| 11 | `ShareIss1Y:ex_price5:split` | 1e6 | 2 | 0 | true | _(controller fills in after the grid runs)_ | | | |
+| 1 | `Mom12m:ex_price5:base` | 1e6 | 2 | — | — | 0.9358 | 0.25× | reference row | `ee541aa560e2464badc0771c066a171a` |
+| 2 | `Mom12m:ex_price5:adv0` | 0 | 2 | — | — | 0.8677 | 0.91× | **level: 0.25× → 0.91×** (inside the band); ρ 0.868 | `4ee9c762671841f0a4618a1decbff107` |
+| 3 | `Mom12m:ex_price5:src1` | 1e6 | 1 | — | — | 0.9430 | -8.88× | sensitivity (47-month overlap, ρ 0.943, mean −0.46%) | `2ca2576ca3874be78212470a61ad6347` |
+| 4 | `Mom12m:ex_price5:adv0src1` | 0 | 1 | — | — | 0.8444 | 8.91× | sensitivity | `3735d25380de4f94900bfbb370c98c55` |
+| 5 | `ShareIss1Y:ex_price5:base` | 1e6 | 2 | 0 | false | 0.7849 | 2.93× | reference row | `54f25b2b487b4196a306eb480ee619db` |
+| 6 | `ShareIss1Y:ex_price5:adv0` | 0 | 2 | 0 | false | 0.6403 | 2.16× | no (ρ 0.640) | `d931bfbd4e544fefa13f04dd170da731` |
+| 7 | `ShareIss1Y:ex_price5:src1` | 1e6 | 1 | 0 | false | 0.8171 | 2.50× | sensitivity (ρ 0.817) | `edaaa524429e4755990588c2c61c0069` |
+| 8 | `ShareIss1Y:ex_price5:adv0src1` | 0 | 1 | 0 | false | 0.6833 | 1.80× | sensitivity | `94cd39c14d2f42549719bf2675e5258e` |
+| 9 | `ShareIss1Y:ex_price5:lag` | 1e6 | 2 | 180 | false | 0.7881 | 1.87× | level 2.93× → 1.87×; shape +0.003 | `10d69e9faadb406babd5657d83f56835` |
+| 10 | `ShareIss1Y:ex_price5:nosplit` | 1e6 | 2 | 0 | false | 0.7849 | 2.93× | reference row | `54f25b2b487b4196a306eb480ee619db` |
+| 11 | `ShareIss1Y:ex_price5:split` | 1e6 | 2 | 0 | true | 0.7954 | 5.10× | shape +0.011; level 2.93× → 5.10× (away) | `fef23b3f836f4373a6263794527829c9` |
 
 Hypothesis 2 has no cell: it closed on the diagnostic (`17354d8bfc4e4633bf88eae14a60781e`).
 
@@ -262,8 +259,15 @@ Hypothesis 2 has no cell: it closed on the diagnostic (`17354d8bfc4e4633bf88eae1
 
 ## 4. Ruling 46 and the `calibration.limits` event
 
-_(controller fills in after the grid runs)_ — the limits as registered (§1), what each hypothesis and the
-fifth experiment did (§2), the `calibration.limits` ledger event id, and the grid event ids.
+Ruling 46 (SDD ledger) registers the two limits exactly as §1 states them — `Mom12m` level 0.25× on the PIT
+map (0.29× on the current map), `ShareIss1Y` ρ 0.785 and level 2.93× — and records what the experiments did:
+hypothesis 1 explains the momentum level (the ADV screen; 0.91× at ρ 0.868 without it), hypothesis 2 is closed
+(0 of 49 month-ends differ), hypothesis 3 is a sensitivity that re-admits the contamination ruling 30 removed,
+hypothesis 4 moves issuance's level (1.87×) but not its shape, and the fifth experiment (split adjustment, the
+definition OSAP uses) lifts issuance's ρ by 0.011 and widens its spread. **Issuance's shape gap survives every
+cell** (ρ 0.640–0.817 across the eleven) and stays registered with no named cause. `calibration.limits`
+ledger event: `b01fd38421be4e5d91b90cd9e2115cdc` (it carries every grid event id, the formation-dates event and the two superseded
+mislabelled events `783bbb1b55534217ab742398feed834a` / `435d2bca481b41daa3fb2ea55f78a260`).
 
 The standing statement, which holds whatever the cells say: **the gate verdict is not re-scored here.**
 A cell that moves a live anomaly inside the band is a measurement, not a new calibration. Changing the
