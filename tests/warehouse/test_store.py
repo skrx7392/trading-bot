@@ -111,6 +111,106 @@ def test_resolution_isolation(tmp_path, monkeypatch):
     assert store.read_bars(resolution="1h")["close"].to_list() == [200.0]
 
 
+def _seed_panel():
+    """Several symbols, dates and sources, with a correction layered on top.
+
+    Deliberately messy: overlapping sources, a symbol that only one source
+    carries, two resolutions, and a re-ingest that must win its key. A windowed
+    read has to agree with a full read on all of it, not just the easy rows.
+    """
+    days = [dt.date(2020, 1, d) for d in (2, 3, 6, 7, 8, 9, 10)]
+    for src in ("stooq", "yf"):
+        for sym in ("AAPL", "MSFT"):
+            store.write_bars(pl.DataFrame({
+                "symbol": [sym] * len(days), "ts": days,
+                "open": [1.0] * len(days), "high": [1.0] * len(days),
+                "low": [1.0] * len(days), "close": [float(d.day) for d in days],
+                "volume": [1e6] * len(days),
+            }), source=src)
+    store.write_bars(_bars(sym="TSLA", d=days[3], c=7.0), source="yf")
+    store.write_bars(_bars(sym="AAPL", d=days[3], c=99.0), source="stooq")  # correction
+    store.write_bars(_bars(sym="AAPL", d=days[3], c=1.0), source="stooq", resolution="1h")
+    return days
+
+
+def test_a_windowed_read_equals_filtering_the_whole_store(tmp_path, monkeypatch):
+    """The pushdown is a memory bound and nothing else: same rows, same order.
+
+    Every predicate is a component of ``DEDUPE_KEY``, so a row and the
+    correction that supersedes it either both survive a filter or both do not —
+    which is why narrowing the scan before the dedupe cannot change the verdict
+    on a key. This pins that claim against a post-hoc filter of the full read.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_panel()
+    whole = store.read_bars()
+
+    for symbols, start, end in [
+        (None, days[1], days[4]),
+        (["AAPL"], days[1], days[4]),
+        (["AAPL", "TSLA"], None, days[3]),
+        (["MSFT"], days[5], None),
+        (None, days[3], days[3]),          # the corrected day, alone
+        ([], days[0], days[-1]),           # an empty symbol list means none
+        (["NOPE"], None, None),            # a symbol the store has never seen
+        (None, days[-1] + dt.timedelta(days=30), None),  # a window past the data
+    ]:
+        expected = whole
+        if symbols is not None:
+            expected = expected.filter(pl.col("symbol").is_in(symbols))
+        if start is not None:
+            expected = expected.filter(pl.col("ts") >= start)
+        if end is not None:
+            expected = expected.filter(pl.col("ts") <= end)
+        got = store.read_bars(symbols=symbols, start=start, end=end)
+        assert got.equals(expected), f"windowed read differs for {symbols} {start}..{end}"
+
+    # and the correction still wins inside a window that contains only its day
+    assert store.read_bars(symbols=["AAPL"], start=days[3], end=days[3],
+                           source="stooq")["close"].to_list() == [99.0]
+
+
+def test_the_scan_never_collects_more_than_the_window(tmp_path, monkeypatch):
+    """The point of the pushdown: what is read is what was asked for.
+
+    Asserting on the returned frame cannot see this — a post-hoc filter returns
+    the same rows while having materialised the whole store first, which is the
+    24.7 GB the nightly used to spend. So assert on what the scan itself
+    collects, before the dedupe narrows anything.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_panel()
+    files = store._batch_files("1d", None)
+
+    raw = store._scan(files, ["AAPL"], days[1], days[4]).collect()
+    assert raw["symbol"].unique().to_list() == ["AAPL"]
+    assert raw["ts"].min() == days[1] and raw["ts"].max() == days[4]
+    # 4 days x 2 sources, plus the one correction row that shares a key
+    assert raw.height == 9
+
+    # a window with nothing in it collects nothing, however large the store
+    assert store._scan(files, None, days[-1] + dt.timedelta(days=30), None).collect().height == 0
+
+
+def test_read_bars_validates_dates_before_touching_the_store(tmp_path, monkeypatch):
+    """An empty warehouse must not swallow a caller's bad argument."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    assert store.read_bars().height == 0  # nothing written at all
+    with pytest.raises(ValueError):
+        store.read_bars(start="not-a-date")
+    with pytest.raises(TypeError, match="end"):
+        store.read_bars(end=20200102)
+
+
+def test_read_bars_accepts_a_symbols_generator(tmp_path, monkeypatch):
+    """`symbols` is any iterable, and a generator must not be drained lazily."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    store.write_bars(_bars(sym="AAPL"), source="stooq")
+    store.write_bars(_bars(sym="MSFT"), source="stooq")
+    got = store.read_bars(symbols=(s for s in ("MSFT",)))
+    assert got["symbol"].to_list() == ["MSFT"]
+
+
 def test_read_is_sorted_deterministically(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     store.write_bars(_bars(sym="MSFT", d=dt.date(2020, 1, 3)), source="yf")

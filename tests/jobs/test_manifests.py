@@ -32,6 +32,13 @@ ENTRYPOINT_UV_FLAGS = ("--frozen", "--no-dev")
 RUN_AS_UID = 1000
 #: A nightly that has not finished in an hour is stuck, not slow.
 MAX_RUNTIME_SECONDS = 3600
+#: Memory sized from a measured run, not from a guess: 2026-09-04 against the
+#: real warehouse, ``/usr/bin/time -l`` peak RSS 2.04 GB (1.90 GiB). The request
+#: is that working set; the limit doubles it as a ceiling on a bad night. Nearly
+#: all of the peak is `edgar.read_filings()`, which reads its 7.8M rows whole --
+#: so a change there is what should move these numbers next.
+MEASURED_PEAK_REQUEST = "2Gi"
+MEASURED_PEAK_LIMIT = "4Gi"
 
 
 @pytest.fixture(scope="module")
@@ -129,10 +136,14 @@ def test_a_hung_run_cannot_swallow_every_later_window(cron):
 def test_the_nightly_declares_what_it_takes_from_a_shared_box(container):
     """quasar also carries k3s system workloads, ai-proxy and ddns. Without a
     request the scheduler treats the job as free and it lands anywhere; without
-    a limit a runaway pandas step can starve everything else on the node."""
+    a limit a runaway pandas step can starve everything else on the node.
+
+    The memory figures are measured, not guessed -- see the manifest comment for
+    the run they come from. They are pinned here because the previous pair was
+    a guess (512Mi/2Gi) and the job OOMKilled against it for weeks."""
     resources = container["resources"]
-    assert resources["requests"] == {"cpu": "250m", "memory": "512Mi"}
-    assert resources["limits"] == {"cpu": "2", "memory": "2Gi"}
+    assert resources["requests"] == {"cpu": "250m", "memory": MEASURED_PEAK_REQUEST}
+    assert resources["limits"] == {"cpu": "2", "memory": MEASURED_PEAK_LIMIT}
 
 
 def test_the_pod_runs_as_the_unprivileged_image_user(pod):
