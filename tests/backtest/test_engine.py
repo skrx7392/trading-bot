@@ -20,13 +20,14 @@ weight:
 
 import dataclasses
 import datetime as dt
+import json
 
 import polars as pl
 import pytest
 
 from tbot import config, ledger
-from tbot.backtest import costs, engine, strategy, tax
-from tbot.warehouse import reconcile, store
+from tbot.backtest import costs, engine, metrics, strategy, tax
+from tbot.warehouse import actions, reconcile, store
 
 
 # --- contract tests from the brief, verbatim ----------------------------------------
@@ -134,6 +135,27 @@ def _rotating_signal(symbols):
         )
 
     return sig
+
+
+def _name_change(tmp_path, old, new, on):
+    """One rename row in the corporate-actions warehouse under `tmp_path`."""
+    d = tmp_path / "actions" / "name_changes"
+    d.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        [{"old_symbol": old, "new_symbol": new, "process_date": on}],
+        schema=actions.NAME_CHANGE_SCHEMA,
+    ).write_parquet(d / "20260101T000000000000-a.parquet")
+
+
+def _merger(tmp_path, symbol, on, kind="cash", cash_rate=None):
+    """One merger row (acquiree `symbol`) in the corporate-actions warehouse."""
+    d = tmp_path / "actions" / "mergers"
+    d.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        [{"symbol": symbol, "process_date": on, "kind": kind, "acquirer": None,
+          "cash_rate": cash_rate, "stock_rate": None}],
+        schema=actions.MERGER_SCHEMA,
+    ).write_parquet(d / "20260101T000000000000-b.parquet")
 
 
 # --- next-day execution -------------------------------------------------------------
@@ -333,17 +355,21 @@ def test_delisted_holding_is_liquidated_at_its_last_close(tmp_path, monkeypatch)
 
     events = ledger.read_events("engine.forced_liquidation")
     assert events.height == 1
-    payload = pl.Series([events["payload"][0]]).str.json_decode().to_list()[0]
+    payload = json.loads(events["payload"][0])
     assert payload["symbol"] == "A"
     assert payload["price"] == pytest.approx(a[a_days[-1]], rel=1e-12)
-    assert payload["ts"] == days[60].isoformat()          # discovered here
+    assert payload["last_close"] == pytest.approx(a[a_days[-1]], rel=1e-12)
+    # Discovery waits out the gap tolerance: the exit is booked on the first day
+    # the gap exceeds MAX_GAP_DAYS, not on the first day A is missing.
+    assert payload["ts"] == days[60 + engine.MAX_GAP_DAYS].isoformat()   # discovered here
+    assert payload["reason"] == "gap_exceeded" and payload["gap_days"] == engine.MAX_GAP_DAYS + 1
     assert payload["last_ts"] == a_days[-1].isoformat()   # sold (and taxed) here
     assert payload["tax_ts"] == a_days[-1].isoformat()
     assert payload["qty"] > 0
 
     # Proceeds are booked at A's last close, so equity is flat from then on —
-    # first as cash, then in B, which the next rebalance promotes into A's slot
-    # because A is no longer investable.
+    # marked at that close through the gap, then as cash, then in B, which the
+    # next rebalance promotes into A's slot because A is no longer investable.
     expected = 100_000.0 * a[a_days[-1]] / a[days[1]]
     tail = res.daily.filter(pl.col("ts") >= days[60])["equity"].to_list()
     assert tail and all(v == pytest.approx(expected, rel=1e-12) for v in tail)
@@ -355,51 +381,32 @@ def test_delisted_holding_is_liquidated_at_its_last_close(tmp_path, monkeypatch)
     assert annual["st"][0] == pytest.approx(expected - 100_000.0, rel=1e-9)
 
 
-def test_quarantine_gap_forces_a_liquidation(tmp_path, monkeypatch):
-    """DOCUMENTS a known sharp edge: a one-day canonical gap reads as a delisting.
-
-    `read_canonical` drops quarantined symbol-days, so a single vendor
-    disagreement removes the symbol from the panel for a day and the engine
-    exits the position (see `engine` module docstring — no point-in-time test can
-    tell a one-day gap from a delisting).
-    """
-    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
-    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 4, 30))
-    gap_day = days[40]
-    a = {d: 100.0 * (1.002 ** i) for i, d in enumerate(days)}
-    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}}, source="stooq")
-    # A second vendor that disagrees with stooq on exactly one day: two sources,
-    # no majority -> that symbol-day is quarantined and vanishes from canonical.
-    # B is written from both vendors so it survives the two-source read filter and
-    # stays available as the name the engine rotates into.
-    disagree = dict(a)
-    disagree[gap_day] = a[gap_day] * 1.5
-    _seed(tmp_path, monkeypatch,
-          {"A": disagree, "B": {d: 30.0 for d in days}}, source="alpaca")
-
-    assert reconcile.read_canonical(symbols=["A"]).filter(
-        pl.col("ts") == gap_day
-    ).height == 0
-
+def test_a_short_gap_is_held_through_not_liquidated(tmp_path, monkeypatch):
+    """Replaces test_quarantine_gap_forces_a_liquidation: a quarantined day is a hole, not a delisting."""
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    a = {d: 100.0 * (1.004 ** i) for i, d in enumerate(days)}
+    gap = days[40:40 + engine.MAX_GAP_DAYS]                 # exactly the tolerance
+    for d in gap:
+        a.pop(d)
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}})
     strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
     res = engine.run(strat, days[0], days[-1], cost_model=FREE)
-    events = ledger.read_events("engine.forced_liquidation")
-    assert events.height == 1
-    # The one-day gap costs a full round trip — exit, then re-entry at the next
-    # month-end — and books a realised gain the strategy never asked for.
-    assert res.trades == 3
-    annual = res.ret_net_after_tax_annual
-    assert annual.height == 1 and annual["st"][0] > 0.0
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    assert res.trades == 1                                    # the entry, nothing else
+    marks = res.daily.filter(pl.col("ts").is_in(gap))["equity"].to_list()
+    assert all(m == pytest.approx(marks[0]) for m in marks)   # flat at the last close through the gap
+    assert res.daily["equity"][-1] == pytest.approx(100_000.0 * a[days[-1]] / a[days[1]], rel=1e-12)
 
 
 def test_forced_liquidation_is_taxed_in_the_year_of_the_last_close(tmp_path, monkeypatch):
     """A gain whose last close is 31 December is a December tax bill.
 
-    Discovery is always the next trading day, so a symbol whose last close falls
-    on the last trading day of the year is discovered missing in January. The
-    engine dates the sale at the last close (module docstring), which keeps the
-    tax year equal to the year the gain actually appears in the equity curve —
-    and refuses the free year of deferral the discovery date would have granted.
+    Discovery is `MAX_GAP_DAYS` + 1 trading days after the last close, so a
+    symbol whose last close falls on the last trading day of the year is
+    discovered missing in January. The engine dates the sale at the last close
+    (module docstring), which keeps the tax year equal to the year the gain
+    actually appears in the equity curve — and refuses the free year of deferral
+    the discovery date would have granted.
     """
     days = _weekdays(dt.date(2020, 1, 1), dt.date(2021, 6, 30))
     a_days = [d for d in days if d.year == 2020]          # A's last close: 2020-12-31
@@ -408,7 +415,7 @@ def test_forced_liquidation_is_taxed_in_the_year_of_the_last_close(tmp_path, mon
     strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
     res = engine.run(strat, days[0], days[-1], cost_model=FREE)
 
-    discovered = days[days.index(a_days[-1]) + 1]
+    discovered = days[days.index(a_days[-1]) + 1 + engine.MAX_GAP_DAYS]
     assert (a_days[-1].year, discovered.year) == (2020, 2021)   # the boundary is real
 
     events = ledger.read_events("engine.forced_liquidation")
@@ -450,6 +457,88 @@ def test_forced_liquidation_holding_period_ends_at_the_last_close(tmp_path, monk
     assert row["st"] == pytest.approx(gain, rel=1e-9)
     assert row["lt"] == pytest.approx(0.0, abs=1e-9)
     assert row["tax_paid"] == pytest.approx(gain * config.TAX_RATE_ST, rel=1e-9)
+
+
+# --- gap tolerance, mergers and renames (ruling 45) ---------------------------------
+
+def test_a_gap_one_day_too_long_exits_at_the_last_close(tmp_path, monkeypatch):
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    a = {d: 50.0 for d in days}
+    for d in days[40:40 + engine.MAX_GAP_DAYS + 1]:
+        a.pop(d)
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}})
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
+    engine.run(strat, days[0], days[-1], cost_model=FREE)
+    events = ledger.read_events("engine.forced_liquidation")
+    assert events.height == 1
+    payload = json.loads(events["payload"][0])
+    assert payload["reason"] == "gap_exceeded" and payload["price"] == 50.0
+    assert payload["last_ts"] == days[39].isoformat() and payload["ts"] == days[40 + engine.MAX_GAP_DAYS].isoformat()
+
+
+def test_a_sub_dollar_gap_exit_takes_the_shumway_haircut(tmp_path, monkeypatch):
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    a = {d: 0.80 for d in days[:40]}
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}})
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
+    engine.run(strat, days[0], days[-1], cost_model=FREE)
+    payload = json.loads(ledger.read_events("engine.forced_liquidation")["payload"][0])
+    assert payload["price"] == pytest.approx(0.80 * (1 + metrics.DELIST_RETURN))
+    assert payload["last_close"] == 0.80
+
+
+def test_a_cash_merger_exits_at_the_cash_rate_on_its_process_date(tmp_path, monkeypatch):
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    a = {d: 20.0 for d in days[:40]}                          # last print day 39
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}})
+    _merger(tmp_path, "A", days[41], cash_rate=25.0)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
+    engine.run(strat, days[0], days[-1], cost_model=FREE)
+    payload = json.loads(ledger.read_events("engine.forced_liquidation")["payload"][0])
+    assert payload["reason"] == "merger_cash" and payload["price"] == 25.0
+    assert payload["ts"] == days[41].isoformat()              # not after five more days
+    assert payload["last_ts"] == days[39].isoformat()
+
+
+def test_a_merger_before_the_entry_is_not_an_exit(tmp_path, monkeypatch):
+    """A deal dated before the position's last vetted close is not this position's deal.
+
+    The merger table is keyed by ticker and tickers are recycled, so a record
+    for `A` that predates the entry belongs to whatever `A` was then. Without
+    the lower bound on the merger filter the first hole in A's series after the
+    entry would exit the position at the stale deal's cash rate — so the name
+    here keeps printing except for a two-day hole, and the hole must be held
+    through. (A name with no hole at all never reaches the merger check, so it
+    would not tell the two filters apart.)
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    a = {d: 40.0 for d in days}
+    for d in days[20:22]:                                     # a short hole after the entry
+        a.pop(d)
+    _seed(tmp_path, monkeypatch, {"A": a, "B": {d: 30.0 for d in days}})
+    _merger(tmp_path, "A", days[5], cash_rate=45.0)           # the entry is days[1]
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["A", "B"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    assert res.trades == 1
+    assert res.daily["equity"][-1] == pytest.approx(100_000.0, rel=1e-12)
+
+
+def test_a_rename_carries_the_position_without_a_trade(tmp_path, monkeypatch):
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    old = {d: 10.0 * (1.002 ** i) for i, d in enumerate(days[:40])}
+    new = {d: 10.0 * (1.002 ** i) for i, d in enumerate(days) if i >= 40}
+    _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": new, "B": {d: 30.0 for d in days}})
+    _name_change(tmp_path, "OLD", "NEW", days[40])
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW", "B"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    renames = ledger.read_events("engine.rename")
+    assert renames.height == 1
+    payload = json.loads(renames["payload"][0])
+    assert payload["symbol"] == "OLD" and payload["new_symbol"] == "NEW" and payload["ts"] == days[40].isoformat()
+    assert res.trades == 1 and res.ret_net_after_tax_annual.height == 0     # nothing realised
+    assert res.daily["equity"][-1] == pytest.approx(100_000.0 * new[days[-1]] / old[days[1]], rel=1e-9)
 
 
 # --- tax year attribution -----------------------------------------------------------

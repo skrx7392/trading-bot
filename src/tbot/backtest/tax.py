@@ -180,6 +180,25 @@ class TaxLots:
             del self._lots[symbol]
         return st, lt
 
+    def rename(self, old: str, new: str) -> None:
+        """Carry every open lot of `old` under `new` — a ticker change, not a trade.
+
+        Nothing is realised and no date moves: the lots keep their purchase
+        dates, so the holding period runs through the rename, as it does for
+        tax purposes. If `new` already has lots the two queues are merged by
+        purchase date so FIFO still means oldest first.
+
+        Raises:
+            TypeError: If either symbol is not a string.
+            ValueError: If either symbol is blank.
+        """
+        old, new = _symbol(old), _symbol(new)
+        moving = self._lots.pop(old, None)
+        if not moving:
+            return
+        merged = sorted([*self._lots.get(new, ()), *moving], key=lambda lot: lot.date)
+        self._lots[new] = deque(merged)
+
     # --- reads ----------------------------------------------------------------------
 
     def qty_held(self, symbol: str) -> float:

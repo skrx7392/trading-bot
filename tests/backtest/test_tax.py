@@ -287,3 +287,49 @@ def test_tax_due_rejects_rates_outside_zero_to_one(rate):
 def test_tax_due_rejects_non_finite_gains():
     with pytest.raises(ValueError):
         tax.TaxLots.tax_due(float("nan"), 0.0, 0.35, 0.15)
+
+
+# --- rename: a ticker change, not a trade -------------------------------------------
+
+def test_rename_moves_lots_fifo_and_keeps_their_dates():
+    lots = tax.TaxLots()
+    lots.buy("OLD", dt.date(2020, 1, 2), 10.0, 5.0)
+    lots.buy("NEW", dt.date(2020, 3, 2), 4.0, 7.0)
+    lots.buy("OLD", dt.date(2020, 6, 2), 6.0, 9.0)
+    lots.rename("OLD", "NEW")
+    assert lots.qty_held("OLD") == 0.0 and lots.symbols() == ("NEW",)
+    assert lots.qty_held("NEW") == pytest.approx(20.0)
+    st, lt = lots.sell("NEW", dt.date(2021, 7, 1), 14.0, 10.0)   # consumes the two oldest lots
+    assert lt == pytest.approx(10 * (10 - 5) + 4 * (10 - 7))       # both > 365 days
+    assert st == 0.0
+
+
+def test_rename_of_an_unknown_symbol_is_a_no_op():
+    lots = tax.TaxLots()
+    lots.rename("GHOST", "NEW")
+    assert lots.symbols() == ()
+
+
+def test_rename_validates_symbols():
+    lots = tax.TaxLots()
+    with pytest.raises(ValueError):
+        lots.rename("", "NEW")
+    with pytest.raises(TypeError):
+        lots.rename("OLD", 3)
+
+
+def test_rename_merges_by_purchase_date_so_fifo_stays_oldest_first():
+    """The merge order is load-bearing only when `new`'s own lot is the youngest.
+
+    Appending the moved lots behind `new`'s would sell the short-term lot first
+    and book a short-term gain where FIFO by date owes a long-term one.
+    """
+    lots = tax.TaxLots()
+    lots.buy("OLD", dt.date(2020, 1, 2), 10.0, 5.0)
+    lots.buy("NEW", dt.date(2021, 6, 2), 4.0, 7.0)    # youngest lot, and it is NEW's own
+    lots.buy("OLD", dt.date(2020, 6, 2), 6.0, 9.0)
+    lots.rename("OLD", "NEW")
+    st, lt = lots.sell("NEW", dt.date(2021, 7, 1), 14.0, 10.0)
+    assert lt == pytest.approx(10 * (10 - 5) + 4 * (10 - 9))   # the two oldest OLD lots
+    assert st == 0.0                                            # NEW's own lot is untouched
+    assert lots.qty_held("NEW") == pytest.approx(6.0)
