@@ -78,6 +78,7 @@ def test_filings_schema_is_exactly_the_documented_columns(tmp_path, monkeypatch)
     assert dict(edgar.FILINGS_SCHEMA) == {
         "cik": pl.Int64, "accn": pl.Utf8, "form": pl.Utf8,
         "filed": pl.Date, "primary_doc": pl.Utf8,
+        "accepted": pl.Datetime("us", "UTC"), "items": pl.Utf8,
     }
 
 
@@ -98,6 +99,7 @@ def test_reads_do_not_create_directories(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     edgar.read_facts()
     edgar.read_filings()
+    edgar.read_entities()
     assert not (tmp_path / "edgar").exists()
 
 
@@ -297,6 +299,7 @@ def test_ingest_submissions_maps_every_field(tmp_path, monkeypatch):
     assert edgar.read_filings().row(0, named=True) == {
         "cik": 320193, "accn": "0000320193-20-000010", "form": "10-Q",
         "filed": dt.date(2020, 1, 29), "primary_doc": "a10-q.htm",
+        "accepted": None, "items": "",
     }
 
 
@@ -790,3 +793,243 @@ def test_read_facts_returns_a_copy_the_caller_cannot_poison(tmp_path, monkeypatc
     df = edgar.read_facts(["Assets"])
     df.with_columns(pl.lit(0.0).alias("val"))  # polars frames are immutable; this pins that
     assert edgar.read_facts(["Assets"])["val"].to_list() == [10.0, 20.0]
+
+
+# --- acceptance instants, 8-K items and entity identity -----------------------------
+
+SUBS_FULL = {
+    "cik": "886158", "name": "20230930-DK-Butterfly-1, Inc.", "tickers": [], "exchanges": [],
+    "formerNames": [{"name": "BED BATH & BEYOND INC", "from": "1995-03-08T00:00:00.000Z",
+                     "to": "2023-09-20T00:00:00.000Z"}],
+    "filings": {"recent": {
+        "accessionNumber": ["0001193125-23-247428", "0001193125-23-100000"],
+        "form": ["8-K", "10-Q"],
+        "filingDate": ["2023-09-29", "2023-04-15"],
+        "acceptanceDateTime": ["2023-09-29T16:23:06.000Z", None],
+        "items": ["1.03,3.03,5.02,5.03,7.01,9.01", None],
+        "primaryDocument": ["d579010d8k.htm", "q.htm"]}}}
+
+
+def test_filings_carry_acceptance_timestamp_and_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps(SUBS_FULL).encode(), cik=886158)
+    f = edgar.read_filings(forms=["8-K"])
+    assert f.columns == list(edgar.FILINGS_SCHEMA)
+    assert f.schema["accepted"] == pl.Datetime("us", "UTC")
+    assert f["accepted"][0] == dt.datetime(2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    assert f["items"][0] == "1.03,3.03,5.02,5.03,7.01,9.01"
+    q = edgar.read_filings(forms=["10-Q"])
+    assert q["accepted"][0] is None and q["items"][0] == ""
+
+
+def test_filings_schema_lists_the_two_new_columns_last():
+    assert list(edgar.FILINGS_SCHEMA)[-2:] == ["accepted", "items"]
+
+
+def test_an_unparseable_acceptance_time_is_null_not_a_skip(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    n = edgar.ingest_submissions(_subs(1, accessionNumber=["a"], form=["8-K"],
+                                       filingDate=["2020-01-02"], acceptanceDateTime=["garbage"]), cik=1)
+    assert n == 1 and edgar.read_filings()["accepted"][0] is None
+
+
+def test_entities_are_written_from_the_main_document(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps(SUBS_FULL).encode(), cik=886158)
+    e = edgar.read_entities()
+    assert e.columns == list(edgar.ENTITIES_SCHEMA) and dict(e.schema) == dict(edgar.ENTITIES_SCHEMA)
+    row = e.row(0, named=True)
+    assert row["cik"] == 886158 and row["name"] == "20230930-DK-Butterfly-1, Inc."
+    assert row["tickers"] == [] and row["exchanges"] == []
+    assert row["former_names"] == [{"name": "BED BATH & BEYOND INC",
+                                    "from": dt.date(1995, 3, 8), "to": dt.date(2023, 9, 20)}]
+
+
+def test_a_shard_does_not_blank_the_entity(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps(SUBS_FULL).encode(), cik=886158)
+    edgar.ingest_submissions(_subs(886158, accessionNumber=["old"], form=["10-K"],
+                                   filingDate=["2001-03-01"]), cik=886158)   # no `name`
+    assert edgar.read_entities().height == 1
+    assert edgar.read_entities()["name"][0] == "20230930-DK-Butterfly-1, Inc."
+    assert edgar.read_filings().height == 3
+
+
+def test_entities_read_is_typed_when_empty_and_lists_tickers(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    assert edgar.read_entities().schema == edgar.ENTITIES_SCHEMA
+    doc = {"cik": 320193, "name": "Apple Inc.", "tickers": ["AAPL"], "exchanges": ["Nasdaq"],
+           "formerNames": [], "filings": {"recent": {}}}
+    edgar.ingest_submissions(json.dumps(doc), cik=320193)
+    assert edgar.read_entities()["tickers"][0].to_list() == ["AAPL"]
+    payload = json.loads(ledger.read_events(edgar.FILINGS_EVENT)["payload"][0])
+    assert payload["entity"] is True
+
+
+def test_opt_datetime_handles_z_naive_offsets_and_junk():
+    """The `Z` is a real UTC marker, not decoration: dropping it would shift
+    Apple's 20:30Z 8-K into the trading day it was filed after."""
+    assert edgar._opt_datetime("2023-09-29T16:23:06.000Z") == dt.datetime(
+        2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    # a naive stamp is read as UTC, an offset one is converted to it
+    assert edgar._opt_datetime("2023-09-29T16:23:06") == dt.datetime(
+        2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    assert edgar._opt_datetime("2023-09-29T12:23:06-04:00") == dt.datetime(
+        2023, 9, 29, 16, 23, 6, tzinfo=dt.timezone.utc)
+    for junk in ("garbage", "", "   ", None, 20230929, ["2023-09-29T16:23:06Z"]):
+        assert edgar._opt_datetime(junk) is None
+
+
+def test_a_former_name_with_no_end_is_an_open_window(tmp_path, monkeypatch):
+    """EDGAR leaves `to` empty while a name is still in force; that is an open
+    window, not a reason to drop the name."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.ingest_submissions(json.dumps({
+        "cik": 1, "name": "Now Inc.", "tickers": ["now"], "exchanges": ["NYSE"],
+        "formerNames": [{"name": "Then Inc.", "from": "1999-01-04T00:00:00.000Z", "to": ""},
+                        "not a dict", {"from": "2000-01-01T00:00:00.000Z"}],
+        "filings": {"recent": {}}}), cik=1)
+    row = edgar.read_entities().row(0, named=True)
+    assert row["tickers"] == ["NOW"]  # normalised the way symbols are held elsewhere
+    assert row["former_names"] == [
+        {"name": "Then Inc.", "from": dt.date(1999, 1, 4), "to": None}]
+
+
+# --- the budgeted document fetcher (task 9) -----------------------------------------
+
+class _DocClient:
+    def __init__(self, body="<html><body><p>Item 2.02 Results.</p><script>x()</script></body></html>"):
+        self.body, self.requests = body, []
+    def get(self, url, headers=None):
+        self.requests.append((url, headers))
+        class R:
+            status_code = 200
+            text = self.body
+            def raise_for_status(self_): pass
+        return R()
+    def close(self): pass
+
+
+def test_fetch_document_builds_the_archive_url_strips_html_and_logs(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
+    monkeypatch.setattr(edgar, "_sleep", lambda s: None)
+    c = _DocClient()
+    text = edgar.fetch_document(320193, "0000320193-26-000018", "aapl-20260730.htm",
+                                budget=edgar.FetchBudget(1), client=c)
+    assert text == "Item 2.02 Results."
+    url, headers = c.requests[0]
+    assert url == "https://www.sec.gov/Archives/edgar/data/320193/000032019326000018/aapl-20260730.htm"
+    assert headers["User-Agent"] == "tbot test@example.com"
+    payload = json.loads(ledger.read_events("fetch.edgar.document")["payload"][0])
+    assert payload["cik"] == 320193 and payload["accn"] == "0000320193-26-000018" and payload["chars"] == len(text)
+
+
+def test_fetch_document_stops_at_the_budget_before_requesting(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
+    monkeypatch.setattr(edgar, "_sleep", lambda s: None)
+    c = _DocClient()
+    budget = edgar.FetchBudget(1)
+    edgar.fetch_document(1, "0000000001-20-000001", "a.htm", budget=budget, client=c)
+    with pytest.raises(edgar.BudgetExceeded):
+        edgar.fetch_document(1, "0000000001-20-000002", "b.htm", budget=budget, client=c)
+    assert len(c.requests) == 1 and budget.used == 1
+
+
+def test_fetch_document_paces_to_eight_per_second(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.setenv("SEC_USER_AGENT", "tbot test@example.com")
+    slept = []
+    monkeypatch.setattr(edgar, "_sleep", slept.append)
+    monkeypatch.setattr(edgar, "_last_request", [0.0])
+    monkeypatch.setattr(edgar.time, "monotonic", lambda: 100.0)
+    edgar.fetch_document(1, "0000000001-20-000001", "a.htm", budget=edgar.FetchBudget(2), client=_DocClient())
+    edgar.fetch_document(1, "0000000001-20-000002", "b.htm", budget=edgar.FetchBudget(2), client=_DocClient())
+    assert slept and slept[-1] == pytest.approx(1 / edgar.MAX_REQ_PER_S)
+
+
+def test_fetch_document_requires_a_user_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    monkeypatch.delenv("SEC_USER_AGENT", raising=False)
+    with pytest.raises(RuntimeError):
+        edgar.fetch_document(1, "0000000001-20-000001", "a.htm", budget=edgar.FetchBudget(1), client=_DocClient())
+
+
+def test_fetch_budget_validates():
+    with pytest.raises(ValueError):
+        edgar.FetchBudget(0)
+
+
+# --- the filings schema migration ------------------------------------------------------
+#
+# Files written before `accepted`/`items` existed have five columns. Merging a new
+# document into one raises inside polars, and scanning a directory that mixes the
+# two schemas fails on whichever file polars reads second. Both are handled
+# explicitly: an old-schema file is replaced, and a mixed directory names the
+# fix.
+
+OLD_COLUMNS = ["cik", "accn", "form", "filed", "primary_doc"]
+
+
+def _old_schema_file(tmp_path, cik, accn="old-1"):
+    d = tmp_path / "edgar" / "filings"
+    d.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"cik": [cik], "accn": [accn], "form": ["10-K"], "filed": [dt.date(2019, 2, 1)],
+                  "primary_doc": ["k.htm"]},
+                 schema={"cik": pl.Int64, "accn": pl.Utf8, "form": pl.Utf8, "filed": pl.Date,
+                         "primary_doc": pl.Utf8}).write_parquet(d / f"{cik}.parquet")
+    assert pl.read_parquet_schema(d / f"{cik}.parquet").names() == OLD_COLUMNS
+
+
+def test_an_old_schema_filings_file_is_replaced_not_merged(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    _old_schema_file(tmp_path, 320193)
+    assert edgar.ingest_submissions(json.dumps(SUBS).encode(), cik=320193) == 1
+    df = edgar.read_filings()
+    assert df.columns == list(edgar.FILINGS_SCHEMA)
+    assert df["accn"].to_list() == ["0000320193-20-000010"]   # the old row is gone, not merged
+    payload = json.loads(ledger.read_events(edgar.FILINGS_EVENT)["payload"][0])
+    assert payload["replaced_old_schema"] is True
+
+
+def test_a_current_schema_file_is_merged_and_the_event_says_so(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    edgar.ingest_submissions(_subs(320193, accessionNumber=["old-1"], form=["10-K"],
+                                   filingDate=["2019-02-01"], primaryDocument=["k.htm"]), cik=320193)
+    edgar.ingest_submissions(json.dumps(SUBS).encode(), cik=320193)
+    assert edgar.read_filings()["accn"].to_list() == ["old-1", "0000320193-20-000010"]
+    payloads = [json.loads(p) for p in ledger.read_events(edgar.FILINGS_EVENT)["payload"]]
+    assert [p["replaced_old_schema"] for p in payloads] == [False, False]
+
+
+def test_an_old_schema_file_is_replaced_even_by_an_empty_document(tmp_path, monkeypatch):
+    """Nothing usable to store still must not leave the poison file in the directory."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    _old_schema_file(tmp_path, 7)
+    assert edgar.ingest_submissions(b'{"cik": "7"}', cik=7) == 0
+    assert edgar.read_filings().height == 0
+    assert pl.read_parquet_schema(tmp_path / "edgar" / "filings" / "7.parquet").names() == list(edgar.FILINGS_SCHEMA)
+    payload = json.loads(ledger.read_events(edgar.FILINGS_EVENT)["payload"][0])
+    assert payload["replaced_old_schema"] is True
+
+
+@pytest.mark.parametrize("old_cik, new_cik", [(1, 2), (2, 1)])
+def test_a_mixed_schema_filings_directory_names_the_fix(tmp_path, monkeypatch, old_cik, new_cik):
+    """Whichever schema polars reads first, the error says where and what to do."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    edgar.clear_cache()
+    _old_schema_file(tmp_path, old_cik)
+    edgar.ingest_submissions(_subs(new_cik, accessionNumber=["n-1"], form=["8-K"],
+                                   filingDate=["2020-05-01"], primaryDocument=["q.htm"]), cik=new_cik)
+    edgar.clear_cache()
+    with pytest.raises(RuntimeError, match=r"more than one schema") as info:
+        edgar.read_filings()
+    message = str(info.value)
+    assert str(tmp_path / "edgar" / "filings") in message
+    assert "data/raw/submissions.zip" in message and "tools/t17/ingest_submissions.py" in message
+    assert "retired" in message
+    assert isinstance(info.value.__cause__, pl.exceptions.PolarsError)

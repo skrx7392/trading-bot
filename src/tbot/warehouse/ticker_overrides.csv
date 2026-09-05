@@ -1,0 +1,2 @@
+cik,symbol,valid_from,valid_to,note
+886158,BBBY,,2023-05-02,"Bed Bath & Beyond Inc (CIK 886158) traded as BBBY on Nasdaq until its 2023-05-03 delisting; from 2025-08-29 the symbol belongs to CIK 1130713 (via the rename chain OSTK -> BYON -> BBBY -> NXH). Verify valid_to against read_canonical(['BBBY'])'s last close before the multi-year gap and correct it here if it differs."

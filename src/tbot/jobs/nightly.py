@@ -27,6 +27,34 @@ investigate, not noise to widen ``tol`` against — and that a day only one vend
 covered still settles as ``ok`` on its single vote, exactly as the pre-2016
 history does, where yf is the only source there is.
 
+**The symbol list is the universe plus the trailing week's rename targets**
+(decision D13). The universe admits a name only after 63 days of canonical
+closes, so a symbol a company was just renamed into has none and could never
+be ingested by a run that ingests only the universe: the company would vanish
+the night of its rename, for good. The targets are the ``new_symbol`` of every
+rename processed in the last :data:`tbot.jobs.rebase.LOOKBACK_DAYS` days
+(``actions.read_name_changes``, as ingested by earlier nights), appended
+de-duplicated; the summary counts them as ``symbols_added_by_rename``. The old
+symbol stays in the list while the universe still holds it, so both are
+ingested for up to a week — the ticker map's rebuild is what represents the
+company once. A caller-supplied list is exact and is not extended.
+
+After the vote the run ingests the trailing week of corporate actions,
+re-bases every symbol that split in it and every rename target (both vendors
+re-adjust history on the ex-date and serve a renamed company's lineage under
+its new symbol; the store does neither — `tbot.jobs.rebase`), rebuilds the
+point-in-time ticker map from the actions just ingested
+(`tbot.warehouse.tickers`; SEC's current map is refreshed first only when
+``SEC_USER_AGENT`` names a contact, since SEC fair access requires one — the
+summary says whether it was), and compacts yesterday's ledger files. Each is a
+collaborator with its own tests; the nightly owns their order.
+
+A refresh of SEC's map that fails is the one collaborator error the run
+survives: it is logged as :data:`REFRESH_FAILED_KIND`, the summary reports
+``refreshed: false``, and the rebuild runs on the file already on disk — which
+is intact, because the refresh validates before it writes. Unlike a vendor
+price failure, an SEC outage costs the night nothing it needs.
+
 Three things are deliberately *not* special-cased:
 
 *A non-trading day.* ``asof - 1`` is often a holiday or a Saturday. The fetchers
@@ -55,15 +83,20 @@ newest reconciliation verdict wins.
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 from collections.abc import Iterable
 
 from tbot import ledger
 from tbot._dates import as_date
-from tbot.warehouse import alpaca, reconcile, universe, yf
+from tbot.jobs import rebase
+from tbot.warehouse import actions, alpaca, reconcile, tickers, universe, yf
 
 #: Ledger event kind for the run summary.
 EVENT_KIND = "job.nightly"
+
+#: Logged, with the exception, when the SEC current-map refresh fails.
+REFRESH_FAILED_KIND = "fetch.sec.company_tickers.failed"
 
 
 def _as_symbols(value) -> list[str]:
@@ -94,11 +127,19 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
     if symbols is None:
         # Raises on a missing ticker map; see the module docstring for why that
         # is preferable to an empty list.
-        symbols = universe.build(asof)["symbol"].to_list()
+        in_universe = _as_symbols(universe.build(asof)["symbol"].to_list())
+        # Plus the trailing week's rename targets (decision D13): a renamed-into
+        # symbol has no canonical history yet and the universe cannot admit it.
+        present = set(in_universe)
+        added = [s for s in rebase.rename_targets(day) if s not in present]
+        symbols = in_universe + added
         source = "universe"
+        empty_universe = not in_universe
     else:
         symbols = _as_symbols(symbols)
+        added = []
         source = "argument"
+        empty_universe = False
 
     # Both fetchers no-op on an empty symbol list without issuing a request, so
     # an empty universe costs nothing and still leaves a summary behind.
@@ -106,15 +147,40 @@ def run(asof: dt.date | None = None, symbols: list[str] | None = None) -> dict:
     yf_rows = yf.ingest(symbols, day, day)
     recon = reconcile.run(day, day)
 
+    # Corporate actions for the trailing week (idempotent: newest batch wins),
+    # then re-base every name that split in it — see tbot.jobs.rebase.
+    acts = actions.ingest(day - dt.timedelta(days=rebase.LOOKBACK_DAYS), day)
+    rebased = rebase.rebase(rebase.symbols_to_rebase(day), day)
+    # The point-in-time ticker map, from the renames and mergers just ingested.
+    # SEC's current map is refreshed first only with a contact User-Agent to
+    # send. A refresh that fails is logged and reported, not fatal: the rebuild
+    # and the compaction behind it run on the file already on disk, which the
+    # refresh cannot have damaged (it validates before it writes).
+    refreshed = bool(os.environ.get(tickers.USER_AGENT_ENV, "").strip())
+    if refreshed:
+        try:
+            tickers.refresh_current()
+        except Exception as exc:
+            ledger.log_event(REFRESH_FAILED_KIND, {"error": f"{type(exc).__name__}: {exc}"})
+            refreshed = False
+    rebuilt = {"refreshed": refreshed, **tickers.build()}
+    # Yesterday's per-event files into one (ruling 27); today's are left alone.
+    compacted = ledger.compact()
+
     out = {
         "asof": asof.isoformat(),
         "day": day.isoformat(),
         "symbols": len(symbols),
         "symbol_source": source,
-        "empty_universe": source == "universe" and not symbols,
+        "symbols_added_by_rename": len(added),
+        "empty_universe": empty_universe,
         "alpaca_rows": alpaca_rows,
         "yf_rows": yf_rows,
         "recon": recon,
+        "actions": acts,
+        "rebase": rebased,
+        "tickers": rebuilt,
+        "ledger_compacted": compacted,
     }
     ledger.log_event(EVENT_KIND, out)
     return out

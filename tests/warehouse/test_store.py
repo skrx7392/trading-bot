@@ -310,3 +310,44 @@ def test_data_lands_under_data_root(tmp_path, monkeypatch):
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     store.write_bars(_bars(), source="stooq")
     assert len(list((tmp_path / "bars" / "stooq" / "1d").glob("*.parquet"))) == 1
+
+
+# --- symbol spans -------------------------------------------------------------------
+
+def test_symbol_spans_are_first_and_last_bar_per_symbol(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    d1, d2, d3 = dt.date(2020, 1, 2), dt.date(2020, 1, 3), dt.date(2020, 1, 6)
+    _bars = lambda sym, days: pl.DataFrame({"symbol": [sym] * len(days), "ts": days,
+        "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    store.write_bars(_bars("A", [d1, d3]), source="alpaca")
+    store.write_bars(_bars("A", [d2]), source="yf")
+    store.write_bars(_bars("B", [d2]), source="alpaca")
+    spans = store.symbol_spans()
+    assert spans.columns == ["symbol", "first_ts", "last_ts"]
+    assert spans.rows() == [("A", d1, d3), ("B", d2, d2)]
+    assert store.symbol_spans(source="yf").rows() == [("A", d2, d2)]
+    assert store.symbol_spans(source="stooq").height == 0
+
+
+def test_symbols_ingested_since_names_only_the_newer_batches(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    d1 = dt.date(2020, 1, 2)
+    _bars = lambda sym: pl.DataFrame({"symbol": [sym], "ts": [d1], "open": 1.0, "high": 1.0,
+                                      "low": 1.0, "close": 1.0, "volume": 1.0})
+    store.write_bars(_bars("A"), source="alpaca")
+    since = dt.datetime.now(dt.timezone.utc)
+    store.write_bars(_bars("B"), source="alpaca")
+    store.write_bars(_bars("C"), source="yf")
+    assert store.symbols_ingested_since(since, source="alpaca") == ["B"]
+    assert store.symbols_ingested_since(since, source="yf") == ["C"]
+    assert store.symbols_ingested_since(since) == ["B", "C"]
+    assert store.symbols_ingested_since(dt.datetime.now(dt.timezone.utc), source="alpaca") == []
+    assert store.symbols_ingested_since(since, source="stooq") == []
+
+
+def test_symbols_ingested_since_requires_an_aware_datetime(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(ValueError, match="aware"):
+        store.symbols_ingested_since(dt.datetime(2020, 1, 1))
+    with pytest.raises(TypeError, match="datetime"):
+        store.symbols_ingested_since(dt.date(2020, 1, 1))

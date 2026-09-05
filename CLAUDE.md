@@ -66,10 +66,33 @@ holdouts, live trading (phase 3). "No edge found" is an accepted outcome. Read, 
 - k3s on quasar: namespace `tbot`, secret `tbot-secrets`, PVC `tbot-data`, CronJob
   `tbot-nightly` (`30 2 * * 2-6` UTC). Image built on quasar with
   `docker build -f deploy/Dockerfile` then `k3s ctr images import`; no registry.
-  Manifests in `deploy/`. Nightly peak ≈ 2 GB; limit 4Gi.
+  Manifests in `deploy/`. Nightly peak ≈ 2 GB (2.01 GiB measured 2026-09-05); limit 4Gi.
+- **Deploying the `phase1-hardening` branch** needs four things on quasar before its first nightly:
+  (1) the filings schema migration on the PVC — `mv data/edgar/filings data/retired/edgar-filings-v1-<date>`
+  then `uv run python -B tools/t17/ingest_submissions.py` (≈ 380 s from `data/raw/submissions.zip`), or a
+  full replace of `data/edgar/filings` with the MacBook copy's; a directory that mixes the old 5-column
+  files with new ones fails every `read_filings` with a `RuntimeError` naming this fix; (2) the backfill of
+  `data/actions/{name_changes,mergers}` — `uv run python -B tools/t17/pull_actions.py --types
+  name_change,cash_merger,stock_merger,stock_and_cash_merger` (2016-01-01 → yesterday); (3) `data/tickers/map.parquet`
+  — built by the first nightly's `tickers.build()`, or by hand; until then `tickers.intervals()` falls back to
+  the current map; (4) `SEC_USER_AGENT` (a real contact) in `tbot-secrets`, else the SEC map refresh is skipped
+  and the summary says `refreshed: false`.
 - Operator drivers for the gate runbook are in `tools/t17/` (see its README).
 
-## Where to start next (decided 2026-09-05)
+## Where to start next (updated 2026-09-05, after the phase-1 hardening branch)
+
+The hardening plan (`docs/superpowers/plans/2026-09-05-phase1-hardening.md`) is implemented on branch
+`phase1-hardening`: split re-basing in the nightly, the point-in-time ticker map, a delisting-aware engine,
+the filings pushdown, the 8-K event scaffolding, the calibration limits measured (`docs/phase1/calibration-limits.md`,
+report §12, rulings 42–47) and the quarantine spike explained. Every decision taken without sign-off is in
+`docs/phase1/decisions-taken.md`. The search-protocol plan (`2026-09-05-phase1-search-protocol.md`) builds the
+registry, the gate 1→2 statistics and the one-shot holdout on branch `phase1-search`; **nothing registers a
+hypothesis or spends a holdout until the gate closes** (five green nightlies + the user's sign-off on the report).
+Deployment of the hardening branch to quasar (image, `SEC_USER_AGENT` in `tbot-secrets`, PVC sync of
+`data/edgar/{filings,entities}`, `data/actions/{name_changes,mergers}`, `data/tickers`, the `rebase-catchup` Job)
+happens after the PR merges — decision D7.
+
+### The original sequencing (2026-09-05, kept for the record)
 
 Phase 0 is merged; gate 0→1 is **open** until nightly runs 2–5 are green (Tue–Sat
 02:30 UTC, check `kubectl -n tbot get jobs` or the `job.nightly` ledger events on the

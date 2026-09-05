@@ -260,3 +260,75 @@ def read_bars(
         .drop(_FILE_COL)
     )
     return df.sort(["symbol", "ts", "source"]).select(list(SCHEMA))
+
+
+#: What :func:`symbol_spans` returns: one row per symbol with its first and last bar.
+SPAN_SCHEMA = pl.Schema({"symbol": pl.Utf8, "first_ts": pl.Date, "last_ts": pl.Date})
+
+
+def symbol_spans(
+    source: str | None = None,
+    resolution: str = "1d",
+    symbols: Iterable[str] | None = None,
+) -> pl.DataFrame:
+    """First and last bar date per symbol: ``symbol, first_ts, last_ts``.
+
+    A lazy aggregate over the batch files with no dedupe — a correction never
+    moves a symbol's first or last date, so the min and max over every batch
+    are the answer. `source` of ``None`` spans every source; `symbols` of
+    ``None`` spans every symbol, and a collection narrows the scan to those
+    names before anything is materialised (an empty collection spans none).
+    Sorted by symbol; typed and empty when nothing matches.
+    """
+    resolution = _safe_component(resolution, "resolution")
+    if source is not None:
+        source = _safe_component(source, "source")
+    symbols = None if symbols is None else list(symbols)
+    files = _batch_files(resolution, source)
+    if not files:
+        return pl.DataFrame(schema=SPAN_SCHEMA)
+    scan = pl.scan_parquet(files)
+    if symbols is not None:
+        scan = scan.filter(pl.col("symbol").is_in(pl.lit(symbols, dtype=pl.List(pl.Utf8))))
+    return (
+        scan.group_by("symbol")
+        .agg(first_ts=pl.col("ts").min(), last_ts=pl.col("ts").max())
+        .sort("symbol")
+        .collect()
+        .select(list(SPAN_SCHEMA))
+    )
+
+
+def symbols_ingested_since(
+    since: dt.datetime,
+    source: str | None = None,
+    resolution: str = "1d",
+    symbols: Iterable[str] | None = None,
+) -> list[str]:
+    """Symbols with at least one bar whose ``ingested_at`` is on or after `since`.
+
+    The evidence that a vendor served a symbol in a pull that has just
+    happened: :func:`write_bars` stamps every row, and a batch newer than
+    `since` names exactly the symbols the vendor returned. No dedupe — an older
+    batch says nothing about the pull. `since` must be timezone-aware; it is
+    rendered the way :func:`write_bars` renders the stamp, so the comparison is
+    the lexicographic one the read side already relies on. The predicate is
+    pushed into the scan, so parquet statistics skip every batch older than
+    `since` unread. Sorted; empty when nothing matches.
+    """
+    if not isinstance(since, dt.datetime):
+        raise TypeError(f"since must be a datetime, got {type(since).__name__}")
+    if since.tzinfo is None or since.utcoffset() is None:
+        raise ValueError("since must be timezone-aware")
+    stamp = since.astimezone(dt.timezone.utc).isoformat(timespec="microseconds")
+    resolution = _safe_component(resolution, "resolution")
+    if source is not None:
+        source = _safe_component(source, "source")
+    symbols = None if symbols is None else list(symbols)
+    files = _batch_files(resolution, source)
+    if not files:
+        return []
+    scan = pl.scan_parquet(files).filter(pl.col("ingested_at") >= stamp)
+    if symbols is not None:
+        scan = scan.filter(pl.col("symbol").is_in(pl.lit(symbols, dtype=pl.List(pl.Utf8))))
+    return sorted(scan.select("symbol").unique().collect()["symbol"].to_list())

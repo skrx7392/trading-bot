@@ -71,19 +71,53 @@ retroactive.
     *measuring*: both vendors concatenate a dead issuer's history under a reused
     ticker (HYFT $0.005 -> $4.30 overnight, AMPY $0.12 -> $18.75, IGLD $0.37 ->
     $24.60), and a partially back-adjusted reverse split shows up as an exact
-    integer step. Everything before a symbol's *last* break is dropped: the tail
-    is the current issuer under the current adjustment regime, and the head is a
-    different company or a different scale wearing the same ticker.
+    integer step.
+
+    Two rules read those ratios, in order. **A one-day spike is dropped.** A row
+    whose ratio breaks but whose successor is back inside the band *against the
+    same preceding close* did not change the level: one print left it and came
+    straight back, so the print goes and the ratios are recomputed across the
+    gap it leaves. Measuring the successor against the close before the break —
+    not against the break — is what separates the print from the splice, since
+    $100 -> $1,000 -> $800 leaves the series eight times where it started and
+    that level moved and stayed moved. **Everything before a symbol's last
+    surviving break is then dropped**: the tail is the current issuer under the
+    current adjustment regime, and the head is a different company or a
+    different scale wearing the same ticker. That truncation wants confirmation,
+    because one row cannot establish a level — so a break sitting on a symbol's
+    *last* row through ``end``, which has no successor to either revert or
+    confirm it, is dropped as a row rather than obeyed as a break.
+
+    The two rules exist to stop the same outcome: a single junk print — a 10x
+    tick both vendors agree on, a partial back-adjustment landing in one night's
+    batch — becoming the *entire* series for a name at that ``asof``, which is
+    exactly what "drop everything before the break" does when the break is the
+    junk. `universe.build`'s median close would be the junk price, and
+    momentum's ``near`` close would be the junk price. The cost is a day of a
+    genuine reverse split's close, back the next session as a confirmed break.
     ``max_jump=None`` disables the detector.
 
     ``end`` bounds the detector, because ``end`` is a *point-in-time horizon*
-    and not a display filter: every consumer here passes ``end=asof``, and
-    letting a break the caller could not yet have known about retract history it
-    could legitimately have traded would put look-ahead — and survivorship bias,
-    in the direction that flatters a backtest — into every result. A name that
+    and not a display filter: the point-in-time consumers — ``universe.build``
+    and the fundamental signals — pass ``end=asof``, and letting a break the
+    caller could not yet have known about retract history it could
+    legitimately have traded would put look-ahead — and survivorship bias, in
+    the direction that flatters a backtest — into every result. A name that
     collapses 100x in 2021 would otherwise vanish from the 2020 universe. The
     contamination is still reached, one horizon later: the moment ``asof`` moves
     past the splice, the dead issuer's history stops being returned.
+
+    **Two consumers do not pass ``end=asof``, and that is a registered limit
+    (decision D12, report §12.6).** ``metrics.monthly_longshort`` and
+    ``engine._market_frame`` read one panel through the *window's* end, so a
+    break confirmed in 2018 truncates the 2016–2017 rows for every formation
+    date in the window, including the 2017 ones that could not have seen it.
+    The exposure is a two-vendor-agreed 5x break on a name past the $5 and
+    $1M screens, and the direction is the flattering one — the dead issuer's
+    history leaves the panel early. Every calibration number carries it. The
+    fix belongs to the search branch's first prerequisite task: read the panel
+    with ``max_jump=None`` and apply the truncation per formation month at
+    that month's horizon, then re-run the calibrations to quantify the change.
 
     ``start`` bounds it too, and — unlike ``end`` — bounding it there changes
     nothing about the answer. Under "keep the tail at and after the *last* break
@@ -239,43 +273,107 @@ def _check_max_jump(max_jump) -> float | None:
     return max_jump
 
 
+def _check_symbols(symbols) -> list[str] | None:
+    """``None`` for "every symbol"; otherwise a normalised, de-duplicated list.
+
+    A bare string is refused rather than iterated: ``symbols="AAPL"`` would
+    otherwise vote four one-letter tickers and report four verdicts.
+    """
+    if symbols is None:
+        return None
+    if isinstance(symbols, (str, bytes)):
+        raise TypeError("symbols must be a collection of strings, not a bare string")
+    out: list[str] = []
+    for raw in symbols:
+        sym = str(raw).strip().upper()
+        if sym and sym not in out:
+            out.append(sym)
+    return out
+
+
+def _ratiable(a: pl.Expr, b: pl.Expr) -> pl.Expr:
+    """Can ``a / b`` be a meaningful close ratio? Both must be real prices.
+
+    Non-positive and non-finite closes cannot form one. They never reach a
+    canonical row today (a quarantine, or the vote's usability filter, catches
+    them first), but the guard stays: without it a single 0.0 would divide the
+    panel into an infinity and silently truncate a good symbol. It also carries
+    the missing neighbours at a symbol's two ends, where the shift is null.
+    """
+    return (
+        a.is_not_null()
+        & a.is_finite()
+        & (a > 0)
+        & b.is_not_null()
+        & b.is_finite()
+        & (b > 0)
+    )
+
+
+def _breaks(numerator: pl.Expr, denominator: pl.Expr, max_jump: float) -> pl.Expr:
+    """Is this close ratio a level break rather than a session? Never null."""
+    ratio = numerator / denominator
+    return _ratiable(numerator, denominator) & ((ratio > max_jump) | (ratio < 1.0 / max_jump))
+
+
 def _drop_pre_break(df: pl.DataFrame, max_jump: float) -> pl.DataFrame:
-    """Per symbol, keep only the rows at and after the *last* level break.
+    """Drop one-day spikes, then keep only the rows at and after the *last* break.
 
     A break is a consecutive-row close ratio outside ``[1/max_jump, max_jump]``,
     measured on `df` exactly as given — so the caller owes this function every
     row whose ratio matters, including the one close before the window it means
-    to return, and applies the window afterwards. The break row itself is the
-    first row of the new regime, so it is kept.
+    to return, and applies the window afterwards.
 
-    Non-positive and non-finite closes cannot form a meaningful ratio. They
-    never reach a canonical row today (a quarantine, or the vote's usability
-    filter, catches them first), but the guard stays: without it a single 0.0
-    would divide the panel into an infinity and silently truncate a good symbol.
+    **Spikes first.** A row whose own ratio breaks but whose *successor* is back
+    inside the band **against the same preceding close** is a print, not a
+    regime: the level left and came straight back, and only one row can be
+    responsible. Those rows are dropped and the ratios recomputed, which is what
+    makes the two neighbours consecutive. Measuring the successor against the
+    close *before* the break rather than against the break itself is the whole
+    discrimination: 100 -> 1000 -> 800 leaves the successor eight times where the
+    series came from, so the level moved and stayed moved — a splice, kept.
 
-    Fully vectorised — one sort, one window ratio, one window max, one filter.
+    **Then the last break in what remains.** The break row itself is the first
+    row of the new regime, so it is kept — once a later row has confirmed it. A
+    break on the symbol's final row through ``end`` has no such row and is
+    unconfirmed: it is dropped instead, and the history it would have erased
+    stays. Both judgements are made on the frame as given, which the caller has
+    already bounded by ``end``, so neither reads a row the caller could not.
+
+    Vectorised throughout: two window passes, no Python loop over symbols.
     """
     if df.height == 0:
         return df
-    prev = pl.col("close").shift(1).over("symbol")
-    ratio = pl.col("close") / prev
-    usable = (
-        pl.col("close").is_not_null()
-        & pl.col("close").is_finite()
-        & (pl.col("close") > 0)
-        & prev.is_not_null()
-        & prev.is_finite()
-        & (prev > 0)
-    )
-    is_break = usable & ((ratio > max_jump) | (ratio < 1.0 / max_jump))
+    close = pl.col("close")
+    df = df.sort(["symbol", "ts"])
+
+    # Pass 1 — spikes. `prev` and `next` are the same row's two neighbours, so
+    # `next / prev` asks what the series would have done had this row never
+    # printed. Inside the band, it would have done nothing.
+    prev = close.shift(1).over("symbol")
+    nxt = close.shift(-1).over("symbol")
+    # A missing neighbour is not a revert: a break on the last row has no
+    # successor to come back, and that is the final-row rule's case below.
+    reverts = _ratiable(nxt, prev) & ~_breaks(nxt, prev, max_jump)
+    spike = _breaks(close, prev, max_jump) & reverts
+    df = df.with_columns(__spike=spike).filter(~pl.col("__spike")).drop("__spike")
+
+    # Pass 2 — the surviving level breaks, on ratios recomputed over the gaps
+    # the spikes left behind.
+    prev = close.shift(1).over("symbol")
+    is_break = _breaks(close, prev, max_jump)
+    is_final = pl.col("ts") == pl.col("ts").max().over("symbol")
+    unconfirmed = is_break & is_final
+    confirmed = is_break & ~is_final
     # `max` over a `when` without an `otherwise` ignores the non-break rows, so a
     # symbol that never breaks gets a null cutoff and keeps everything.
-    last_break = pl.when(is_break).then(pl.col("ts")).max().over("symbol")
+    last_break = pl.when(confirmed).then(pl.col("ts")).max().over("symbol")
     return (
-        df.sort(["symbol", "ts"])
-        .with_columns(__cut=last_break)
-        .filter(pl.col("__cut").is_null() | (pl.col("ts") >= pl.col("__cut")))
-        .drop("__cut")
+        df.with_columns(__cut=last_break, __drop=unconfirmed)
+        .filter(
+            ~pl.col("__drop") & (pl.col("__cut").is_null() | (pl.col("ts") >= pl.col("__cut")))
+        )
+        .drop("__cut", "__drop")
     )
 
 
@@ -337,21 +435,35 @@ def _write_batch(rows: pl.DataFrame) -> Path:
     return target
 
 
-def run(start: dt.date, end: dt.date, tol: float = DEFAULT_TOL) -> dict[str, int]:
+def run(
+    start: dt.date,
+    end: dt.date,
+    tol: float = DEFAULT_TOL,
+    *,
+    symbols: Iterable[str] | None = None,
+) -> dict[str, int]:
     """Reconcile every symbol-day in ``[start, end]`` and return the verdict counts.
 
     Writes one canonical-closes parquet batch (including the quarantined rows,
     for audit) and one ledger event per non-unanimous symbol-day. Re-running a
     range is safe and is how corrections are applied: the newest verdict wins.
+
+    `symbols` (keyword-only) narrows the vote to those names; ``None`` votes
+    every symbol the store holds in the window and an empty collection votes
+    nothing and writes nothing. Used by the split re-base, which re-votes one
+    name's whole history after both vendors re-adjusted it.
     """
     start = as_date(start, "start")
     end = as_date(end, "end")
     if start > end:
         raise ValueError(f"start {start} is after end {end}")
     tol = _check_tol(tol)
+    symbols = _check_symbols(symbols)
 
     counts = dict.fromkeys(STATUSES, 0)
-    bars = store.read_bars(start=start, end=end, resolution=RESOLUTION)
+    if symbols is not None and not symbols:
+        return counts
+    bars = store.read_bars(symbols=symbols, start=start, end=end, resolution=RESOLUTION)
     if bars.height == 0:
         return counts
 
@@ -462,13 +574,21 @@ def read_canonical(
         neutral choice and callers that want it should say why.
 
     `max_jump`
-        Drop, per symbol, everything before its last level break — a
-        consecutive-close ratio above `max_jump` or below ``1 / max_jump``.
-        Defaults to :data:`DEFAULT_MAX_JUMP` (5.0); ``None`` disables it. A
-        break after `end` is invisible, because `end` is a point-in-time
-        horizon; one before `start` is *irrelevant*, because every row of the
-        window already lies after it. See the module docstring for why the two
-        boundaries differ and why the second one lets the scan be windowed.
+        Drop, per symbol, its one-day spikes and then everything before its last
+        *confirmed* level break — a consecutive-close ratio above `max_jump` or
+        below ``1 / max_jump``. Defaults to :data:`DEFAULT_MAX_JUMP` (5.0);
+        ``None`` disables it. A break whose successor comes back inside the band
+        against the close before it is a spike: that one row is dropped and the
+        series closes over it. A break is otherwise confirmed only by a
+        subsequent close at or before `end`; an unconfirmed break — one whose
+        row is the symbol's last row through `end` — drops that row and leaves
+        the history before it intact. Either way a single junk print costs a day
+        rather than becoming the name's whole series. A break after `end` is
+        invisible, because `end` is a
+        point-in-time horizon; one before `start` is *irrelevant*, because
+        every row of the window already lies after it. See the module docstring
+        for why the two boundaries differ and why the second one lets the scan
+        be windowed.
 
     Order matters and is fixed: window the scan, dedupe to the newest verdict,
     drop quarantines, apply `min_sources`, find breaks on what is left, then cut

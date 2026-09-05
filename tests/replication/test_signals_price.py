@@ -14,13 +14,15 @@ correctness of the arithmetic:
 
 import datetime as dt
 import json
+import math
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 import tbot.replication as replication
 from tbot.replication import issuance, momentum
-from tbot.warehouse import edgar, reconcile, store
+from tbot.warehouse import actions, edgar, reconcile, store
 
 SIGNAL_COLUMNS = {"symbol": pl.Utf8, "score": pl.Float64}
 
@@ -497,3 +499,230 @@ def test_issuance_staleness_bound_is_inclusive(tmp_path, monkeypatch):
     sig = issuance.signal(asof)
     assert sig["symbol"].to_list() == ["EDGE"]
     assert sig["score"][0] == pytest.approx(0.0)
+
+
+# --- issuance: the point-in-time ticker map -----------------------------------------
+
+def test_issuance_uses_the_point_in_time_ticker_map(tmp_path, monkeypatch):
+    """A built map is honoured: a symbol that starts after `asof` is not the filer's yet."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "A")])
+    _shares_facts(1, [("2019-06-30", "2019-08-01", 100.0),
+                      ("2020-06-30", "2020-08-01", 200.0)])
+    asof = dt.date(2020, 9, 1)
+    from tbot.warehouse import tickers
+    pl.DataFrame([{"cik": 1, "symbol": "A", "valid_from": asof + dt.timedelta(days=1),
+                   "valid_to": None, "source": "override"}], schema=tickers.MAP_SCHEMA
+                 ).write_parquet(tickers._map_path(create=True))
+    assert issuance.signal(asof).height == 0
+    assert issuance.signal(asof + dt.timedelta(days=1))["symbol"].to_list() == ["A"]
+
+
+# --- issuance: the lag knob (OSAP's ShareIss1Y lags both endpoints six months) ------
+# OSAP forms `(temp[t-6m] - temp[t-18m]) / temp[t-18m]`: a twelve-month change whose
+# endpoints both sit six months behind the formation date. `lag_days` reproduces that
+# alignment. The two things it must get right: both counts move back *together* (the
+# horizon stays one year), and the ticker map is still read on `asof` (today's names
+# carry yesterday's counts — the symbol that trades on the formation date is the one
+# that gets the score).
+
+def _three_annual_counts(cik: int, counts: tuple[float, float, float]) -> None:
+    """Counts filed 2018-08-01, 2019-08-01 and 2020-08-01, so that a read on
+    2020-09-01 sees the last year and a read 180 days earlier sees the one before."""
+    _shares_facts(cik, [("2018-06-30", "2018-08-01", counts[0]),
+                        ("2019-06-30", "2019-08-01", counts[1]),
+                        ("2020-06-30", "2020-08-01", counts[2])])
+
+
+def test_issuance_lag_moves_both_endpoints_together(tmp_path, monkeypatch):
+    """`signal(asof, lag_days=k)` is `signal(asof - k)` on the same filings.
+
+    GROWER's lagged year is 100 -> 150 and its unlagged year 150 -> 300, so a
+    knob that moved only one endpoint would score a two-year change (100 ->
+    300) or the unlagged year, and neither equals the read taken `k` days
+    earlier.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "GROWER"), (2, "STEADY")])
+    _three_annual_counts(1, (100.0, 150.0, 300.0))
+    _three_annual_counts(2, (100.0, 100.0, 100.0))
+    asof = dt.date(2020, 9, 1)
+    lagged = issuance.signal(asof, lag_days=180)
+    assert_frame_equal(lagged, issuance.signal(asof - dt.timedelta(days=180)))
+    assert lagged["symbol"].to_list() == ["GROWER", "STEADY"]
+    assert lagged["score"].to_list() == pytest.approx([-math.log(1.5), 0.0])
+    # And that is not the unlagged answer, which sees the 150 -> 300 year.
+    assert issuance.signal(asof)["score"][0] == pytest.approx(-math.log(2.0))
+
+
+def test_issuance_lag_defaults_to_zero(tmp_path, monkeypatch):
+    """Ruling 40's calibration was made on the unlagged read; it stays the default."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "GROWER")])
+    _three_annual_counts(1, (100.0, 150.0, 300.0))
+    asof = dt.date(2020, 9, 1)
+    assert issuance.LAG_DAYS == 0
+    assert_frame_equal(issuance.signal(asof), issuance.signal(asof, lag_days=0))
+    assert issuance.signal(asof)["score"][0] == pytest.approx(-math.log(2.0))
+
+
+def test_issuance_lag_reads_the_ticker_map_at_asof_not_at_the_lagged_date(
+        tmp_path, monkeypatch):
+    """The counts move back `k` days; the names are still today's.
+
+    The filer renamed OLD -> NEW inside the lag window. On `asof` its tradable
+    name is NEW, so NEW carries the lagged score; an unlagged read on the lagged
+    date would have called it OLD.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "OLD")])
+    _three_annual_counts(1, (100.0, 150.0, 300.0))
+    asof = dt.date(2020, 9, 1)
+    renamed = asof - dt.timedelta(days=30)  # inside the 180-day lag window
+    from tbot.warehouse import tickers
+    pl.DataFrame([
+        {"cik": 1, "symbol": "OLD", "valid_from": None,
+         "valid_to": renamed - dt.timedelta(days=1), "source": "override"},
+        {"cik": 1, "symbol": "NEW", "valid_from": renamed, "valid_to": None,
+         "source": "override"},
+    ], schema=tickers.MAP_SCHEMA).write_parquet(tickers._map_path(create=True))
+    lagged = issuance.signal(asof, lag_days=180)
+    assert lagged["symbol"].to_list() == ["NEW"]
+    assert lagged["score"][0] == pytest.approx(-math.log(1.5))
+    assert issuance.signal(asof - dt.timedelta(days=180))["symbol"].to_list() == ["OLD"]
+
+
+@pytest.mark.parametrize("bad", [-1, 1.5, True, "180"])
+def test_issuance_rejects_a_negative_or_non_int_lag(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "A")])
+    with pytest.raises(ValueError, match="lag_days"):
+        issuance.signal(dt.date(2020, 9, 1), lag_days=bad)
+
+
+# --- issuance: split adjustment (ruling D11 — the definition, not a tuning knob) ------
+# OSAP's count is `shrout * cfacshr`, split-adjusted; a filed count is not. Without the
+# adjustment a 2:1 split between the two filings reads as 100% issuance. `split_adjust`
+# puts the year-ago count on the current count's basis: it is multiplied by
+# new_rate / old_rate over every split of the row's symbol with an ex-date strictly
+# after the year-ago count's filing date and at or before the current count's.
+
+def _splits(root, rows: list[dict]) -> None:
+    """Seed `actions/splits/` with :data:`actions.SPLIT_SCHEMA` rows, one batch per call."""
+    d = root / "actions" / "splits"
+    d.mkdir(parents=True, exist_ok=True)
+    n = len(list(d.glob("*.parquet")))
+    pl.DataFrame(rows, schema=actions.SPLIT_SCHEMA).write_parquet(
+        d / f"2026010{n}T000000000000-{'a' * 32}.parquet")
+
+
+def _year_of_counts(cik: int, then: float, now: float) -> None:
+    """A count filed 2019-08-01 and one filed 2020-08-01, read on 2020-09-01."""
+    _shares_facts(cik, [("2019-06-30", "2019-08-01", then),
+                        ("2020-06-30", "2020-08-01", now)])
+
+
+ASOF = dt.date(2020, 9, 1)
+
+
+def test_issuance_split_adjusts_the_year_ago_count_onto_the_current_basis(tmp_path, monkeypatch):
+    """A 2:1 split between the filings: the doubled count is not issuance."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "SPLIT")])
+    _year_of_counts(1, 100.0, 200.0)
+    _splits(tmp_path, [{"symbol": "SPLIT", "ex_date": dt.date(2020, 1, 15),
+                        "old_rate": 1.0, "new_rate": 2.0}])
+    assert issuance.signal(ASOF, split_adjust=True)["score"][0] == pytest.approx(0.0)
+    assert issuance.signal(ASOF, split_adjust=False)["score"][0] == pytest.approx(-math.log(2.0))
+
+
+@pytest.mark.parametrize("ex_date, expected", [
+    (dt.date(2019, 7, 1), -math.log(2.0)),   # before the year-ago filing: already in that count
+    (dt.date(2019, 8, 1), -math.log(2.0)),   # ON the year-ago filing date: strictly after is required
+    (dt.date(2020, 8, 1), 0.0),              # on the current filing date: inclusive
+    (dt.date(2020, 8, 2), -math.log(2.0)),   # after the current filing: not in that count yet
+])
+def test_issuance_split_adjusts_only_between_the_two_filing_dates(
+        tmp_path, monkeypatch, ex_date, expected):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "SPLIT")])
+    _year_of_counts(1, 100.0, 200.0)
+    _splits(tmp_path, [{"symbol": "SPLIT", "ex_date": ex_date, "old_rate": 1.0, "new_rate": 2.0}])
+    assert issuance.signal(ASOF)["score"][0] == pytest.approx(expected)
+
+
+def test_issuance_two_splits_multiply(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "SPLIT")])
+    _year_of_counts(1, 100.0, 600.0)
+    _splits(tmp_path, [{"symbol": "SPLIT", "ex_date": dt.date(2019, 12, 1),
+                        "old_rate": 1.0, "new_rate": 2.0}])
+    _splits(tmp_path, [{"symbol": "SPLIT", "ex_date": dt.date(2020, 3, 1),
+                        "old_rate": 1.0, "new_rate": 3.0}])
+    assert issuance.signal(ASOF)["score"][0] == pytest.approx(0.0)
+    assert issuance.signal(ASOF, split_adjust=False)["score"][0] == pytest.approx(-math.log(6.0))
+
+
+def test_issuance_reverse_split_divides(tmp_path, monkeypatch):
+    """10 old shares -> 1 new: a tenth of the count is not a buyback."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "RSPLIT")])
+    _year_of_counts(1, 1000.0, 100.0)
+    _splits(tmp_path, [{"symbol": "RSPLIT", "ex_date": dt.date(2020, 1, 15),
+                        "old_rate": 10.0, "new_rate": 1.0}])
+    assert issuance.signal(ASOF)["score"][0] == pytest.approx(0.0)
+    assert issuance.signal(ASOF, split_adjust=False)["score"][0] == pytest.approx(math.log(10.0))
+
+
+def test_issuance_a_filer_without_splits_is_unchanged(tmp_path, monkeypatch):
+    """Another symbol's split is not this filer's, and no splits table at all is fine."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "ISSUER"), (2, "SPLIT")])
+    _year_of_counts(1, 100.0, 125.0)
+    _year_of_counts(2, 100.0, 200.0)
+    before = issuance.signal(ASOF)  # no `actions/splits/` directory yet
+    assert before["symbol"].to_list() == ["ISSUER", "SPLIT"]
+    assert before["score"].to_list() == pytest.approx([-math.log(1.25), -math.log(2.0)])
+    _splits(tmp_path, [{"symbol": "SPLIT", "ex_date": dt.date(2020, 1, 15),
+                        "old_rate": 1.0, "new_rate": 2.0}])
+    after = issuance.signal(ASOF)
+    assert after["score"].to_list() == pytest.approx([-math.log(1.25), 0.0])
+    assert_frame_equal(after.filter(pl.col("symbol") == "ISSUER"),
+                       before.filter(pl.col("symbol") == "ISSUER"))
+
+
+def test_issuance_split_adjustment_is_on_by_default_and_keyed_by_the_asof_map(
+        tmp_path, monkeypatch):
+    """Default is `split_adjust=True`; the split is looked up under the symbol the
+    filer has on `asof` (the map read stays at `asof`), and per symbol for a filer
+    with two share classes."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "OLD"), (2, "SHRA"), (2, "SHRB")])
+    _year_of_counts(1, 100.0, 200.0)
+    _year_of_counts(2, 100.0, 200.0)
+    from tbot.warehouse import tickers
+    renamed = ASOF - dt.timedelta(days=30)
+    pl.DataFrame([
+        {"cik": 1, "symbol": "OLD", "valid_from": None,
+         "valid_to": renamed - dt.timedelta(days=1), "source": "override"},
+        {"cik": 1, "symbol": "NEW", "valid_from": renamed, "valid_to": None, "source": "override"},
+        {"cik": 2, "symbol": "SHRA", "valid_from": None, "valid_to": None, "source": "override"},
+        {"cik": 2, "symbol": "SHRB", "valid_from": None, "valid_to": None, "source": "override"},
+    ], schema=tickers.MAP_SCHEMA).write_parquet(tickers._map_path(create=True))
+    # The vendor keys the split by the current symbol; only SHRB of the two classes split.
+    _splits(tmp_path, [
+        {"symbol": "NEW", "ex_date": dt.date(2020, 1, 15), "old_rate": 1.0, "new_rate": 2.0},
+        {"symbol": "SHRB", "ex_date": dt.date(2020, 1, 15), "old_rate": 1.0, "new_rate": 2.0},
+    ])
+    sig = issuance.signal(ASOF)
+    assert_frame_equal(sig, issuance.signal(ASOF, split_adjust=True))
+    assert sig["symbol"].to_list() == ["NEW", "SHRA", "SHRB"]
+    assert sig["score"].to_list() == pytest.approx([0.0, -math.log(2.0), 0.0])
+
+
+@pytest.mark.parametrize("bad", [0, 1, "yes", None])
+def test_issuance_rejects_a_non_bool_split_adjust(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write_ticker_map(tmp_path, [(1, "A")])
+    with pytest.raises(TypeError, match="split_adjust"):
+        issuance.signal(ASOF, split_adjust=bad)

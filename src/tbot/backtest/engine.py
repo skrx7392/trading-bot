@@ -11,18 +11,27 @@ How a day works
 
 Each trading day is processed in four steps, in this order:
 
-1. **Delistings.** Any held symbol with no canonical close today is liquidated
-   at its last observed close, the gain is realised, and an
-   ``engine.forced_liquidation`` ledger event is written. Every position that
-   survives this step therefore has a price for the rest of the day, which is
-   what lets the marking arithmetic below be exact rather than defensive.
+1. **Renames, gaps and exits.** A held symbol with a name change (from
+   :func:`~tbot.warehouse.actions.read_name_changes`) whose process date falls
+   after its last vetted close and on or before today is carried into the new
+   symbol — shares, tax lots, pending target and last mark move unchanged,
+   nothing is traded — and an ``engine.rename`` event is written. Then every
+   held symbol with no vetted close today is either *held* through the hole,
+   marked at its last vetted close, for up to :data:`MAX_GAP_DAYS` consecutive
+   trading days, or *exited* — on a merger for it (from
+   :func:`~tbot.warehouse.actions.read_mergers`) or once the gap exceeds the
+   tolerance — at the price "Exits" below gives, with an
+   ``engine.forced_liquidation`` event saying which rule fired. A name inside
+   its gap has no price for the rest of the day: it cannot be traded, and it is
+   marked at its last close.
 2. **Fills.** Orders decided at the *previous* rebalance day's close execute at
    today's close (see "Next-day execution" below). Sells are executed before
    buys, because that is the order in which cash actually becomes available.
 3. **Decision.** On a rebalance day, `strat.signal(asof)` is scored, the top
    `n_long` investable names are equal-weighted, and the resulting target is
    held over to the next trading day.
-4. **Marking.** Equity is cash plus shares at today's close.
+4. **Marking.** Equity is cash plus shares at today's close — or, for a name
+   inside its gap, at its last vetted close.
 
 Documented simplifications (all of them v0)
 -------------------------------------------
@@ -36,22 +45,48 @@ extra day of price movement it did not decide on, which is noise for a monthly
 rebalance and would not be for a daily one. Upgrade this to true opens before
 trusting a high-turnover result.
 
-**Forced liquidation prices a delisting at the last good close.** Real
-delistings are usually preceded by a large drop and often settle below the last
-print, so this is the optimistic direction; it is bounded by how much of the
-book can be in delisting names at once. Note also that
-:func:`~tbot.warehouse.reconcile.read_canonical` drops *quarantined* symbol-days,
-so a single vendor disagreement makes a live symbol vanish for one day and
-triggers this path — the engine cannot tell a one-day gap from a delisting
-without looking into the future, and it will not look into the future. The
-observable cost is one unwanted round trip plus the tax on it; if quarantine
-rates in the real backfill turn out to be non-trivial, the fix belongs in the
-warehouse (an explicit `delisted` flag) rather than here.
+**Renames carry the position; they do not trade it.** On the first trading day
+`t` at which a held symbol `S` has a name change ``(old=S, new=S')`` whose
+process date lies after `S`'s last vetted close and on or before `t`, the
+shares, the open tax lots (merged FIFO by purchase date with any `S'` already
+holds), the pending target and the last mark move to `S'` unchanged: nothing is
+traded, charged or realised, and the holding period runs through the rename as
+it does for tax purposes. This runs before the gap check, so a rename day is
+not a gap. A name-change row whose two symbols are equal (Alpaca files a
+company-name change that way) is not a rename and is ignored.
+
+**A short gap is a hole, not a delisting.** A held symbol with no vetted close
+on `t` is held, marked at its last vetted close, for up to :data:`MAX_GAP_DAYS`
+(5) consecutive trading days; on its return the position simply continues.
+:func:`~tbot.warehouse.reconcile.read_canonical` drops *quarantined*
+symbol-days, so under phase 0's rule — any hole is a delisting — a single vendor
+disagreement forced a taxable round trip, and the measured quarantine rate is
+2.4% of bars. A name inside its gap is still part of the book the rebalance
+weights are measured against, but it cannot be traded until it prints again.
+
+**Exits.** The position is exited when (a) a merger event for `S` with a process
+date after the last vetted close and on or before `t` exists — at ``cash_rate``
+per share for a cash merger with a positive rate, else at the last vetted close
+(share conversion into the acquirer is not modelled; the event records the
+deal's kind) — or (b)
+the gap exceeds :data:`MAX_GAP_DAYS`, at the last vetted close, multiplied by
+``1 + DELIST_RETURN`` when that close is below ``DELIST_PRICE_FLOOR`` (the
+Shumway rule :mod:`~tbot.backtest.metrics` adopted under ruling 39), because a
+name forced off an exchange under a dollar typically loses most of the residual
+value in the aftermarket. Above the floor the last print is the optimistic
+direction — real delistings are usually preceded by a large drop and often
+settle below it — bounded by how much of the book can be in delisting names at
+once. Cost if wrong: a genuinely dead name is carried for five extra days at a
+stale mark before it is exited exactly as before, and a wrong vendor
+``cash_rate`` prices a merger exit wrong; the event carries both the price and
+the last close and says which rule fired (``reason``, ``gap_days``).
 
 **A forced liquidation is *dated* at that last close too, not at the day the
-engine noticed.** Discovery is always the next trading day, so the two dates
-differ by one trading day — which is enough to move a realised gain across a
-year boundary (last close 31 Dec, discovery 2 Jan) or a 365-day holding across
+engine noticed.** Discovery is at the earliest the next trading day (a merger
+dated the day after the last print) and for a gap exit :data:`MAX_GAP_DAYS` + 1
+trading days after the last close, so the two dates differ by up to a week and
+more across holidays — which is enough to move a realised gain across a year
+boundary (last close 31 Dec, discovery in January) or a 365-day holding across
 the short/long-term line. The last close wins for three reasons: it is the price
 the sale is booked at, so pairing it with a later date would compute a gain at
 one date and tax it in another; it is the last day the position contributed to
@@ -100,9 +135,10 @@ import polars as pl
 from tbot import config, ledger
 from tbot._dates import as_date
 from tbot.backtest import costs as costs_mod
+from tbot.backtest.metrics import DELIST_PRICE_FLOOR, DELIST_RETURN
 from tbot.backtest.strategy import Strategy
 from tbot.backtest.tax import TaxLots
-from tbot.warehouse import reconcile, store
+from tbot.warehouse import actions, reconcile, store
 
 #: Trailing window, in *observations*, for the cost model's volatility and ADV
 #: inputs. Twenty trading days ~ one month: long enough to be an estimate,
@@ -137,6 +173,12 @@ QTY_EPS = 1e-9
 
 #: Orders smaller than a millionth of a dollar are rounding, not trades.
 MIN_TRADE_NOTIONAL = 1e-6
+
+#: Consecutive trading days a held name may go without a vetted close before
+#: it is treated as gone. Five is a week: long enough to ride out a quarantined
+#: vendor disagreement or a halt, short enough that a real delisting is booked
+#: within the month it happened.
+MAX_GAP_DAYS = 5
 
 #: The equity curve: one row per trading day in the run window.
 DAILY_SCHEMA = pl.Schema({"ts": pl.Date, "equity": pl.Float64, "ret_net": pl.Float64})
@@ -210,7 +252,11 @@ def _market_frame(start: dt.date, end: dt.date) -> pl.DataFrame:
 
     Both trailing windows end at the row they annotate, so a trade priced on day
     `d` uses only data through day `d`'s close — the same information the
-    decision had.
+    decision had. The one exception is registered, not hidden: the panel is read
+    once, at `end`'s horizon, so `read_canonical`'s confirmed-break truncation is
+    applied with the whole run's hindsight — a 5x break confirmed late in the run
+    removes that name's earlier rows from every day of it (gate report §12.6,
+    decision D12; the per-day rule is the search branch's first task).
     """
     warm_start = start - dt.timedelta(days=WARMUP_DAYS)
     can = reconcile.read_canonical(start=warm_start, end=end).filter(
@@ -481,6 +527,25 @@ def run(
     costs_paid = 0.0
     equity: list[float] = []
 
+    # Corporate actions, loaded once and keyed by the symbol they act on. Both
+    # readers return a typed empty frame when nothing has been ingested.
+    renames: dict[str, list[tuple[dt.date, str]]] = {}
+    for old, new, on in actions.read_name_changes().iter_rows():
+        if old == new:
+            # Alpaca files a company-name change with the ticker unchanged as a
+            # name_change row too (211 of them in the table). There is nothing
+            # to carry, and carrying it would double a pending target and reset
+            # the gap counter.
+            continue
+        renames.setdefault(old, []).append((on, new))
+    mergers: dict[str, list[tuple[dt.date, str, float | None]]] = {}
+    for row in actions.read_mergers().iter_rows(named=True):
+        mergers.setdefault(row["symbol"], []).append(
+            (row["process_date"], row["kind"], row["cash_rate"])
+        )
+    #: Consecutive trading days each held symbol has gone without a vetted close.
+    gap_days: dict[str, int] = {}
+
     for index, day in enumerate(days):
         quotes: dict[str, tuple[float, float, float] | None] = {}
 
@@ -489,16 +554,69 @@ def run(
                 quotes[symbol] = market.quote(symbol, index)
             return quotes[symbol]
 
-        # --- 1. symbols that left the panel while held --------------------------------
+        # --- 1a. renames: a ticker change carries the position, it does not trade it ---
+        for symbol in sorted(shares):
+            seen_on = last[symbol][0]
+            # "Not yet applied" is "dated after the last close under the old
+            # name": a rename dated on or before a day the old symbol printed
+            # is one the position has already lived through.
+            due = [(on, new) for on, new in renames.get(symbol, ()) if seen_on < on <= day]
+            if not due:
+                continue
+            on, new = min(due)
+            qty = shares.pop(symbol)
+            shares[new] = shares.get(new, 0.0) + qty
+            lots.rename(symbol, new)
+            mark = last.pop(symbol)
+            # A book that somehow holds both names keeps the fresher mark; the
+            # targets add, as the shares and the lots do.
+            if new not in last or last[new][0] < mark[0]:
+                last[new] = mark
+            gap_days.pop(symbol, None)
+            if pending is not None and symbol in pending:
+                moved = pending.pop(symbol)
+                pending[new] = pending.get(new, 0.0) + moved
+            ledger.log_event(
+                "engine.rename",
+                {
+                    "strategy": strat.name,
+                    "symbol": symbol,
+                    "new_symbol": new,
+                    "ts": day.isoformat(),
+                    "process_date": on.isoformat(),
+                    "qty": qty,
+                },
+            )
+
+        # --- 1b. no vetted close today: hold through a short gap, exit otherwise ------
         for symbol in sorted(shares):
             if quote(symbol) is not None:
+                gap_days.pop(symbol, None)
                 continue
-            seen_on, price, adv, sigma = last[symbol]
+            gap = gap_days.get(symbol, 0) + 1
+            gap_days[symbol] = gap
+            seen_on, close, adv, sigma = last[symbol]
+            # Only a deal dated after the last close under this name can be the
+            # reason it stopped printing; the ticker may have been recycled.
+            deal = [m for m in mergers.get(symbol, ()) if seen_on < m[0] <= day]
+            if not deal and gap <= MAX_GAP_DAYS:
+                continue  # a hole, not a delisting: marked at the last close in step 4
+            if deal:
+                _, kind, cash_rate = min(deal, key=lambda m: (m[0], m[1]))
+                reason = f"merger_{kind}"
+                # A missing or non-positive vendor rate is no rate: a cash exit
+                # at 0.0 would be a silent write-off, not a measurement.
+                priced = kind == "cash" and cash_rate is not None and cash_rate > 0.0
+                price = cash_rate if priced else close
+            else:
+                reason = "gap_exceeded"
+                price = close * (1.0 + DELIST_RETURN) if close < DELIST_PRICE_FLOOR else close
             qty = shares.pop(symbol)
             held = lots.qty_held(symbol)
             _check_book(symbol, day, qty, held)
             qty = min(qty, held)
             last.pop(symbol, None)
+            gap_days.pop(symbol, None)
             if qty <= QTY_EPS:
                 continue
             cost = cm.estimate(price, qty, adv, sigma)
@@ -518,18 +636,25 @@ def run(
                     "tax_ts": seen_on.isoformat(),  # drives the year and ST/LT
                     "qty": qty,
                     "price": price,
+                    "last_close": close,
                     "proceeds": qty * price,
                     "cost": cost,
                     "st": st,
                     "lt": lt,
                     "cost_model_version": cm.version,
-                    "reason": "no canonical close; symbol left the price panel",
+                    "reason": reason,
+                    "gap_days": gap,
                 },
             )
 
         # --- 2. fills for the previous rebalance day's decision ------------------------
         if pending is not None:
-            portfolio = cash + sum(qty * quotes[s][0] for s, qty in shares.items())
+            # A name inside its gap cannot be traded today (it is skipped below),
+            # but it is still part of the book the weights are measured against.
+            portfolio = cash + sum(
+                qty * (quotes[s][0] if quotes.get(s) is not None else last[s][1])
+                for s, qty in shares.items()
+            )
             orders = []
             if portfolio > 0.0:
                 for symbol in sorted(set(pending) | set(shares)):
@@ -610,9 +735,10 @@ def run(
         # --- 4. mark to today's close --------------------------------------------------
         value = 0.0
         for symbol, qty in shares.items():
-            quoted = quotes[symbol]
-            if quoted is None:  # unreachable: step 1 liquidated every hole
-                raise RuntimeError(f"held {symbol} has no close on {day}")
+            quoted = quotes.get(symbol)
+            if quoted is None:  # inside its gap tolerance: carried at the last close
+                value += qty * last[symbol][1]
+                continue
             value += qty * quoted[0]
             last[symbol] = (day, *quoted)
         equity.append(cash + value)

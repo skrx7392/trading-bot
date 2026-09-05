@@ -12,7 +12,10 @@ Two SEC feeds land here:
     consumer diffing quarters must filter on it; see :data:`_PIT_SORT`.
 ``submissions``
     The company's filing index (``filings.recent``), flattened to one row per
-    filing under ``<data_root>/edgar/filings/``.
+    filing under ``<data_root>/edgar/filings/`` — with the acceptance instant
+    (the PIT key to the minute) and, for 8-Ks, the item codes — and the
+    document's identity block (name, tickers, former names) to one row under
+    ``<data_root>/edgar/entities/``.
 
 **``filed`` is the point-in-time key.** An entry carries both the period it
 describes (``end``) and the date the market could first see it (``filed``), and
@@ -26,23 +29,34 @@ so a reader globbing ``*.parquet`` never sees a partial file. Re-ingesting a
 company is a correction, not an append, so a re-run of the backfill is
 idempotent instead of doubling every row: companyfacts is a complete snapshot
 and replaces the file outright, while submissions arrives in shards and so
-merges, deduped on ``(cik, accn)`` with the incoming row winning. Point-in-time
+merges, deduped on ``(cik, accn)`` with the incoming row winning. The identity
+block is a complete snapshot too and so replaces ``edgar/entities/<cik>.parquet``
+outright — but only the *main* submissions document carries one, so a shard
+merging its filings can never blank a company's identity. Point-in-time
 integrity does not depend on file history — the ``filed`` date inside the data
 carries it — and every ingest is recorded in the decision ledger.
 
-Nothing here talks to the network. Callers fetch the bytes (see the backfill
+The ingesters here talk to no network. Callers fetch the bytes (see the backfill
 runbook: bulk ``companyfacts.zip`` plus per-company ``submissions``, with a
 contact ``User-Agent`` and <=10 req/s per SEC fair access) and hand them over.
+The one exception is :func:`fetch_document`, which pulls a *single* filing's
+primary document from the EDGAR archive because there is no bulk feed for it —
+under a stated :class:`FetchBudget`, so a caller cannot drift into a bulk crawl
+without a decision that names the number.
 """
 
 import datetime as dt
+import html as html_lib
 import json
 import math
 import os
+import re
+import time
 from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
+import httpx
 import polars as pl
 
 from tbot import config, ledger
@@ -76,12 +90,44 @@ FILINGS_SCHEMA = pl.Schema(
         "form": pl.Utf8,
         "filed": pl.Date,
         "primary_doc": pl.Utf8,
+        "accepted": pl.Datetime("us", "UTC"),  # EDGAR acceptance instant; null if unusable
+        "items": pl.Utf8,  # 8-K item codes as filed, "2.02,9.01"; "" if none
+    }
+)
+
+#: One entry of ``formerNames``: the name and the window it was in force.
+FORMER_NAME = pl.Struct({"name": pl.Utf8, "from": pl.Date, "to": pl.Date})
+
+#: One row per company whose *main* submissions document has been ingested.
+ENTITIES_SCHEMA = pl.Schema(
+    {
+        "cik": pl.Int64,
+        "name": pl.Utf8,
+        "tickers": pl.List(pl.Utf8),
+        "exchanges": pl.List(pl.Utf8),
+        "former_names": pl.List(FORMER_NAME),
     }
 )
 
 #: Read-side orderings. Reads are deterministic so downstream diffs are stable.
 _FACTS_SORT = ("cik", "taxonomy", "tag", "unit", "end", "filed", "accn")
 _FILINGS_SORT = ("cik", "filed", "accn")
+
+#: Every table stored under ``edgar/``: its declared schema and its read order.
+#: :func:`_cached` dispatches on this, so a new table is one entry and a reader.
+_TABLES = {
+    "facts": (FACTS_SCHEMA, _FACTS_SORT),
+    "filings": (FILINGS_SCHEMA, _FILINGS_SORT),
+    "entities": (ENTITIES_SCHEMA, ("cik",)),
+}
+
+#: Where each table is rebuilt from when its directory has to be re-ingested:
+#: the bulk zip under ``data/raw/`` and the driver that walks it.
+_REINGEST = {
+    "facts": ("data/raw/companyfacts.zip", "tools/t17/ingest_companyfacts.py"),
+    "filings": ("data/raw/submissions.zip", "tools/t17/ingest_submissions.py"),
+    "entities": ("data/raw/submissions.zip", "tools/t17/ingest_submissions.py"),
+}
 
 #: :func:`pit_facts` sorts on this and keeps the last row per cik: the most
 #: recent period ``end``, ties broken by the latest ``filed`` (a restatement
@@ -102,6 +148,22 @@ _FILINGS_DEDUPE_KEY = ("cik", "accn")
 #: Ledger event kinds emitted by the two ingesters.
 FACTS_EVENT = "ingest.edgar.facts"
 FILINGS_EVENT = "ingest.edgar.submissions"
+
+#: The contact address SEC fair access requires on every request.
+USER_AGENT_ENV = "SEC_USER_AGENT"
+#: One filing's primary document: ``.../data/<cik>/<accn without dashes>/<doc>``.
+ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/{doc}"
+#: SEC fair-access ceiling is 10 req/s; 8 leaves headroom for retries and clocks.
+MAX_REQ_PER_S = 8
+#: Ledger event kind emitted by :func:`fetch_document`.
+DOCUMENT_EVENT = "fetch.edgar.document"
+_TIMEOUT = 30.0
+_sleep = time.sleep
+_last_request = [0.0]  # monotonic seconds; a list so tests can reset it
+#: A script/style element with its body, or any single tag. The first
+#: alternative has to come first: ``<[^>]+>`` alone would strip ``<script>`` and
+#: leave the code inside it in the text.
+_TAG = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.S | re.I)
 
 
 # --- helpers ------------------------------------------------------------------------
@@ -156,6 +218,32 @@ def _opt_date(value) -> dt.date | None:
         return None
 
 
+def _opt_datetime(value) -> dt.datetime | None:
+    """An EDGAR ``acceptanceDateTime`` (``2023-09-29T16:23:06.000Z``) as a UTC instant.
+
+    The ``Z`` is genuine: Apple's after-close 8-Ks are accepted at 20:30 UTC,
+    which is 16:30 Eastern. Anything unparseable is ``None`` — the filing is
+    still point-in-time usable by its ``filed`` date, just not to the minute.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _opt_day(value) -> dt.date | None:
+    """The date half of an EDGAR timestamp string, or ``None``."""
+    return _opt_date(value[:10]) if isinstance(value, str) else None
+
+
 def _opt_float(value) -> float | None:
     """Parse a numeric field, or ``None`` if it is absent/unusable.
 
@@ -188,6 +276,44 @@ def _int_or_zero(value) -> int:
         return 0
 
 
+def _entity_row(doc: dict, cik: int) -> dict:
+    """The identity block of a main ``submissions`` document as one row.
+
+    ``tickers`` and ``exchanges`` are normalised the way the rest of the
+    warehouse holds symbols — stripped and upper-cased — and anything that is
+    not a usable string is dropped rather than stored as a null list element.
+    A ``formerNames`` entry keeps its window; either end can be ``None`` (the
+    current name has no ``to``), which is a window that is still open, not a
+    reason to drop the name.
+    """
+
+    def strings(key: str) -> list[str]:
+        raw = doc.get(key)
+        return (
+            [s.strip().upper() for s in raw if isinstance(s, str) and s.strip()]
+            if isinstance(raw, list)
+            else []
+        )
+
+    former = []
+    for entry in doc.get("formerNames") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            former.append(
+                {
+                    "name": entry["name"],
+                    "from": _opt_day(entry.get("from")),
+                    "to": _opt_day(entry.get("to")),
+                }
+            )
+    return {
+        "cik": cik,
+        "name": _text(doc.get("name")),
+        "tickers": strings("tickers"),
+        "exchanges": strings("exchanges"),
+        "former_names": former,
+    }
+
+
 def _write(name: str, cik: int, df: pl.DataFrame) -> None:
     """Replace this company's parquet file atomically."""
     target = _dir(name) / f"{cik}.parquet"
@@ -199,6 +325,11 @@ def _write(name: str, cik: int, df: pl.DataFrame) -> None:
 def _files(name: str) -> list[Path]:
     d = _dir(name, create=False)
     return sorted(d.glob("*.parquet")) if d.is_dir() else []
+
+
+def _is_old_filings_schema(path: Path) -> bool:
+    """Whether a per-company filings file predates the `accepted`/`items` columns."""
+    return "accepted" not in pl.read_parquet_schema(path).names()
 
 
 # --- ingestion ----------------------------------------------------------------------
@@ -282,6 +413,11 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
     idempotent. `cik` is checked against the document's own CIK so a mis-filed
     download cannot attribute one company's filings to another. Returns the
     number of usable filings in *this* document.
+
+    A main document also carries the filer's identity — name, current tickers
+    and exchanges, former names — which is written to ``edgar/entities/`` and
+    read back by :func:`read_entities`. Shards carry none, so only a main
+    document ever writes there.
     """
     cik = _as_cik(cik)
     doc = _load(json_bytes)
@@ -304,6 +440,7 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
     # silently drop *every* filing when one array is missing, so index instead.
     accns, forms = column("accessionNumber"), column("form")
     dates, docs = column("filingDate"), column("primaryDocument")
+    accepted_col, items_col = column("acceptanceDateTime"), column("items")
 
     rows: list[dict] = []
     skipped = 0
@@ -320,6 +457,10 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
                 "form": _text(forms[i] if i < len(forms) else None),
                 "filed": filed,
                 "primary_doc": _text(docs[i] if i < len(docs) else None),
+                # An unusable acceptance time nulls the column, never drops the
+                # row: `filed` still carries point-in-time integrity for it.
+                "accepted": _opt_datetime(accepted_col[i] if i < len(accepted_col) else None),
+                "items": _text(items_col[i] if i < len(items_col) else None),
             }
         )
 
@@ -327,23 +468,121 @@ def ingest_submissions(json_bytes: bytes | str, cik: int) -> int:
         subset=list(_FILINGS_DEDUPE_KEY), keep="last", maintain_order=True
     )
     stored = df.height
-    if stored:
+    # A file written before `accepted`/`items` existed has five columns. It
+    # cannot be merged with (polars refuses to concatenate the widths), and left
+    # in place it breaks every scan of the directory, so it is replaced outright
+    # — even by a document with nothing usable, which still must not leave it
+    # behind. The shards' rows it held come back when the shards are
+    # re-ingested, which the driver does in order after the main documents.
+    existing = _dir("filings", create=False) / f"{cik}.parquet"
+    replaced_old_schema = existing.is_file() and _is_old_filings_schema(existing)
+    if stored or replaced_old_schema:
         # Merge rather than replace: `filings.recent` holds only the newest ~1000
         # filings and the rest arrive as separate `filings.files` shards, so
         # replacing would make ingesting a company's full history self-defeating.
         # A filing is immutable once made, so a re-ingest of the same accession
         # is a correction and the incoming row wins.
-        existing = _dir("filings", create=False) / f"{cik}.parquet"
-        if existing.is_file():
+        if existing.is_file() and not replaced_old_schema:
             df = pl.concat([pl.read_parquet(existing), df]).unique(
                 subset=list(_FILINGS_DEDUPE_KEY), keep="last", maintain_order=True
             )
         _write("filings", cik, df)
         clear_cache()  # the memo now describes a warehouse that no longer exists
+
+    # Only the main document carries the identity block; a `filings.files` shard
+    # has no `name`, so merging one can never blank a company's identity.
+    entity = isinstance(doc.get("name"), str)
+    if entity:
+        _write("entities", cik, pl.DataFrame([_entity_row(doc, cik)], schema=ENTITIES_SCHEMA))
+        clear_cache()
     ledger.log_event(
-        FILINGS_EVENT, {"cik": cik, "rows": stored, "skipped": skipped}
+        FILINGS_EVENT,
+        {"cik": cik, "rows": stored, "skipped": skipped, "entity": entity,
+         "replaced_old_schema": replaced_old_schema},
     )
     return stored
+
+
+# --- the archive: one document at a time --------------------------------------------
+
+
+class BudgetExceeded(RuntimeError):
+    """The stated document budget is spent; ruling 34: decide, then fetch more."""
+
+
+class FetchBudget:
+    """A stated ceiling on documents fetched in one operation.
+
+    A ceiling is the whole point: EDGAR has no bulk feed for filing documents,
+    so the only way to read a thousand of them is a thousand requests, and a
+    loop that quietly grows into one is both a fair-access problem and a
+    measurement nobody decided to take. The budget makes the number an argument
+    the caller had to write down.
+    """
+
+    def __init__(self, max_docs: int) -> None:
+        if isinstance(max_docs, bool) or not isinstance(max_docs, int) or max_docs < 1:
+            raise ValueError(f"max_docs must be a positive int, got {max_docs!r}")
+        self.max_docs, self.used = max_docs, 0
+
+    def take(self) -> None:
+        """Spend one document, or raise :class:`BudgetExceeded`."""
+        if self.used >= self.max_docs:
+            raise BudgetExceeded(f"fetch budget of {self.max_docs} documents is spent")
+        self.used += 1
+
+
+def _pace() -> None:
+    """Hold the process to :data:`MAX_REQ_PER_S` requests per second."""
+    gap = 1.0 / MAX_REQ_PER_S
+    wait = _last_request[0] + gap - time.monotonic()
+    if wait > 0:
+        _sleep(wait)
+    _last_request[0] = time.monotonic()
+
+
+def fetch_document(cik: int, accn: str, primary_doc: str, *, budget: FetchBudget, client=None) -> str:
+    """The plain text of one filing's primary document from the EDGAR archive.
+
+    Counts against `budget` *before* the request — a refused fetch must not
+    reach SEC — paces to :data:`MAX_REQ_PER_S`, sends the contact
+    ``User-Agent`` SEC requires, strips tags, scripts and styles, and logs
+    :data:`DOCUMENT_EVENT`. Not for bulk use without a decision that names the
+    budget (ruling 34).
+
+    `client` accepts any object with httpx's ``get`` signature, which is how
+    this is unit-tested without a server; when it is omitted the function owns
+    and closes its own :class:`httpx.Client`.
+    """
+    cik = _as_cik(cik)
+    accn = _text(accn).strip()
+    primary_doc = _text(primary_doc).strip()
+    if not accn or not primary_doc:
+        raise ValueError("accn and primary_doc must be non-empty")
+    agent = os.environ.get(USER_AGENT_ENV, "").strip()
+    if not agent:
+        raise RuntimeError(f"{USER_AGENT_ENV} must be set to a real contact to fetch from SEC")
+    if not isinstance(budget, FetchBudget):
+        raise TypeError(f"budget must be a FetchBudget, got {type(budget).__name__}")
+    budget.take()
+    url = ARCHIVE_URL.format(cik=cik, accn=accn.replace("-", ""), doc=primary_doc)
+    owned = client is None
+    if owned:
+        client = httpx.Client(timeout=_TIMEOUT)
+    try:
+        _pace()
+        r = client.get(url, headers={"User-Agent": agent})
+        r.raise_for_status()
+        raw = r.text
+    finally:
+        if owned:
+            client.close()
+    text = html_lib.unescape(_TAG.sub(" ", raw))
+    text = re.sub(r"\s+", " ", text).strip()
+    ledger.log_event(
+        DOCUMENT_EVENT, {"cik": cik, "accn": accn, "doc": primary_doc, "chars": len(text)}
+    )
+    return text
 
 
 # --- reads --------------------------------------------------------------------------
@@ -380,15 +619,33 @@ def _scan(
     return lf
 
 
-def _collect(lf: pl.LazyFrame, schema: pl.Schema, sort_key: tuple[str, ...]) -> pl.DataFrame:
+def _collect(
+    lf: pl.LazyFrame, schema: pl.Schema, sort_key: tuple[str, ...], *, table: str
+) -> pl.DataFrame:
     """Materialise a scan into the declared schema, or a typed empty frame.
 
     Stable: files are globbed in sorted order and parquet preserves write order,
     so rows that tie on the sort key keep document order instead of whatever the
     sort's worker threads happen to produce. See :data:`_PIT_SORT` for why that
     matters.
+
+    A directory that mixes two schemas — files from before a column was added
+    beside files from after — fails inside polars on whichever file it reads
+    second, with a message about that file. That is re-raised as a
+    ``RuntimeError`` naming the directory and the fix: move the old files aside
+    and re-ingest the table from its bulk zip with its driver.
     """
-    df = lf.collect()
+    try:
+        df = lf.collect()
+    except (pl.exceptions.SchemaError, pl.exceptions.ColumnNotFoundError) as exc:
+        d = _dir(table, create=False)
+        zip_path, driver = _REINGEST[table]
+        raise RuntimeError(
+            f"{d} holds files of more than one schema ({type(exc).__name__}: {exc}). "
+            f"Move the old files aside — `mv data/edgar/{table} "
+            f"data/retired/edgar-{table}-v1-<date>` — then re-ingest from {zip_path} "
+            f"with `uv run python -B {driver}`."
+        ) from exc
     if df.height == 0:
         return pl.DataFrame(schema=schema)
     return df.select(list(schema)).sort(list(sort_key), maintain_order=True)
@@ -396,21 +653,21 @@ def _collect(lf: pl.LazyFrame, schema: pl.Schema, sort_key: tuple[str, ...]) -> 
 
 @lru_cache(maxsize=32)
 def _cached(root: str, name: str, key: tuple) -> pl.DataFrame:
-    """The memo behind both readers.
+    """The memo behind every reader.
 
     ``root`` is part of the key so tests and multi-root callers never collide;
+    ``name`` selects the table's schema and read order from :data:`_TABLES`; and
     ``key`` is the predicate tuple ``(tags, forms, filed_from, filed_to)``.
     Polars frames are immutable, so handing out the cached object is safe — a
     caller's ``with_columns`` builds a new frame and cannot poison this one.
     """
-    schema, sort_key = (
-        (FACTS_SCHEMA, _FACTS_SORT) if name == "facts" else (FILINGS_SCHEMA, _FILINGS_SORT)
-    )
+    schema, sort_key = _TABLES[name]
     tags, forms, filed_from, filed_to = key
     return _collect(
         _scan(name, schema, tags=tags, forms=forms, filed_from=filed_from, filed_to=filed_to),
         schema,
         sort_key,
+        table=name,
     )
 
 
@@ -452,6 +709,16 @@ def read_filings(
     start = as_date(filed_from, "filed_from") if filed_from is not None else None
     end = as_date(filed_to, "filed_to") if filed_to is not None else None
     return _cached(str(config.data_root()), "filings", (None, wanted, start, end))
+
+
+def read_entities() -> pl.DataFrame:
+    """Every ingested company's identity — name, current tickers, former names.
+
+    One row per company whose *main* submissions document has been ingested;
+    shards carry no identity and never write here. Sorted by ``cik``; typed and
+    empty when nothing has been ingested.
+    """
+    return _cached(str(config.data_root()), "entities", (None, None, None, None))
 
 
 def read_facts(tags: Iterable[str] | None = None) -> pl.DataFrame:

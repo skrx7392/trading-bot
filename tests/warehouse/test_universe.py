@@ -303,12 +303,19 @@ def test_thresholds_are_overridable(tmp_path, monkeypatch):
 
 
 def test_only_bars_inside_the_lookback_are_used(tmp_path, monkeypatch):
-    """The window is ``asof - lookback_days`` .. ``asof``, inclusive at both ends."""
+    """The window is ``asof - lookback_days`` .. ``asof``, inclusive at both ends.
+
+    The two price levels are a factor of 4.4 apart — inside `max_jump`, so the
+    step between them is not a level break. What is under test here is the
+    *window* boundary, and a break on the window's newest row would be an
+    unconfirmed one that `read_canonical` drops, which would make this pass or
+    fail for a reason that has nothing to do with the lookback.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
     _tickers(tmp_path, [(1, "EDGE")])
     _filing(1, "2020-05-01")
-    _bars("EDGE", [63], 50.0)               # exactly the first day of the window
-    _bars("EDGE", [64, 65, 66], 1.0)        # a day too early: penny, must be ignored
+    _bars("EDGE", [63], 20.0)               # exactly the first day of the window
+    _bars("EDGE", [64, 65, 66], 4.5)        # a day too early: penny, must be ignored
     _reconcile()
     assert universe.build(ASOF)["symbol"].to_list() == ["EDGE"]
     assert universe.build(ASOF, lookback_days=62).height == 0   # window now empty
@@ -504,3 +511,34 @@ def test_build_rejects_bad_input(tmp_path, monkeypatch, kwargs, exc):
     _tickers(tmp_path, [(1, "X")])
     with pytest.raises(exc):
         universe.build(**{"asof": ASOF, **kwargs})
+
+
+# --- the filings read ---------------------------------------------------------------
+
+def test_build_pushes_the_alive_predicates_into_the_filings_read(tmp_path, monkeypatch):
+    """The whole filings table is 7.8M rows; the question is two predicates wide."""
+    _liquid(tmp_path, monkeypatch)
+    seen = {}
+    real = edgar.read_filings
+
+    def recording(forms=None, filed_from=None, filed_to=None):
+        seen.update(forms=tuple(forms) if forms is not None else None,
+                    filed_from=filed_from, filed_to=filed_to)
+        return real(forms=forms, filed_from=filed_from, filed_to=filed_to)
+
+    monkeypatch.setattr(edgar, "read_filings", recording)
+    assert universe.build(ASOF)["symbol"].to_list() == ["X"]
+    assert seen == {"forms": universe.ALIVE_FORMS,
+                    "filed_from": ASOF - dt.timedelta(days=universe.ALIVE_WINDOW_DAYS),
+                    "filed_to": ASOF}
+
+
+# --- the point-in-time ticker map ---------------------------------------------------
+
+def test_build_uses_the_point_in_time_ticker_map(tmp_path, monkeypatch):
+    _liquid(tmp_path, monkeypatch)                      # X <-> cik 1, alive, liquid
+    from tbot.warehouse import tickers
+    pl.DataFrame([{"cik": 1, "symbol": "X", "valid_from": ASOF + dt.timedelta(days=1),
+                   "valid_to": None, "source": "override"}], schema=tickers.MAP_SCHEMA
+                 ).write_parquet(tickers._map_path(create=True))
+    assert universe.build(ASOF).height == 0             # X was not cik 1's symbol yet on ASOF

@@ -429,10 +429,15 @@ def test_max_jump_is_tunable(tmp_path, monkeypatch):
 
 
 def test_breaks_are_detected_per_symbol(tmp_path, monkeypatch):
-    """One symbol's splice must not truncate its neighbour in the same frame."""
+    """One symbol's splice must not truncate its neighbour in the same frame.
+
+    The splice carries a row past the break so that it is *confirmed* — an
+    unconfirmed break is judged per symbol too, which is
+    :func:`test_unconfirmed_break_is_judged_per_symbol`'s job.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
-    days = _seed_series([1.0, 1.0, 10.0], sym="SPLICED")
-    _seed_series([2.0, 2.0, 2.0], sym="CLEAN")
+    days = _seed_series([1.0, 1.0, 10.0, 10.0], sym="SPLICED")
+    _seed_series([2.0, 2.0, 2.0, 2.0], sym="CLEAN")
     can = reconcile.read_canonical()
     assert can.filter(pl.col("symbol") == "SPLICED")["ts"].to_list() == days[2:]
     assert can.filter(pl.col("symbol") == "CLEAN")["ts"].to_list() == days
@@ -516,28 +521,141 @@ def test_a_break_after_end_does_not_truncate(tmp_path, monkeypatch):
     that was legitimately tradable then: that is look-ahead, and it is
     survivorship bias in the direction that flatters a backtest. The
     contamination is still removed — one horizon later, as soon as `end` reaches
-    the break.
+    a row that *confirms* the break. The horizon in between, where `end` is the
+    break day itself and the break is not yet confirmed, is
+    :func:`test_confirmation_is_judged_through_end_only`'s case.
     """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
-    days = _seed_series([1.0, 1.0, 1.0, 10.0])
+    days = _seed_series([1.0, 1.0, 1.0, 10.0, 10.0])
     assert reconcile.read_canonical(end=days[2])["ts"].to_list() == days[:3]
-    assert reconcile.read_canonical(end=days[3])["ts"].to_list() == days[3:]
+    assert reconcile.read_canonical(end=days[4])["ts"].to_list() == days[3:]
     assert reconcile.read_canonical()["ts"].to_list() == days[3:]
 
 
 def test_breaks_are_measured_after_the_min_sources_filter(tmp_path, monkeypatch):
-    """A single-source spike is dropped first, so it cannot fake a level break."""
+    """A single-source excursion is dropped first, so it cannot fake a level break.
+
+    Two days wide on purpose: a one-day excursion is a *spike* and the detector
+    now removes it on its own merits, which would make both reads agree and
+    prove nothing about the order of the two filters.
+    """
     monkeypatch.setenv("TBOT_DATA", str(tmp_path))
-    days = [D + dt.timedelta(days=i) for i in range(5)]
+    days = [D + dt.timedelta(days=i) for i in range(6)]
     for i, day in enumerate(days):
-        if i == 2:
-            _write("stooq", 10.0, day=day)  # one source only: unvetted spike
+        if i in (2, 3):
+            _write("stooq", 10.0, day=day)  # one source only: unvetted excursion
         else:
             _write("stooq", 1.0, day=day); _write("alpaca", 1.0, day=day)
     reconcile.run(days[0], days[-1])
-    assert reconcile.read_canonical()["ts"].to_list() == [days[0], days[1], days[3], days[4]]
-    # with the spike admitted it is two breaks, and only the tail survives
-    assert reconcile.read_canonical(min_sources=1)["ts"].to_list() == days[3:]
+    assert reconcile.read_canonical()["ts"].to_list() == [days[0], days[1], days[4], days[5]]
+    # with the excursion admitted it is two breaks, and only the tail survives
+    assert reconcile.read_canonical(min_sources=1)["ts"].to_list() == days[4:]
+
+
+def test_a_break_on_the_final_row_drops_that_row_not_the_history(tmp_path, monkeypatch):
+    """One junk print cannot establish a regime; the history it would erase is kept."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0])   # 10x on the last day
+    can = reconcile.read_canonical(end=days[-1])
+    assert can["close"].to_list() == [100.0, 101.0, 102.0]
+    assert can["ts"].to_list() == days[:-1]
+
+
+def test_the_same_break_is_confirmed_by_the_next_row(tmp_path, monkeypatch):
+    """The day after, the level persisted: the break is real and truncates as before."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0, 1030.0])
+    can = reconcile.read_canonical(end=days[-1])
+    assert can["close"].to_list() == [1020.0, 1030.0]
+
+
+def test_confirmation_is_judged_through_end_only(tmp_path, monkeypatch):
+    """At `end` = the break day the later row is invisible, so the row is dropped;
+    the later horizon sees the confirmation. Neither answer uses the future."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0, 1030.0])
+    assert reconcile.read_canonical(end=days[3])["close"].to_list() == [100.0, 101.0, 102.0]
+    assert reconcile.read_canonical(end=days[4])["close"].to_list() == [1020.0, 1030.0]
+
+
+def test_an_unconfirmed_break_reveals_the_previous_confirmed_one(tmp_path, monkeypatch):
+    """Two breaks: an old confirmed one still truncates; the new unconfirmed one is dropped."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 10.0, 11.0, 12.0, 120.0])
+    can = reconcile.read_canonical(end=days[-1])
+    assert can["close"].to_list() == [10.0, 11.0, 12.0]
+
+
+def test_a_downward_unconfirmed_break_is_dropped_too(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 10.0])
+    assert reconcile.read_canonical(end=days[-1])["close"].to_list() == [100.0, 101.0, 102.0]
+
+
+def test_unconfirmed_break_is_judged_per_symbol(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 1010.0], sym="JUNK")
+    _seed_series([50.0, 51.0, 52.0], sym="FINE")
+    can = reconcile.read_canonical(end=days[-1])
+    assert can.filter(pl.col("symbol") == "JUNK")["close"].to_list() == [100.0, 101.0]
+    assert can.filter(pl.col("symbol") == "FINE")["close"].to_list() == [50.0, 51.0, 52.0]
+
+
+def test_a_one_day_spike_is_dropped_and_the_level_it_left_is_kept(tmp_path, monkeypatch):
+    """The print left the level and came straight back, so the print is what is wrong.
+
+    Under the final-row rule alone this series is a trap: the reverting close is
+    an unconfirmed break and goes, which promotes the junk print to a *confirmed*
+    break and truncates everything before it — the junk price as the whole
+    series, which is the one answer the detector must never give.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0, 102.0])
+    can = reconcile.read_canonical(end=days[-1])
+    assert can["close"].to_list() == [100.0, 101.0, 102.0, 102.0]
+    assert can["ts"].to_list() == days[:3] + days[4:]
+
+
+def test_a_spike_strictly_inside_the_window_no_longer_truncates(tmp_path, monkeypatch):
+    """The same spike with history on both sides of it: only the spike goes."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0, 102.0, 103.0])
+    assert reconcile.read_canonical(end=days[-1])["close"].to_list() == [
+        100.0, 101.0, 102.0, 102.0, 103.0
+    ]
+
+
+def test_a_level_that_does_not_come_back_is_a_break_not_a_spike(tmp_path, monkeypatch):
+    """The successor is measured against the close *before* the break, not the break.
+
+    800 is a normal session away from 1000 and eight times the 100 the series
+    came from: the level moved and stayed moved. That is a splice, not a print.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 1000.0, 800.0])
+    assert reconcile.read_canonical(end=days[-1])["close"].to_list() == [1000.0, 800.0]
+
+
+def test_a_genuine_regime_change_still_truncates(tmp_path, monkeypatch):
+    """The ticker-splice case ruling 30 exists for is untouched by spike removal."""
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([1.0, 1.0, 10.0, 10.0, 11.0])
+    assert reconcile.read_canonical(end=days[-1])["close"].to_list() == [10.0, 10.0, 11.0]
+
+
+def test_spike_removal_is_judged_through_end_only(tmp_path, monkeypatch):
+    """On the spike day the revert is invisible, so the final-row rule answers.
+
+    Neither horizon reads a row after its own `end`: at ``days[3]`` the spike is
+    an unconfirmed final-row break and is dropped for that reason; at
+    ``days[4]`` the revert is there and the same row is dropped as a spike.
+    """
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    days = _seed_series([100.0, 101.0, 102.0, 1020.0, 102.0])
+    assert reconcile.read_canonical(end=days[3])["close"].to_list() == [100.0, 101.0, 102.0]
+    assert reconcile.read_canonical(end=days[4])["close"].to_list() == [
+        100.0, 101.0, 102.0, 102.0
+    ]
 
 
 # --- read-side validation ------------------------------------------------------------
@@ -693,3 +811,50 @@ def test_batch_filenames_sort_in_run_order(tmp_path, monkeypatch):
     files = sorted((tmp_path / "canonical" / "closes").glob("*.parquet"))
     assert len(files) == 2
     assert [pl.read_parquet(f)["close"][0] for f in files] == [100.0, 101.0]
+
+
+# --- symbol-scoped runs -------------------------------------------------------------
+
+def test_run_can_be_scoped_to_symbols(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    for sym in ("AAPL", "MSFT"):
+        _write("alpaca", 100.0, sym=sym)
+        _write("yf", 100.0, sym=sym)
+    out = reconcile.run(D, D, symbols=["aapl"])   # normalised like the fetchers
+    assert out == {"ok": 1, "majority": 0, "quarantined": 0}
+    can = reconcile.read_canonical()
+    assert can["symbol"].to_list() == ["AAPL"]
+
+
+def test_run_with_an_empty_symbol_list_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    _write("alpaca", 100.0); _write("yf", 100.0)
+    assert reconcile.run(D, D, symbols=[]) == {"ok": 0, "majority": 0, "quarantined": 0}
+    assert reconcile.read_canonical().height == 0
+    assert not list((tmp_path / "canonical" / "closes").glob("*.parquet"))
+
+
+def test_run_rejects_a_bare_string_symbol_list(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    with pytest.raises(TypeError):
+        reconcile.run(D, D, symbols="AAPL")
+
+
+def test_scoped_rerun_leaves_other_symbols_verdicts_alone(tmp_path, monkeypatch):
+    monkeypatch.setenv("TBOT_DATA", str(tmp_path))
+    for sym in ("AAPL", "MSFT"):
+        _write("alpaca", 100.0, sym=sym); _write("yf", 100.0, sym=sym)
+    reconcile.run(D, D)
+    _write("alpaca", 200.0, sym="AAPL")            # a correction for AAPL only
+    # Only AAPL is re-voted: MSFT contributes no verdict to the scoped run.
+    assert reconcile.run(D, D, symbols=["AAPL"]) == {"ok": 0, "majority": 0, "quarantined": 1}
+    can = reconcile.read_canonical()
+    assert can.filter(pl.col("symbol") == "MSFT")["close"][0] == 100.0
+    # AAPL's newest verdict is a quarantine (200 vs 100). `read_canonical` drops
+    # quarantines, so the verdict itself is read off the audit trail.
+    assert can.filter(pl.col("symbol") == "AAPL").height == 0
+    batches = sorted((tmp_path / "canonical" / "closes").glob("*.parquet"))
+    newest = pl.concat([pl.read_parquet(f) for f in batches]).unique(
+        subset=["symbol", "ts"], keep="last", maintain_order=True
+    )
+    assert newest.filter(pl.col("symbol") == "AAPL")["status"][0] == "quarantined"

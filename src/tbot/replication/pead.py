@@ -43,8 +43,7 @@ import polars as pl
 
 from tbot._dates import as_date
 from tbot.replication import _empty, _finalise, _positive_int
-from tbot.warehouse import edgar
-from tbot.warehouse.universe import _ticker_map
+from tbot.warehouse import edgar, tickers
 
 #: The earnings series. One tag: quarterly net income as filed.
 TAG = "NetIncomeLoss"
@@ -101,7 +100,7 @@ def signal(asof: dt.date, window_days: int = DEFAULT_WINDOW_DAYS) -> pl.DataFram
     """
     asof = as_date(asof, "asof")
     window_days = _positive_int(window_days, "window_days")
-    tickers = _ticker_map()  # fail on a missing map before doing any work
+    mapped = tickers.ticker_map(asof)  # fail on a missing map before doing any work
 
     duration = (pl.col("end") - pl.col("start")).dt.total_days()
     quarters = edgar.read_facts([TAG]).filter(
@@ -159,4 +158,4 @@ def signal(asof: dt.date, window_days: int = DEFAULT_WINDOW_DAYS) -> pl.DataFram
                 & (pl.col("scale") > 0))
         .with_columns(score=pl.col("surprise") / pl.col("scale"))
     )
-    return _finalise(scored.join(tickers, on="cik", how="inner"))
+    return _finalise(scored.join(mapped, on="cik", how="inner"))
