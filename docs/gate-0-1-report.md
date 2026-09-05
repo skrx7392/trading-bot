@@ -560,7 +560,10 @@ rename; the unmapped remainder under both maps is dominated by ETFs (`AAXJ`, `AC
 (decision D13: no old-symbol interval is inferred when the new symbol's series predates the rename) the
 nightly's rebuild (event `ca9f2f4ec0ad4543a2fbebb3367ada3a`) holds 355 rename, 660 asset and 11,423 total
 intervals; the 1,136 rows dropped were the inert old-symbol intervals of lineage-keyed renames, and the
-coverage measurement is the counter to re-run before the search branch leans on the map.
+coverage measurement, re-run on the rebuilt map, is unmoved: 3,040,564 point-in-time / 3,080,952 current mapped
+symbol-days, identical to the first run (event `6d3df14fc2af4264b5fb0552f56268a6`) — the dropped intervals
+had no bars. The rule's future cost is coverage, not attribution: after a rename the nightly keeps
+accumulating bars under the old symbol until the map rebuild, and rule 2 leaves that tail unmapped.
 
 **The two live calibrations, re-run on the PIT map** (same panel, `ex_price5` reference, series cut to
 `month <= 2019-12`):
@@ -744,10 +747,11 @@ what one corporate action, adjusted for by one vendor and not by the other, leav
 fractions for a consolidation (`UHAL` 10.0, `AEHL` 64, `DBVT` 5.0, `IESC` 0.5, `ABTS` 15, `RCON` 200) and
 small non-integer factors for a spin-off distribution or a reclassification (`ZBH` 1.030, `LEN` 1.033,
 `CMCSA` 1.067, `BWA` 1.136, `GSK` 1.250, `LBTYK` 1.91). Alpaca's close is the higher one for 123 of the 138.
-These are not microcaps the screen would have dropped anyway: **130 of the 138 have a median close above the
-universe's $5 line**, and the set includes `CMCSA`, `HON`, `MMM`, `GE`, `T`, `IBM`, `FDX`, `BDX`, `DHR`,
+These are not microcaps the screen would have dropped anyway: **130 of the 138 have a median Alpaca close above the
+universe's $5 line** (the canonical close is null on a quarantined day), and the set includes `CMCSA`, `HON`, `MMM`, `GE`, `T`, `IBM`, `FDX`, `BDX`, `DHR`,
 `SPGI`, `LH`, `DD`. Each has been absent from the canonical panel — and therefore from the universe and
-every calibration — for its *entire* history, on every day of it, and a re-base does not touch it: the
+every calibration — for the whole measured window (120 of the 138 on every one of its 1,008 sessions, the other
+18 on 932 or more; the window, not the names' whole histories, is what was measured), and a re-base does not touch it: the
 re-base re-pulls both vendors' current series, and the two current series disagree by the same constant.
 **Registered as a limit**, with the follow-up: identify the corporate action per floor name from
 `data/actions` (splits, dividends, name changes, mergers) and decide, per action type, which vendor's basis
@@ -789,7 +793,7 @@ per *vote*, so a re-voted symbol-day is counted twice; at 0.7% over the canonica
 any share above, and the floor is counted on verdicts, where it cannot arise. (c) Pairs where either vendor
 is absent are skipped by construction, so the bucket tables say nothing about single-source days; the
 conditional line above is the measurement that accounts for them. (d) The vendor-basis floor, as above:
-138 names, entire history, untouched by a re-base, follow-up registered (carried into §12.6).
+138 names, the whole measured window (120 on every session), untouched by a re-base, follow-up registered (carried into §12.6).
 
 ### 12.6 Registered limits carried into the search branch
 
@@ -814,6 +818,6 @@ takes them as prerequisites (decisions D12–D14 in `docs/phase1/decisions-taken
 3. **The vendor-basis floor (§12.5).** 138 names quarantined on ≥ 900 of the window's 1,008 sessions because
    the two vendors sit on different adjustment bases for the whole series (one adjusted for a
    consolidation, spin-off or reclassification, the other not) — absent from the canonical panel and from
-   the universe for their entire history, and untouched by a re-base. Follow-up: identify the corporate
+   the universe for the whole measured window (120 of the 138 on every session), and untouched by a re-base. Follow-up: identify the corporate
    action per floor name from `data/actions` and decide which vendor's basis matches spec A3 (a
    consolidation is a split; a spin-off distribution is not).

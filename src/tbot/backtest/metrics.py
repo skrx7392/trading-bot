@@ -97,7 +97,11 @@ Two residual imprecisions, both stated rather than hidden.
 :func:`~tbot.warehouse.reconcile.read_canonical` drops quarantined symbol-days
 and truncates history before a 5x single-day break, so a name whose panel ends
 mid-month for either of those reasons is booked as a delisting it did not
-suffer. And the panel is only read over ``[start, end]``: a name whose real
+suffer. The truncation is applied at the horizon of the one panel read here,
+``end``: a break confirmed after a formation month still removes the name's
+earlier rows from that month's cross-section — a registered look-ahead in the
+flattering direction (gate report §12.6, decision D12; the per-formation read is
+the search branch's first task). And the panel is only read over ``[start, end]``: a name whose real
 history continues past `end` but whose last close *within the window* falls
 inside the final month's hold books a spurious exit. Callers who care about the
 final month should pass an `end` one month past the last month they use and cut

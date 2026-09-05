@@ -252,7 +252,11 @@ def _market_frame(start: dt.date, end: dt.date) -> pl.DataFrame:
 
     Both trailing windows end at the row they annotate, so a trade priced on day
     `d` uses only data through day `d`'s close — the same information the
-    decision had.
+    decision had. The one exception is registered, not hidden: the panel is read
+    once, at `end`'s horizon, so `read_canonical`'s confirmed-break truncation is
+    applied with the whole run's hindsight — a 5x break confirmed late in the run
+    removes that name's earlier rows from every day of it (gate report §12.6,
+    decision D12; the per-day rule is the search branch's first task).
     """
     warm_start = start - dt.timedelta(days=WARMUP_DAYS)
     can = reconcile.read_canonical(start=warm_start, end=end).filter(
