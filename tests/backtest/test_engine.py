@@ -591,6 +591,64 @@ def test_a_cash_merger_with_no_usable_rate_exits_at_the_last_close(tmp_path, mon
     assert payload["price"] == 20.0 and payload["last_close"] == 20.0
 
 
+def test_a_rename_is_not_applied_while_the_old_symbol_keeps_printing(tmp_path, monkeypatch):
+    """A recycled ticker: `OLD`'s series in the store is another issuer's lineage.
+
+    Vendor histories are keyed by lineage, not by ticker — a symbol's bars are
+    filed under whoever owns the ticker *now* — while the name-change table is
+    keyed by the ticker as it was. The two disagree on 100 of the table's 2,864
+    renames (75 on Alpaca alone; `IR→TT`, `META→METV`, `CR→CXT`, and `BBT→TFC`
+    on 2019-12-09, inside the development window): the old symbol prints both
+    before and after the process date, because those bars belong to the issuer
+    that inherited the ticker. Carrying the position on the process date alone
+    moves it into an unrelated issuer's price series without a trade — here a
+    tenfold gain out of thin air. The old series has to have *stopped* first.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    on = days[40]
+    _seed(tmp_path, monkeypatch, {"OLD": {d: 10.0 for d in days}, "NEW": {d: 100.0 for d in days}})
+    _name_change(tmp_path, "OLD", "NEW", on)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    # Still holding OLD at 10.0: flat prices, free costs, so equity cannot move.
+    assert res.daily["equity"][-1] == pytest.approx(100_000.0, rel=1e-12)
+    assert ledger.read_events("engine.rename").height == 0
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    assert res.trades == 1                                     # the entry, and nothing else
+
+
+def test_a_rename_dated_on_the_last_printed_day_still_carries(tmp_path, monkeypatch):
+    """Last-trading-day semantics: `OLD` prints *on* its process date, then stops.
+
+    Ruling 45 read "not yet applied" as `last vetted close < process_date`,
+    which is one day too strict if the vendor dates the change at the last day
+    the old ticker traded rather than the first day it did not: the position's
+    last close is then *on* the process date, the rename never becomes due, and
+    the name gaps out into a `gap_exceeded` liquidation five days later. The
+    bound is `≤`, and the carry happens on the first day `OLD` has no quote.
+    """
+    days = _weekdays(dt.date(2020, 1, 1), dt.date(2020, 6, 30))
+    on = days[40]
+    old = {d: 10.0 for d in days if d <= on}
+    new = {d: 20.0 for d in days if d > on}                    # NEW starts the next session
+    _seed(tmp_path, monkeypatch, {"OLD": old, "NEW": new})
+    _name_change(tmp_path, "OLD", "NEW", on)
+    strat = strategy.Strategy(name="const", n_long=1, signal=_ranked_signal(["OLD", "NEW"]))
+    res = engine.run(strat, days[0], days[-1], cost_model=FREE)
+
+    assert ledger.read_events("engine.forced_liquidation").height == 0
+    events = ledger.read_events("engine.rename")
+    assert events.height == 1
+    payload = json.loads(events["payload"][0])
+    assert payload["symbol"] == "OLD" and payload["new_symbol"] == "NEW"
+    assert payload["process_date"] == on.isoformat()
+    assert payload["ts"] == days[41].isoformat()               # the first day OLD has no quote
+    assert res.trades == 1                                     # carried, not traded
+    # The shares carry into NEW and are marked there: 10 -> 20 doubles equity.
+    assert res.daily["equity"][-1] == pytest.approx(100_000.0 * 20.0 / 10.0, rel=1e-12)
+
+
 # --- tax year attribution -----------------------------------------------------------
 
 def _switch_signal(first, second, switch_on):

@@ -11,11 +11,12 @@ How a day works
 
 Each trading day is processed in four steps, in this order:
 
-1. **Renames, gaps and exits.** A held symbol with a name change (from
-   :func:`~tbot.warehouse.actions.read_name_changes`) whose process date falls
-   after its last vetted close and on or before today is carried into the new
-   symbol — shares, tax lots, pending target and last mark move unchanged,
-   nothing is traded — and an ``engine.rename`` event is written. Then every
+1. **Renames, gaps and exits.** A held symbol with *no vetted close today* and
+   a name change (from :func:`~tbot.warehouse.actions.read_name_changes`) whose
+   process date falls on or after its last vetted close and on or before today
+   is carried into the new symbol — shares, tax lots, pending target and last
+   mark move unchanged, nothing is traded — and an ``engine.rename`` event is
+   written. A symbol that is still printing is never carried. Then every
    held symbol with no vetted close today is either *held* through the hole,
    marked at its last vetted close, for up to :data:`MAX_GAP_DAYS` consecutive
    trading days, or *exited* — on a merger for it (from
@@ -45,15 +46,33 @@ extra day of price movement it did not decide on, which is noise for a monthly
 rebalance and would not be for a daily one. Upgrade this to true opens before
 trusting a high-turnover result.
 
-**Renames carry the position; they do not trade it.** On the first trading day
-`t` at which a held symbol `S` has a name change ``(old=S, new=S')`` whose
-process date lies after `S`'s last vetted close and on or before `t`, the
+**Renames carry the position; they do not trade it — but only once the old
+series has stopped printing.** On the first trading day `t` at which a held
+symbol `S` has *no vetted close*, and a name change ``(old=S, new=S')`` whose
+process date lies on or after `S`'s last vetted close and on or before `t`, the
 shares, the open tax lots (merged FIFO by purchase date with any `S'` already
 holds), the pending target and the last mark move to `S'` unchanged: nothing is
 traded, charged or realised, and the holding period runs through the rename as
 it does for tax purposes. This runs before the gap check, so a rename day is
 not a gap. A name-change row whose two symbols are equal (Alpaca files a
 company-name change that way) is not a rename and is ignored.
+
+Both halves of "not yet applied" are load-bearing. *The old symbol must have
+stopped printing:* vendor histories are keyed by lineage — a ticker's bars are
+filed under whoever owns it now — while the action table is keyed by the ticker
+as it was, so on a recycled symbol the two describe different issuers. Of the
+table's 2,864 renames, 100 have the old symbol printing both before and on or
+after its process date while the new symbol also has bars (75 on Alpaca alone,
+37 on yfinance; ``IR→TT``, ``META→METV``, ``CR→CXT``, and ``BBT→TFC`` on
+2019-12-09, inside the development window). Carrying those would move a position
+into an unrelated issuer's price series without a trade — `IR` at roughly four
+times the price. If the old name still prints, the holder keeps holding it.
+*And the bound on the last close is "on or after", not "after":* if the vendor
+dates the change at the last day the old ticker traded rather than the first day
+it did not, the position's last close falls *on* the process date, and a strict
+bound would leave the rename permanently undue and gap the name out five days
+later. A rename dated strictly before the last close is one the position has
+already lived through, exactly as before.
 
 **A short gap is a hole, not a delisting.** A held symbol with no vetted close
 on `t` is held, marked at its last vetted close, for up to :data:`MAX_GAP_DAYS`
@@ -556,11 +575,21 @@ def run(
 
         # --- 1a. renames: a ticker change carries the position, it does not trade it ---
         for symbol in sorted(shares):
+            if quote(symbol) is not None:
+                # The old series is still printing, so it is not the issuer the
+                # action describes: vendor histories are keyed by lineage and
+                # tickers are recycled, so those bars belong to whoever owns the
+                # symbol now (100 of the table's 2,864 renames look like this).
+                # Carrying the position would move it into an unrelated price
+                # series without a trade. The holder keeps holding it.
+                continue
             seen_on = last[symbol][0]
-            # "Not yet applied" is "dated after the last close under the old
-            # name": a rename dated on or before a day the old symbol printed
-            # is one the position has already lived through.
-            due = [(on, new) for on, new in renames.get(symbol, ()) if seen_on < on <= day]
+            # "Not yet applied" is "dated on or after the last close under the
+            # old name": a rename dated strictly before a day the old symbol
+            # printed is one the position has already lived through, while one
+            # dated *on* that day is the vendor's "last trading day" semantics
+            # and is due the first session the name does not print.
+            due = [(on, new) for on, new in renames.get(symbol, ()) if seen_on <= on <= day]
             if not due:
                 continue
             on, new = min(due)
